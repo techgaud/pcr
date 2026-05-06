@@ -3,10 +3,38 @@
 #include <iostream>
 #include <filesystem>
 #include <thread>
+#include <chrono>
+#include <ctime>
+#include <string>
 
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Includes/stb_image_write.h"
+
+namespace
+{
+    // Format current time as "YYYYMMDD-HHMMSS-<ZONE>". When utc=false, uses
+    // system local time and the active zone abbreviation (e.g. EDT, EST, PST).
+    // When utc=true, uses UTC and a literal "UTC" suffix.
+    std::string formatTimestamp(bool utc)
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm tm{};
+#ifdef _MSC_VER
+        if (utc) gmtime_s(&tm, &now);
+        else localtime_s(&tm, &now);
+#else
+        if (utc) gmtime_r(&now, &tm);
+        else localtime_r(&now, &tm);
+#endif
+        char buf[64];
+        if (utc)
+            std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-UTC", &tm);
+        else
+            std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-%Z", &tm);
+        return std::string(buf);
+    }
+}
 
 Renderer::Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples, Plane &light)
     : _width{width}, _height{height}, _fov{fov}, _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples}
@@ -16,7 +44,7 @@ Renderer::Renderer(int width, int height, float fov, int depth, int samples, int
     createWalls();
 }
 
-void Renderer::render(const std::vector<Sphere> &spheres)
+void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_clock::time_point start)
 {
     std::vector<Vec3f> frameBuffer(_width * _height);
     Vec3f origin{0, 0, 0};
@@ -51,11 +79,6 @@ void Renderer::render(const std::vector<Sphere> &spheres)
     for (auto &t : threads)
         t.join();
 
-    std::filesystem::path outputPath =
-        std::filesystem::current_path().parent_path() / "Image" / "out.png";
-
-    std::filesystem::create_directories(outputPath.parent_path());
-
     std::vector<unsigned char> rgb(_width * _height * 3);
     for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
@@ -72,10 +95,29 @@ void Renderer::render(const std::vector<Sphere> &spheres)
         rgb[i * 3 + 2] = (unsigned char)(255 * frameBuffer[i][2] + 0.5f);
     }
 
+    auto end = std::chrono::steady_clock::now();
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "Render took " << elapsedMs << " ms" << std::endl;
+
+    // Filename: <timestamp>-d#-s#-shadow#-t<ms>.png. Flip the bool to use UTC.
+    std::string filename = formatTimestamp(false)
+                         + "-d" + std::to_string(_maxDepth)
+                         + "-s" + std::to_string(_samples)
+                         + "-shadow" + std::to_string(_shadowSamples)
+                         + "-t" + std::to_string(elapsedMs)
+                         + ".png";
+
+    std::filesystem::path outputPath =
+        std::filesystem::current_path().parent_path() / "Image" / filename;
+
+    std::filesystem::create_directories(outputPath.parent_path());
+
     // PNG output is always lossless. Compression level only affects file
     // size vs. write speed; default is 8 (range 0-9), tweak if needed.
     if (!stbi_write_png(outputPath.string().c_str(), _width, _height, 3, rgb.data(), _width * 3))
         std::cerr << "Failed to write PNG to " << outputPath << std::endl;
+    else
+        std::cout << "Wrote " << outputPath << std::endl;
 }
 
 Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth)

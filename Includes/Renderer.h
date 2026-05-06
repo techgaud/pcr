@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "Ray.h"
 #include "Sphere.h"
 #include "Plane.h"
@@ -9,7 +11,7 @@ class Renderer
 public:
     Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples, Plane &light);
 
-    void render(const std::vector<Sphere> &sphere);
+    void render(const std::vector<Sphere> &sphere, std::chrono::steady_clock::time_point start);
 
 private:
     std::vector<Plane> _planes;

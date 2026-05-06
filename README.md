@@ -23,7 +23,7 @@ On Windows with Visual Studio, the second step produces `Build/Release/pcr.exe`.
 
 ## Run
 
-The renderer writes its output to `<cwd>/../Image/out.ppm`. Run from the `Build/` directory so the image lands at the repo root:
+The renderer writes its output under `<cwd>/../Image/`. Run from the `Build/` directory so images land at the repo root:
 
 ```bash
 cd Build
@@ -39,7 +39,7 @@ It will prompt for three integers on stdin:
 
 Higher values give a cleaner image and a slower render.
 
-The output is a lossless 712x712 PNG. PNG is always lossless, the deflate compression level (default 8, range 0-9) only trades file size for write speed.
+The output is a lossless 712x712 PNG, named `<timestamp>-d#-s#-shadow#-t<ms>.png`, where the timestamp is local-zone `YYYYMMDD-HHMMSS-<ZONE>` and the trailing `t` is render time in milliseconds. Example: `20260506-143234-EDT-d2-s4-shadow2-t115.png`. The renderer also prints the elapsed time to stdout at the end of the run.
 
 ## Scene
 

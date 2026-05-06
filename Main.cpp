@@ -1,11 +1,14 @@
 #include <vector>
 #include <iostream>
+#include <chrono>
 
 #include "Includes/Renderer.h"
 #include "Includes/Sphere.h"
 
 int main()
 {
+    auto start = std::chrono::steady_clock::now();
+
     int depth, samples, shadowSamples;
     std::cout << "Enter depth: " << std::endl;
     std::cin >> depth;
@@ -28,7 +31,7 @@ int main()
     };
     
     Renderer renderer{712, 712, 65.f, depth, samples, shadowSamples, lightSource};
-    renderer.render(spheres);
+    renderer.render(spheres, start);
 
     return 0;
 }
