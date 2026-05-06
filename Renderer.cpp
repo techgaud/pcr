@@ -21,7 +21,7 @@ void Renderer::render(const std::vector<Sphere> &spheres)
     std::vector<Vec3f> frameBuffer(_width * _height);
     Vec3f origin{0, 0, 0};
     float aspect = _width / (float)_height;
-    float scale = std::tan(M_PI / (float)180 * 0.5f * _fov);
+    float scale = std::tan((float)std::numbers::pi / 180.f * 0.5f * _fov);
     unsigned int numThreads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads(numThreads);
 
