@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <string>
 
@@ -13,9 +14,19 @@ class Renderer
 public:
     Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples);
 
+    // Optional GUI hooks. Either may be null (the CLI leaves both null and
+    // gets identical behavior to before). When non-null:
+    //   progressRows   -> incremented by 1 each time a row is finished
+    //   cancelRequested -> checked between rows, render bails if true
+    std::atomic<int> *progressRows = nullptr;
+    std::atomic<bool> *cancelRequested = nullptr;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
+
+    // Filename of the most recently written PNG (set inside render()).
+    std::string lastOutputPath;
 
 private:
     std::vector<Plane> _planes;

@@ -67,6 +67,8 @@ void Renderer::render(const Scenes::SceneData &scene,
                                     try{
             for (size_t i = t; i < (size_t)_height; i += numThreads)
             {
+                if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+                    break;
                 for (size_t j = 0; j < (size_t)_width; j++)
                 {
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
@@ -74,6 +76,8 @@ void Renderer::render(const Scenes::SceneData &scene,
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
                     frameBuffer[i * _width + j] = castRay(ray, scene.spheres, 0);
                 }
+                if (progressRows)
+                    progressRows->fetch_add(1, std::memory_order_relaxed);
             } }
             catch(const std::exception& ex){
                 std::cerr << "Thread " << t << " threw: " << ex.what() << std::endl;
@@ -85,6 +89,13 @@ void Renderer::render(const Scenes::SceneData &scene,
 
     for (auto &t : threads)
         t.join();
+
+    if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+    {
+        std::cout << "Render cancelled before write." << std::endl;
+        lastOutputPath.clear();
+        return;
+    }
 
     std::vector<unsigned char> rgb((size_t)_width * _height * 3);
     for (size_t i = 0; i < (size_t)_width * _height; i++)
@@ -163,6 +174,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     }
 
     std::cout << "Wrote " << outputPath << std::endl;
+    lastOutputPath = outputPath.string();
 }
 
 Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth)
