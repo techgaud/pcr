@@ -3,7 +3,6 @@
 
 #include "Includes/Renderer.h"
 #include "Includes/Sphere.h"
-#include "Includes/Light.h"
 
 int main()
 {

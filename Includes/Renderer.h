@@ -2,7 +2,6 @@
 
 #include "Ray.h"
 #include "Sphere.h"
-#include "Light.h"
 #include "Plane.h"
 
 class Renderer
