@@ -1,6 +1,6 @@
 # pcr
 
-A small CPU path tracer in C++20. Renders a hardcoded Cornell Box scene to a PPM image.
+A small CPU path tracer in C++20. Renders a hardcoded Cornell Box scene to a lossless PNG.
 
 Multi-threaded, cosine-weighted hemisphere sampling for indirect light, explicit area-light sampling with shadow rays for direct light, soft shadows, emissive surfaces, Reinhard tone mapping.
 
@@ -39,7 +39,7 @@ It will prompt for three integers on stdin:
 
 Higher values give a cleaner image and a slower render.
 
-The output is a binary PPM (`P6`) at 712x712. View it with any image tool that handles PPM (Photoshop, GIMP, IrfanView, `feh`, `qlmanage` on macOS, etc.).
+The output is a lossless 712x712 PNG. PNG is always lossless, the deflate compression level (default 8, range 0-9) only trades file size for write speed.
 
 ## Scene
 

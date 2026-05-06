@@ -15,6 +15,7 @@ add_executable(pcr
     Main.cpp
     Renderer.cpp
     NumGen.cpp
+    stb_impl.cpp
 )
 
 target_include_directories(pcr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

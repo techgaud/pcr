@@ -1,4 +1,3 @@
-#include <fstream>
 #include <vector>
 #include <numbers>
 #include <iostream>
@@ -7,6 +6,7 @@
 
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
+#include "Includes/stb_image_write.h"
 
 Renderer::Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples, Plane &light)
     : _width{width}, _height{height}, _fov{fov}, _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples}
@@ -51,42 +51,31 @@ void Renderer::render(const std::vector<Sphere> &spheres)
     for (auto &t : threads)
         t.join();
 
-    std::ofstream ofs;
     std::filesystem::path outputPath =
-        std::filesystem::current_path().parent_path() / "Image" / "out.ppm";
+        std::filesystem::current_path().parent_path() / "Image" / "out.png";
 
     std::filesystem::create_directories(outputPath.parent_path());
 
-    ofs.open(outputPath, std::ios::out | std::ios::binary);
-
-    if (!ofs || !ofs.is_open())
-        std::cerr << "Failed to open file" << std::endl;
-
-    ofs << "P6\n"
-        << _width << " " << _height << "\n255\n";
-
-    float gamma = 2.2f;
-    for (size_t i = 0; i < _width * _height; i++)
+    std::vector<unsigned char> rgb(_width * _height * 3);
+    for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
-        // Vec3f &c = frameBuffer[i];
-        // c[0] = std::min(1.f, c[0]);
-        // c[1] = std::min(1.f, c[1]);
-        // c[2] = std::min(1.f, c[2]);
-
         reinhardToneMap(frameBuffer[i]);
 
         // gamma correction:
-        // c[0] = std::pow(c[0], 1/gamma);
-        // c[1] = std::pow(c[1], 1/gamma);
-        // c[2] = std::pow(c[2], 1/gamma);
+        // const float gamma = 2.2f;
+        // frameBuffer[i][0] = std::pow(frameBuffer[i][0], 1/gamma);
+        // frameBuffer[i][1] = std::pow(frameBuffer[i][1], 1/gamma);
+        // frameBuffer[i][2] = std::pow(frameBuffer[i][2], 1/gamma);
 
-        for (size_t j = 0; j < 3; j++)
-        {
-            ofs << (unsigned char)(255 * frameBuffer[i][j] + 0.5f);
-        }
+        rgb[i * 3 + 0] = (unsigned char)(255 * frameBuffer[i][0] + 0.5f);
+        rgb[i * 3 + 1] = (unsigned char)(255 * frameBuffer[i][1] + 0.5f);
+        rgb[i * 3 + 2] = (unsigned char)(255 * frameBuffer[i][2] + 0.5f);
     }
 
-    ofs.close();
+    // PNG output is always lossless. Compression level only affects file
+    // size vs. write speed; default is 8 (range 0-9), tweak if needed.
+    if (!stbi_write_png(outputPath.string().c_str(), _width, _height, 3, rgb.data(), _width * 3))
+        std::cerr << "Failed to write PNG to " << outputPath << std::endl;
 }
 
 Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth)
