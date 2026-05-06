@@ -44,7 +44,7 @@ Renderer::Renderer(int width, int height, float fov, int depth, int samples, int
     createWalls();
 }
 
-void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_clock::time_point start)
+void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_clock::time_point start, const std::string &outputDir)
 {
     std::vector<Vec3f> frameBuffer(_width * _height);
     Vec3f origin{0, 0, 0};
@@ -107,9 +107,7 @@ void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_cl
                          + "-t" + std::to_string(elapsedMs)
                          + ".png";
 
-    std::filesystem::path outputPath =
-        std::filesystem::current_path().parent_path() / "Image" / filename;
-
+    std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
     std::filesystem::create_directories(outputPath.parent_path());
 
     // PNG output is always lossless. Compression level only affects file

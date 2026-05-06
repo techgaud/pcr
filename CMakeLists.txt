@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pcr CXX)
+project(pcr-cornell CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,18 +11,18 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_executable(pcr
+add_executable(pcr-cornell
     Main.cpp
     Renderer.cpp
     NumGen.cpp
     stb_impl.cpp
 )
 
-target_include_directories(pcr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(pcr PRIVATE Threads::Threads)
+target_include_directories(pcr-cornell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(pcr-cornell PRIVATE Threads::Threads)
 
 if(MSVC)
-    target_compile_options(pcr PRIVATE /W4)
+    target_compile_options(pcr-cornell PRIVATE /W4)
 else()
-    target_compile_options(pcr PRIVATE -Wall -Wextra)
+    target_compile_options(pcr-cornell PRIVATE -Wall -Wextra)
 endif()

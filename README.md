@@ -19,27 +19,71 @@ cmake -S . -B Build
 cmake --build Build --config Release
 ```
 
-On Windows with Visual Studio, the second step produces `Build/Release/pcr.exe`. On Linux and macOS it produces `Build/pcr`.
+On Windows with Visual Studio, the binary lands at `Build/Release/pcr-cornell.exe`. On Linux and macOS it's `Build/pcr-cornell`.
 
 ## Run
 
-The renderer writes its output under `<cwd>/../Image/`. Run from the `Build/` directory so images land at the repo root:
-
 ```bash
-cd Build
-./pcr            # Linux, macOS
-.\Release\pcr    # Windows
+./Build/pcr-cornell -d 4 -s 16 -S 4
 ```
 
-It will prompt for three integers on stdin:
+All flags are optional — defaults render a reasonable image.
 
-1. `depth`, max ray bounces (try 4)
-2. `samples`, indirect-lighting samples per pixel hit (try 16)
-3. `shadowSamples`, direct-light shadow rays per pixel hit (try 4)
+### Flags
 
-Higher values give a cleaner image and a slower render.
+| Short | Long | Default | Meaning |
+|-------|------|---------|---------|
+| `-d` | `--depth` | `4` | Max ray bounces |
+| `-s` | `--samples` | `16` | Indirect-light samples per hit |
+| `-S` | `--shadow` | `4` | Direct-light shadow rays per hit |
+| | `--tz`, `--timezone` | system local | Timezone for filename, see below |
+| `-o` | `--output` | `$PWD/Image` | Output directory |
+| `-h` | `--help` | | Print usage and exit |
 
-The output is a lossless 712x712 PNG, named `<timestamp>-d#-s#-shadow#-t<ms>.png`, where the timestamp is local-zone `YYYYMMDD-HHMMSS-<ZONE>` and the trailing `t` is render time in milliseconds. Example: `20260506-143234-EDT-d2-s4-shadow2-t115.png`. The renderer also prints the elapsed time to stdout at the end of the run.
+### Output
+
+Each render writes to `<output-dir>/<timestamp>-d#-s#-shadow#-t<ms>.png`. Example:
+
+```
+20260506-143234-EDT-d2-s4-shadow2-t115.png
+```
+
+The timestamp is `YYYYMMDD-HHMMSS-<ZONE>`. Render time in milliseconds is appended as `t<ms>` and also printed to stdout.
+
+### Timezones
+
+`--tz` accepts friendly short names that map to DST-aware POSIX strings:
+
+| You pass | Internally set to | Result label in May | Result label in December |
+|----------|-------------------|---------------------|--------------------------|
+| `EST` | `EST5EDT` | `EDT` | `EST` |
+| `CST` | `CST6CDT` | `CDT` | `CST` |
+| `MST` | `MST7MDT` | `MDT` | `MST` |
+| `PST` | `PST8PDT` | `PDT` | `PST` |
+| `UTC` | `UTC` | `UTC` | `UTC` |
+
+Anything not in the table is passed through verbatim, so power users can do `--tz America/New_York` or `--tz Etc/GMT+5`. Without `--tz`, the binary uses the system's local time.
+
+### Example invocations
+
+```bash
+# Quick noisy preview (~1 sec)
+./Build/pcr-cornell -d 2 -s 4 -S 2
+
+# Reasonable quality (~15 sec)
+./Build/pcr-cornell -d 4 -s 16 -S 4
+
+# Production-ish (~minutes)
+./Build/pcr-cornell -d 5 -s 64 -S 8 --tz EST -o ~/renders
+```
+
+View the resulting `.png` with any image viewer:
+
+```bash
+xdg-open Image/*.png   # Linux
+open Image/*.png       # macOS
+start Image/*.png      # Windows
+```
 
 ## Scene
 
