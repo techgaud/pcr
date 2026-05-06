@@ -12,22 +12,30 @@ A C++20 compiler and CMake 3.20+:
 - **macOS**, Apple Clang 14+ (Xcode 14, macOS 12 or newer)
 - **Windows**, MSVC from Visual Studio 2019 16.10+ (2022 recommended)
 
+## Layout
+
+Source code lives under `code/`. Renders are written to `Image/` next to it (default), so the source tree stays clean while past renders are preserved beside the code that produced them.
+
 ## Build
 
+From the repo root:
+
 ```bash
-cmake -S . -B Build
-cmake --build Build --config Release
+cmake -S code -B code/Build
+cmake --build code/Build --config Release
 ```
 
-On Windows with Visual Studio, the binary lands at `Build/Release/pcr-cornell.exe`. On Linux and macOS it's `Build/pcr-cornell`.
+On Windows with Visual Studio, the binary lands at `code/Build/Release/pcr-cornell.exe`. On Linux and macOS it's `code/Build/pcr-cornell`.
 
 ## Run
 
+Run from the repo root so the default `$PWD/Image/` resolves to `pcr/Image/`:
+
 ```bash
-./Build/pcr-cornell -d 4 -s 16 -S 4
+./code/Build/pcr-cornell -d 4 -s 16 -S 4
 ```
 
-All flags are optional — defaults render a reasonable image.
+All flags are optional — defaults render a reasonable image. Pass `-o <dir>` to send renders elsewhere.
 
 ### Flags
 
@@ -68,13 +76,13 @@ Anything not in the table is passed through verbatim, so power users can do `--t
 
 ```bash
 # Quick noisy preview (~1 sec)
-./Build/pcr-cornell -d 2 -s 4 -S 2
+./code/Build/pcr-cornell -d 2 -s 4 -S 2
 
 # Reasonable quality (~15 sec)
-./Build/pcr-cornell -d 4 -s 16 -S 4
+./code/Build/pcr-cornell -d 4 -s 16 -S 4
 
 # Production-ish (~minutes)
-./Build/pcr-cornell -d 5 -s 64 -S 8 --tz EST -o ~/renders
+./code/Build/pcr-cornell -d 5 -s 64 -S 8 --tz EST -o ~/renders
 ```
 
 View the resulting `.png` with any image viewer:
@@ -87,4 +95,4 @@ start Image/*.png      # Windows
 
 ## Scene
 
-The scene is defined in `Main.cpp`. Walls and the area light live in `Renderer::createWalls` and the `lightSource` Plane. To try a different scene, edit those and rebuild.
+The scene is defined in `code/Main.cpp`. Walls and the area light live in `Renderer::createWalls` and the `lightSource` Plane. To try a different scene, edit those and rebuild.
