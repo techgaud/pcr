@@ -43,6 +43,17 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+# X11 only. Wayland support would require libwayland-dev + wayland-protocols
+# at build time, which not every Linux box has and CI doesn't bother with.
+set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+
+# Propagate the static-CRT setting to GLFW (and any other FetchContent deps)
+# *before* their config runs, so we don't end up with our /MT linking against
+# GLFW's /MD and getting CRT-mismatch link errors on MSVC.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
+endif()
+
 FetchContent_Declare(
     glfw
     GIT_REPOSITORY https://github.com/glfw/glfw.git
