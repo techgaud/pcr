@@ -40,6 +40,16 @@ sudo apt install libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev li
 
 Windows and macOS need no additional packages beyond Visual Studio / Xcode CLT.
 
+### Don't want to install a toolchain?
+
+GitHub Actions builds Windows, Linux, and macOS binaries on every push. Just grab the artifact:
+
+1. Open `github.com/techgaud/pcr/actions`, pick the latest run
+2. Scroll to "Artifacts", download the one for your OS
+3. Extract the ZIP, double-click the binary
+
+Or push a tag (`git tag v1.0.0 && git push origin v1.0.0`) and the workflow auto-publishes a GitHub Release with all three OS binaries attached at `github.com/techgaud/pcr/releases`.
+
 ## Run (GUI)
 
 Double-click the GUI binary, or from a shell:

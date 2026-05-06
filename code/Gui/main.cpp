@@ -298,6 +298,36 @@ int main(int, char **)
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
+        // Top-right About button. Right-aligned by manually positioning the cursor.
+        {
+            const float btnW = 70.f;
+            float windowW = ImGui::GetWindowSize().x;
+            float padX = ImGui::GetStyle().WindowPadding.x;
+            ImGui::SetCursorPosX(windowW - btnW - padX);
+            if (ImGui::Button("About", ImVec2(btnW, 0)))
+                ImGui::OpenPopup("About##popup");
+        }
+
+        if (ImGui::BeginPopupModal("About##popup", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::Text("physically cringe renderer");
+            ImGui::Text("Version 1.0.0");
+            ImGui::Separator();
+            ImGui::TextWrapped("CPU path tracer with a Cornell Box scene.");
+            ImGui::Spacing();
+            ImGui::Text("Source: github.com/techgaud/pcr");
+            ImGui::Spacing();
+            ImGui::SeparatorText("Vendored libraries");
+            ImGui::BulletText("Dear ImGui v1.91.5 (MIT)");
+            ImGui::BulletText("GLFW 3.4 (zlib)");
+            ImGui::BulletText("lodepng v20260119 (zlib)");
+            ImGui::BulletText("nlohmann json v3.11.3 (MIT)");
+            ImGui::Spacing();
+            if (ImGui::Button("Close", ImVec2(120, 0)))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
         // Scene picker.
         const auto &reg = sceneRegistry();
         if (ImGui::BeginCombo("Scene", reg[settings.sceneIndex].name))

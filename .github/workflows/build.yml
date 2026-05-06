@@ -1,0 +1,114 @@
+name: Build
+
+on:
+  push:
+    branches: [main, gui]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Build (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S code -B code/Build
+
+      - name: Build
+        run: cmake --build code/Build --config Release
+
+      - name: Smoke test (CLI)
+        shell: bash
+        run: ./code/Build/Release/pcr-cornell.exe -d 2 -s 4 -S 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcr-windows-x64
+          path: |
+            code/Build/Release/pcr-cornell.exe
+            code/Build/Release/physically-cringe-renderer-v1.0.0.exe
+          if-no-files-found: error
+          retention-days: 90
+
+  linux:
+    name: Build (Linux x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GLFW build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libgl1-mesa-dev libxrandr-dev libxinerama-dev \
+            libxcursor-dev libxi-dev pkg-config
+
+      - name: Configure
+        run: cmake -S code -B code/Build
+
+      - name: Build
+        run: cmake --build code/Build -j
+
+      - name: Smoke test (CLI)
+        run: ./code/Build/pcr-cornell -d 2 -s 4 -S 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcr-linux-x64
+          path: |
+            code/Build/pcr-cornell
+            code/Build/physically-cringe-renderer-v1.0.0
+          if-no-files-found: error
+          retention-days: 90
+
+  macos:
+    name: Build (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S code -B code/Build
+
+      - name: Build
+        run: cmake --build code/Build -j
+
+      - name: Smoke test (CLI)
+        run: ./code/Build/pcr-cornell -d 2 -s 4 -S 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcr-macos-arm64
+          path: |
+            code/Build/pcr-cornell
+            code/Build/physically-cringe-renderer-v1.0.0
+          if-no-files-found: error
+          retention-days: 90
+
+  release:
+    name: Publish GitHub Release
+    needs: [windows, linux, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Stage release archives
+        run: |
+          mkdir -p release
+          (cd pcr-windows-x64 && zip -r ../release/pcr-windows-x64.zip .)
+          (cd pcr-linux-x64 && chmod +x * && tar -czf ../release/pcr-linux-x64.tar.gz .)
+          (cd pcr-macos-arm64 && chmod +x * && tar -czf ../release/pcr-macos-arm64.tar.gz .)
+          ls -la release/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
