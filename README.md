@@ -110,19 +110,23 @@ Anything not in the table passes through verbatim, so power users can do `--tz A
 
 ### Example invocations
 
+Times below are wall-clock from a Linux x86_64 container, multi-threaded across the host's CPU cores. Your machine will vary. Cost grows roughly linearly in pixel count and faster than linearly in `samples` (this is a branched path tracer).
+
 ```bash
-# Quick noisy preview (~150 ms at default 720, ~325 ms at 1080)
+# Quick noisy preview (~150 ms at 720, ~325 ms at 1080)
 ./code/Build/pcr-cornell -d 2 -s 4 -S 2
 
-# Reasonable quality (~15 sec at 720, ~35 sec at 1080)
+# Decent quality, visible noise (~4 min at 720, ~10 min at 1080)
 ./code/Build/pcr-cornell -d 4 -s 16 -S 4
 
-# Production-ish (~minutes), 1080 square, EST-stamped, custom output dir
-./code/Build/pcr-cornell -d 5 -s 64 -S 8 -w 1080 --tz EST -o ~/renders
+# Picture-perfect, near-zero noise (~1 hr at 720, ~2-3 hr at 1080)
+./code/Build/pcr-cornell -d 4 -s 256 -S 4 -w 1080 --tz EST -o ~/renders
 
 # Non-square (1920x1080)
 ./code/Build/pcr-cornell -w 1920 --height 1080
 ```
+
+Rule of thumb: doubling `--samples` roughly doubles render time and roughly halves visible noise (sqrt scaling). To go from "decent" to "clean" usually costs 4-16x more time.
 
 View the resulting `.png` with any image viewer:
 
