@@ -9,7 +9,7 @@
 
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
-#include "Includes/stb_image_write.h"
+#include "Includes/lodepng.h"
 
 namespace
 {
@@ -36,16 +36,23 @@ namespace
     }
 }
 
-Renderer::Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples, Plane &light)
+Renderer::Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples)
     : _width{width}, _height{height}, _fov{fov}, _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples}
 {
-    _light = light;
-    _planes.push_back(light);
-    createWalls();
 }
 
-void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_clock::time_point start, const std::string &outputDir)
+void Renderer::render(const Scenes::SceneData &scene,
+                      std::chrono::steady_clock::time_point start,
+                      const std::string &outputDir)
 {
+    // Scene geometry: light first, then walls. Spheres are passed through
+    // separately to castRay/sceneIntersect since they use a different intersect.
+    _light = scene.lightSource;
+    _planes.clear();
+    _planes.push_back(_light);
+    for (const auto &w : scene.walls)
+        _planes.push_back(w);
+
     std::vector<Vec3f> frameBuffer(_width * _height);
     Vec3f origin{0, 0, 0};
     float aspect = _width / (float)_height;
@@ -58,16 +65,16 @@ void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_cl
         threads[t] = std::thread([&, t]()
                                  {
                                     try{
-            for (size_t i = t; i < _height; i += numThreads)
+            for (size_t i = t; i < (size_t)_height; i += numThreads)
             {
-                for (size_t j = 0; j < _width; j++)
+                for (size_t j = 0; j < (size_t)_width; j++)
                 {
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
                     auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
-                    frameBuffer[i * _width + j] = castRay(ray, spheres, 0);
+                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, 0);
                 }
-            } } 
+            } }
             catch(const std::exception& ex){
                 std::cerr << "Thread " << t << " threw: " << ex.what() << std::endl;
             }
@@ -79,7 +86,7 @@ void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_cl
     for (auto &t : threads)
         t.join();
 
-    std::vector<unsigned char> rgb(_width * _height * 3);
+    std::vector<unsigned char> rgb((size_t)_width * _height * 3);
     for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
         reinhardToneMap(frameBuffer[i]);
@@ -99,23 +106,63 @@ void Renderer::render(const std::vector<Sphere> &spheres, std::chrono::steady_cl
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << "Render took " << elapsedMs << " ms" << std::endl;
 
-    // Filename: <timestamp>-d#-s#-shadow#-t<ms>.png. Flip the bool to use UTC.
-    std::string filename = formatTimestamp(false)
+    std::string timestamp = formatTimestamp(false); // flip to true for UTC
+
+    // Filename: <scene>-<version>-<timestamp>-d#-s#-S#-w#[-h#]-t<ms>.png.
+    // Height segment is omitted when height == width (the common square case).
+    std::string filename = scene.name + "-" + scene.version + "-"
+                         + timestamp
                          + "-d" + std::to_string(_maxDepth)
                          + "-s" + std::to_string(_samples)
-                         + "-shadow" + std::to_string(_shadowSamples)
-                         + "-t" + std::to_string(elapsedMs)
-                         + ".png";
+                         + "-S" + std::to_string(_shadowSamples)
+                         + "-w" + std::to_string(_width);
+    if (_width != _height)
+        filename += "-h" + std::to_string(_height);
+    filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
     std::filesystem::create_directories(outputPath.parent_path());
 
-    // PNG output is always lossless. Compression level only affects file
-    // size vs. write speed; default is 8 (range 0-9), tweak if needed.
-    if (!stbi_write_png(outputPath.string().c_str(), _width, _height, 3, rgb.data(), _width * 3))
-        std::cerr << "Failed to write PNG to " << outputPath << std::endl;
-    else
-        std::cout << "Wrote " << outputPath << std::endl;
+    // Encode PNG via lodepng so we can attach tEXt metadata chunks.
+    lodepng::State state;
+    state.info_raw.colortype = LCT_RGB;
+    state.info_raw.bitdepth = 8;
+    state.info_png.color.colortype = LCT_RGB;
+    state.info_png.color.bitdepth = 8;
+    // 0 = write uncompressed tEXt chunks (lodepng default writes zTXt). For
+    // short metadata strings tEXt is simpler and more universally readable.
+    state.encoder.text_compression = 0;
+
+    auto addText = [&](const char *key, const std::string &val) {
+        lodepng_add_text(&state.info_png, key, val.c_str());
+    };
+    addText("Software", "pcr-cornell");
+    addText("Scene", scene.name);
+    addText("SceneVersion", scene.version);
+    addText("CreationTime", timestamp);
+    addText("Depth", std::to_string(_maxDepth));
+    addText("Samples", std::to_string(_samples));
+    addText("ShadowSamples", std::to_string(_shadowSamples));
+    addText("Width", std::to_string(_width));
+    addText("Height", std::to_string(_height));
+    addText("RenderTimeMs", std::to_string(elapsedMs));
+
+    std::vector<unsigned char> pngBuffer;
+    unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
+    if (encErr)
+    {
+        std::cerr << "lodepng encode error " << encErr << ": " << lodepng_error_text(encErr) << std::endl;
+        return;
+    }
+
+    unsigned saveErr = lodepng::save_file(pngBuffer, outputPath.string());
+    if (saveErr)
+    {
+        std::cerr << "lodepng save error " << saveErr << ": " << lodepng_error_text(saveErr) << " (path: " << outputPath << ")" << std::endl;
+        return;
+    }
+
+    std::cout << "Wrote " << outputPath << std::endl;
 }
 
 Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth)
@@ -139,16 +186,17 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
     //  auto reflected = Ray(reflectDir, reflectOrig);
     //  indirectLo += castRay(reflected, spheres, depth + 1) * material.albedo;
 
-    for (size_t i = 0; i < _samples; i++)
+    for (size_t i = 0; i < (size_t)_samples; i++)
     {
         auto randomRay = Ray::genRayFromIntersection(N, hit + N * 1e-3);
         auto cos = std::max(0.f, randomRay.dir.dot(N));
+        (void)cos;
         indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo;
     }
     indirectLo /= _samples;
 
     Vec3f directLo;
-    for (size_t i = 0; i < _shadowSamples; i++)
+    for (size_t i = 0; i < (size_t)_shadowSamples; i++)
     {
         auto Li = _light.getVecToPlaneFromHit(hit);
         auto wi = Li.normalize();
@@ -201,19 +249,6 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
     return closest_t < std::numeric_limits<float>::max();
 }
 
-void Renderer::createWalls()
-{
-    auto cream = Material{Vec3f(0.74f, 0.74f, 0.64f), Vec3f(0, 0, 0)};
-    auto red = Material{Vec3f(0.63f, 0.06f, 0.05f), Vec3f(0, 0, 0)};
-    auto green = Material{Vec3f(0.13f, 0.45f, 0.1f), Vec3f(0, 0, 0)};
-
-    _planes.emplace_back(Vec3f{-2.f, 2.f, -6.f}, Vec3f{4, 0, 0}, Vec3f{0, 0, 7}, cream);  // ceiling
-    _planes.emplace_back(Vec3f{2.f, 2.f, -6.f}, Vec3f{-6, 0, 0}, Vec3f{0, -6, 0}, cream); // back wall
-    _planes.emplace_back(Vec3f{2.f, -2.f, 0.f}, Vec3f{0, 0, -7}, Vec3f{-4, 0, 0}, cream); // floor
-    _planes.emplace_back(Vec3f{2.f, -2.f, 0.f}, Vec3f{0, 4, 0}, Vec3f{0, 0, -6}, green);  // right wall
-    _planes.emplace_back(Vec3f{-2.f, -2.f, -6.f}, Vec3f{0, 4, 0}, Vec3f{0, 0, 6}, red);   // left wall
-}
-
 void Renderer::reinhardToneMap(Vec3f &color)
 {
     // normal reinhard
@@ -224,7 +259,7 @@ void Renderer::reinhardToneMap(Vec3f &color)
     // reinhard-jodie version
     // const float exposure = 0.65f;
     // color *= exposure;
-    
+
     // float luminance = 0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2];
     // if(luminance <= 0.f)
     //     return;

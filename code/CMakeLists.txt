@@ -15,10 +15,14 @@ add_executable(pcr-cornell
     Main.cpp
     Renderer.cpp
     NumGen.cpp
-    stb_impl.cpp
+    lodepng.cpp
+    Scenes/Cornell.cpp
 )
 
-target_include_directories(pcr-cornell PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(pcr-cornell PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/Includes
+)
 target_link_libraries(pcr-cornell PRIVATE Threads::Threads)
 
 if(MSVC)

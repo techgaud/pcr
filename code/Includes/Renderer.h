@@ -6,13 +6,16 @@
 #include "Ray.h"
 #include "Sphere.h"
 #include "Plane.h"
+#include "../Scenes/Scene.h"
 
 class Renderer
 {
 public:
-    Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples, Plane &light);
+    Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples);
 
-    void render(const std::vector<Sphere> &sphere, std::chrono::steady_clock::time_point start, const std::string &outputDir);
+    void render(const Scenes::SceneData &scene,
+                std::chrono::steady_clock::time_point start,
+                const std::string &outputDir);
 
 private:
     std::vector<Plane> _planes;
@@ -26,6 +29,5 @@ private:
 
     Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth);
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres, Vec3f &hit, Vec3f &N, Material &material);
-    void createWalls();
     void reinhardToneMap(Vec3f &color);
 };
