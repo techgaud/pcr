@@ -29,20 +29,26 @@
 
   "camera": { "position": [0, 0, 0], "fov": 38 },
 
+  // Materials are RGB approximations of Cornell's published spectral
+  // reflectance data for the box. The cream "white" is genuinely
+  // neutral (slightly cooler than our usual 0.74,0.74,0.64) and the
+  // light is closer to D65 daylight than our usual warm-tungsten
+  // (1.0,0.85,0.6) — both choices match what canonical reference
+  // images of the Cornell Box look like.
   "materials": {
-    "cream":     { "albedo": [0.74, 0.74, 0.64] },
-    "red":       { "albedo": [0.63, 0.06, 0.05] },
-    "green":     { "albedo": [0.13, 0.45, 0.10] },
-    "warmlight": { "emissive": [80.0, 68.0, 48.0] }
+    "white":      { "albedo": [0.725, 0.71, 0.68] },
+    "red":        { "albedo": [0.63, 0.065, 0.05] },
+    "green":      { "albedo": [0.14, 0.45, 0.091] },
+    "neutrallight": { "emissive": [70.0, 65.0, 55.0] }
   },
 
   "primitives": [
     { "type": "plane", "name": "ceiling",
-      "origin": [-2, 2, -9.80], "u": [4, 0, 0], "v": [0, 0, 4.03], "material": "cream" },
+      "origin": [-2, 2, -9.80], "u": [4, 0, 0], "v": [0, 0, 4.03], "material": "white" },
     { "type": "plane", "name": "back-wall",
-      "origin": [2, 2, -9.80], "u": [-4, 0, 0], "v": [0, -4, 0], "material": "cream" },
+      "origin": [2, 2, -9.80], "u": [-4, 0, 0], "v": [0, -4, 0], "material": "white" },
     { "type": "plane", "name": "floor",
-      "origin": [2, -2, -5.77], "u": [0, 0, -4.03], "v": [-4, 0, 0], "material": "cream" },
+      "origin": [2, -2, -5.77], "u": [0, 0, -4.03], "v": [-4, 0, 0], "material": "white" },
     { "type": "plane", "name": "right-wall",
       "origin": [2, -2, -5.77], "u": [0, 4, 0], "v": [0, 0, -4.03], "material": "green" },
     { "type": "plane", "name": "left-wall",
@@ -50,44 +56,44 @@
 
     { "type": "plane", "name": "tall-bottom",
       "origin": [-1.4017, -2.0, -8.6882], "u": [1.134, 0, -0.3575], "v": [0.3575, 0, 1.134],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "tall-top",
       "origin": [-1.4017, 0.3782, -8.6882], "u": [1.134, 0, -0.3575], "v": [0.3575, 0, 1.134],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "tall-back",
       "origin": [-1.4017, -2.0, -8.6882], "u": [1.134, 0, -0.3575], "v": [0, 2.378, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "tall-front",
       "origin": [-1.0441, -2.0, -7.5542], "u": [1.134, 0, -0.3575], "v": [0, 2.378, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "tall-left",
       "origin": [-1.4017, -2.0, -8.6882], "u": [0.3575, 0, 1.134], "v": [0, 2.378, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "tall-right",
       "origin": [-0.2677, -2.0, -9.0458], "u": [0.3575, 0, 1.134], "v": [0, 2.378, 0],
-      "material": "cream" },
+      "material": "white" },
 
     { "type": "plane", "name": "short-bottom",
       "origin": [0.2749, -2.0, -7.7358], "u": [1.134, 0, 0.3575], "v": [-0.3575, 0, 1.134],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "short-top",
       "origin": [0.2749, -0.8109, -7.7358], "u": [1.134, 0, 0.3575], "v": [-0.3575, 0, 1.134],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "short-back",
       "origin": [0.2749, -2.0, -7.7358], "u": [1.134, 0, 0.3575], "v": [0, 1.189, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "short-front",
       "origin": [-0.0827, -2.0, -6.6018], "u": [1.134, 0, 0.3575], "v": [0, 1.189, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "short-left",
       "origin": [0.2749, -2.0, -7.7358], "u": [-0.3575, 0, 1.134], "v": [0, 1.189, 0],
-      "material": "cream" },
+      "material": "white" },
     { "type": "plane", "name": "short-right",
       "origin": [1.4089, -2.0, -7.3782], "u": [-0.3575, 0, 1.134], "v": [0, 1.189, 0],
-      "material": "cream" },
+      "material": "white" },
 
     { "type": "plane", "name": "area-light", "light": true,
       "origin": [-0.469, 1.95, -7.41], "u": [0.937, 0, 0], "v": [0, 0, 0.757],
-      "material": "warmlight" }
+      "material": "neutrallight" }
   ]
 }

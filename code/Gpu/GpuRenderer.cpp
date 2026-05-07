@@ -1210,16 +1210,28 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // took 245 sec ≈ 1.87e9 work-units-per-second. 0.15 sec target =
     // ~2.8e8 work units per dispatch.
     int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
-    double bvhMult = 1.0;
+
+    // Per-ray cost depends on how many primitives sceneIntersect tests.
+    // Spheres + planes are linear in count; triangles go through the BVH
+    // at log(N/leafSize) cost. Without this multiplier, tile sizing
+    // assumes a baseline-cornell scene (~7 primitives) and over-sizes
+    // tiles for plane-heavy scenes — cornell-spec with 18 primitives
+    // hits TDR at the same tile size that cornell handles fine.
+    constexpr double kBaselinePrimitives = 7.0; // cornell baseline
+    int primCount = (int)scene.spheres.size() + (int)scene.walls.size();
+    for (const auto &L : scene.areaLights)
+        if (L.kind == Scenes::AreaLightKind::Plane) primCount++;
+    double primMult = std::max(1.0, (double)primCount / kBaselinePrimitives);
+    double bvhMult = 0.0;
     if ((int)scene.triangles.size() > 4)
     {
         // Each ray traverses ~log2(N/leafSize) BVH nodes. AABB tests are
         // cheap (~1/4 of a triangle test); the 4-tri leaves add a few
         // full triangle tests per ray.
         double depth = std::log2((double)scene.triangles.size() / 4.0);
-        bvhMult = 1.0 + depth * 0.25;
+        bvhMult = depth * 0.25;
     }
-    double effectivePerPixel = (double)workPerPixel * bvhMult;
+    double effectivePerPixel = (double)workPerPixel * (primMult + bvhMult);
     constexpr double kTargetWorkPerDispatch = 2.8e8;
     double maxPixelsD = kTargetWorkPerDispatch / effectivePerPixel;
     int maxPixelsPerDispatch = std::max(64, (int)maxPixelsD);
