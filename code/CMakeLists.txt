@@ -24,6 +24,7 @@ set(PCR_RENDERER_SOURCES
     Scenes/CornellLargeLight.cpp
     Scenes/SceneLoader.cpp
     Scenes/SceneDiscovery.cpp
+    Scenes/MeshLoader.cpp
     Bvh/Bvh.cpp
 )
 
@@ -33,8 +34,14 @@ set(PCR_RENDERER_SOURCES
 # executable-dir fallback in SceneDiscovery. Uses per-file copy_if_different
 # rather than copy_directory because parallel builds otherwise race when
 # multiple targets POST_BUILD into the same destination.
+#
+# Mesh files in repo-root models/ are deployed the same way; JSON scenes
+# reference them via relative paths (e.g. "../models/foo.obj") which the
+# CMake post-build resolves by mirroring the layout.
 set(PCR_SCENES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Scenes)
+set(PCR_MODELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../models)
 file(GLOB PCR_SCENE_JSON_FILES "${PCR_SCENES_DIR}/*.json")
+file(GLOB PCR_MODEL_FILES "${PCR_MODELS_DIR}/*.obj" "${PCR_MODELS_DIR}/*.mtl")
 function(pcr_deploy_scenes target)
     foreach(scene_file ${PCR_SCENE_JSON_FILES})
         get_filename_component(scene_name ${scene_file} NAME)
@@ -44,6 +51,17 @@ function(pcr_deploy_scenes target)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     ${scene_file}
                     $<TARGET_FILE_DIR:${target}>/Scenes/${scene_name}
+            VERBATIM
+        )
+    endforeach()
+    foreach(model_file ${PCR_MODEL_FILES})
+        get_filename_component(model_name ${model_file} NAME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    $<TARGET_FILE_DIR:${target}>/models
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${model_file}
+                    $<TARGET_FILE_DIR:${target}>/models/${model_name}
             VERBATIM
         )
     endforeach()

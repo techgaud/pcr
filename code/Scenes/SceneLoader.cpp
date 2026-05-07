@@ -10,6 +10,7 @@
 #include "../Includes/Sphere.h"
 #include "../Includes/Triangle.h"
 #include "../Includes/Vec3f.h"
+#include "MeshLoader.h"
 
 namespace Scenes
 {
@@ -212,9 +213,60 @@ namespace Scenes
             return Plane(origin, u, v, mat);
         }
 
+        // Mesh primitive parser. Reads file/transform/material override,
+        // delegates the OBJ parse + transform + triangle generation to
+        // MeshLoader, and appends the resulting triangles to SceneData.
+        // Resolves "file" relative to the JSON scene's directory so a JSON
+        // can reference ../models/foo.obj predictably regardless of cwd.
+        void parseMesh(const json &p,
+                       std::unordered_map<std::string, Material> &mats,
+                       SceneData &out,
+                       const std::string &fieldPath,
+                       const std::string &scenePath)
+        {
+            std::string fileRel = requireString(p, "file", fieldPath, scenePath);
+            std::filesystem::path objPath = std::filesystem::path(scenePath).parent_path() / fileRel;
+
+            MeshOptions opts;
+            if (auto it = p.find("position"); it != p.end())
+                opts.position = vec3FromJson(*it, fieldPath + ".position");
+            if (auto it = p.find("rotation"); it != p.end())
+                opts.rotation = vec3FromJson(*it, fieldPath + ".rotation");
+            if (auto it = p.find("scale"); it != p.end())
+            {
+                if (it->is_number())
+                {
+                    float s = it->get<float>();
+                    opts.scale = Vec3f(s, s, s);
+                }
+                else
+                {
+                    opts.scale = vec3FromJson(*it, fieldPath + ".scale");
+                }
+            }
+            if (auto it = p.find("material"); it != p.end() && it->is_string())
+            {
+                opts.materialOverride = it->get<std::string>();
+                opts.hasMaterialOverride = true;
+            }
+            if (auto it = p.find("smooth"); it != p.end())
+            {
+                if (!it->is_boolean())
+                    throw SceneLoaderError(scenePath + ": " + fieldPath +
+                                           ".smooth must be a boolean");
+                opts.smoothOverride = it->get<bool>();
+                opts.hasSmoothOverride = true;
+            }
+
+            auto tris = loadMesh(objPath.string(), opts, mats);
+            out.triangles.insert(out.triangles.end(),
+                                 std::make_move_iterator(tris.begin()),
+                                 std::make_move_iterator(tris.end()));
+        }
+
         // Walk the primitives array. Builds spheres + walls + identifies the
         // single light-flagged primitive (must be a plane).
-        void parsePrimitives(const json &j, const std::unordered_map<std::string, Material> &mats,
+        void parsePrimitives(const json &j, std::unordered_map<std::string, Material> &mats,
                              SceneData &out, const std::string &path)
         {
             auto it = j.find("primitives");
@@ -233,9 +285,15 @@ namespace Scenes
                 bool isLight = p.value("light", false);
 
                 if (type == "mesh")
-                    throw SceneLoaderError(path + ": " + fieldPath +
-                                           ": mesh primitives are reserved in the schema "
-                                           "but not yet supported by this binary");
+                {
+                    if (isLight)
+                        throw SceneLoaderError(path + ": " + fieldPath +
+                                               ": light flag on mesh not yet supported "
+                                               "(triangle area-light sampling lands in phase 3b); "
+                                               "use a plane light for now");
+                    parseMesh(p, mats, out, fieldPath, path);
+                    continue;
+                }
                 if (type == "sphere")
                 {
                     if (isLight)
@@ -273,6 +331,8 @@ namespace Scenes
                                            "\" (expected sphere, plane, triangle, or mesh)");
                 }
             }
+            // Note: mesh handling above uses 'continue' to skip the if-else
+            // chain above. The light-count check below still needs to fire.
             if (lightCount == 0)
                 throw SceneLoaderError(path + ": exactly one primitive must have \"light\": true; found none");
             if (lightCount > 1)
@@ -308,6 +368,9 @@ namespace Scenes
 
         auto materials = parseMaterials(j, path);
         parsePrimitives(j, materials, out, path);
+        // parsePrimitives may have grown `materials` from MTL files that
+        // OBJ meshes pull in, but we don't surface those to the caller —
+        // primitives reference them only via the registry above.
 
         // Build the BVH now so renders don't pay the cost (and so the GPU
         // upload path in phase 4 can ship pre-built nodes verbatim). The

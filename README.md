@@ -113,6 +113,7 @@ Scenes can be hardcoded in C++ (always available, baked into the binary) or auth
 | `cornell`             | `1.1.0` | `Scenes/cornell.json` (1.0.0 hardcoded fallback if JSON missing) |
 | `cornell-spheres`     | `1.0.0` | `Scenes/cornell-spheres.json` (1.0.0 hardcoded fallback) |
 | `cornell-large-light` | `1.0.0` | `Scenes/cornell-large-light.json` (1.0.0 hardcoded fallback) |
+| `cornell-bunny`       | `1.0.0` | `Scenes/cornell-bunny.json` (Stanford bunny in cornell box) |
 
 Each scene declares its own version number that bumps when the scene definition changes. The scene name and version are baked into the output filename and PNG metadata, so renders stay traceable to the exact scene revision that produced them.
 
@@ -245,7 +246,27 @@ Drop a `*.json` file in `Scenes/` at the repo root (or anywhere `--scenes-dir` p
 }
 ```
 
-Primitive types: `sphere`, `plane`, `triangle`. Triangles take `v0`/`v1`/`v2` plus optional `n0`/`n1`/`n2` per-vertex normals for smooth shading (omit for flat shading from the geometric normal). Triangle lights are not yet supported — keep the area light as a separate plane primitive. (A `mesh` discriminator is reserved for OBJ-import support landing in phase 3.) Materials are a named registry referenced by name from each primitive. Bump `version` whenever geometry changes meaningfully — it shows up in the output filename and PNG metadata, so renders stay traceable.
+Primitive types: `sphere`, `plane`, `triangle`, `mesh`. Triangles take `v0`/`v1`/`v2` plus optional `n0`/`n1`/`n2` per-vertex normals for smooth shading (omit for flat shading from the geometric normal). Meshes load OBJ files — see the "Mesh import" subsection below. Triangle and mesh lights are not yet supported — keep the area light as a separate plane primitive. Materials are a named registry referenced by name from each primitive.
+
+### Mesh import
+
+To drop a mesh into a scene, point a `mesh` primitive at an OBJ file:
+
+```jsonc
+{ "type": "mesh",
+  "file": "../models/stanford-bunny.obj",
+  "scale": 8,
+  "rotation": [0, 180, 0],   // Euler XYZ degrees
+  "position": [0, -2, -4.5],
+  "material": "bunny-tan"    // optional; if set, overrides MTL materials
+}
+```
+
+`file` is resolved relative to the JSON scene's directory. `scale` is either a scalar (uniform) or `[sx, sy, sz]`. `rotation` is Euler XYZ in degrees, applied X then Y then Z. `position` is applied after scale + rotation. If the OBJ ships vertex normals, smooth shading is on by default; pass `"smooth": false` to force flat shading.
+
+The OBJ's `mtllib` directive is honored. MTL materials enter the registry under their MTL-given names; the JSON `materials` block can shadow them. A per-mesh `material` override clobbers all MTL materials for that mesh. Texture maps in MTL (`map_Kd` etc.) are ignored with a warning today — texture support is planned.
+
+The repo ships the Stanford bunny (~69k triangles) at `models/stanford-bunny.obj`, demoed by `cornell-bunny.json`. Renders use a BVH for log(N) triangle intersection cost, so even high-poly meshes are tractable. Bump `version` whenever geometry changes meaningfully — it shows up in the output filename and PNG metadata, so renders stay traceable.
 
 The CLI rescans on every invocation; the GUI rescans on combo open. Use `--list-scenes` to see what the binary picks up.
 
