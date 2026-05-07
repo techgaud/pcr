@@ -25,9 +25,42 @@ cmake -S code -B code/Build
 cmake --build code/Build --config Release
 ```
 
-On Windows with Visual Studio, the binary lands at `code/Build/Release/pcr-cornell.exe`. On Linux and macOS it's `code/Build/pcr-cornell`.
+This produces two executables:
 
-## Run
+- **`pcr-cornell`** — the CLI renderer (small, headless, scriptable)
+- **`physically-cringe-renderer-v1.0.0`** — the GUI app (sliders, render button, image preview)
+
+On Windows with Visual Studio they land at `code/Build/Release/<name>.exe`. On Linux and macOS they're at `code/Build/<name>`.
+
+The GUI target uses GLFW (fetched + built statically by CMake on first configure, ~30 sec) and Dear ImGui (vendored under `code/Includes/imgui/`). On Linux you'll need X11 dev headers installed:
+
+```bash
+sudo apt install libgl1-mesa-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev pkg-config
+```
+
+Windows and macOS need no additional packages beyond Visual Studio / Xcode CLT.
+
+### Don't want to install a toolchain?
+
+GitHub Actions builds Windows, Linux, and macOS binaries on every push. Just grab the artifact:
+
+1. Open `github.com/techgaud/pcr/actions`, pick the latest run
+2. Scroll to "Artifacts", download the one for your OS
+3. Extract the ZIP, double-click the binary
+
+Or push a tag (`git tag v1.0.0 && git push origin v1.0.0`) and the workflow auto-publishes a GitHub Release with all three OS binaries attached at `github.com/techgaud/pcr/releases`.
+
+## Run (GUI)
+
+Double-click the GUI binary, or from a shell:
+
+```bash
+./code/Build/physically-cringe-renderer-v1.0.0
+```
+
+Sliders set every parameter the CLI exposes (depth, samples, shadow, width, square checkbox + height, scene, timezone, output dir). Click **Render** and the path tracer runs on a worker thread; progress is reported as rows-completed-of-total. **Cancel** mid-render works. When the render finishes the resulting PNG is loaded and shown in the same window. Settings persist to `physically-cringe-renderer.json` next to the executable.
+
+## Run (CLI)
 
 Run from the repo root so the default `$PWD/Image/` resolves to `pcr/Image/`:
 

@@ -11,14 +11,19 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_executable(pcr-cornell
-    Main.cpp
+# --- Shared renderer sources used by both CLI and GUI ---------------------
+set(PCR_RENDERER_SOURCES
     Renderer.cpp
     NumGen.cpp
     lodepng.cpp
     Scenes/Cornell.cpp
 )
 
+# --- CLI target -----------------------------------------------------------
+add_executable(pcr-cornell
+    Main.cpp
+    ${PCR_RENDERER_SOURCES}
+)
 target_include_directories(pcr-cornell PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Includes
@@ -29,4 +34,71 @@ if(MSVC)
     target_compile_options(pcr-cornell PRIVATE /W4)
 else()
     target_compile_options(pcr-cornell PRIVATE -Wall -Wextra)
+endif()
+
+# --- GUI target -----------------------------------------------------------
+# Fetch GLFW for static linking. First build downloads + builds it (~30s).
+include(FetchContent)
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+# X11 only. Wayland support would require libwayland-dev + wayland-protocols
+# at build time, which not every Linux box has and CI doesn't bother with.
+set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+
+# Propagate the static-CRT setting to GLFW (and any other FetchContent deps)
+# *before* their config runs, so we don't end up with our /MT linking against
+# GLFW's /MD and getting CRT-mismatch link errors on MSVC.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "" FORCE)
+endif()
+
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG 3.4
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(glfw)
+
+find_package(OpenGL REQUIRED)
+
+set(IMGUI_SOURCES
+    Includes/imgui/imgui.cpp
+    Includes/imgui/imgui_draw.cpp
+    Includes/imgui/imgui_widgets.cpp
+    Includes/imgui/imgui_tables.cpp
+    Includes/imgui/backends/imgui_impl_glfw.cpp
+    Includes/imgui/backends/imgui_impl_opengl3.cpp
+)
+
+add_executable(physically-cringe-renderer-v1.0.0
+    Gui/main.cpp
+    ${IMGUI_SOURCES}
+    ${PCR_RENDERER_SOURCES}
+)
+target_include_directories(physically-cringe-renderer-v1.0.0 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/Includes
+    ${CMAKE_CURRENT_SOURCE_DIR}/Includes/imgui
+)
+target_link_libraries(physically-cringe-renderer-v1.0.0 PRIVATE
+    glfw
+    OpenGL::GL
+    Threads::Threads
+)
+
+# Static MSVC runtime so the .exe ships without VC++ Redistributable.
+# Use /SUBSYSTEM:WINDOWS so a console window doesn't pop up alongside the GUI.
+# NOMINMAX prevents <windows.h> (pulled in by portable-file-dialogs.h) from
+# defining min/max as macros that break std::min, std::numeric_limits::max,
+# etc. WIN32_LEAN_AND_MEAN trims unused Windows headers for faster compile.
+if(MSVC)
+    set_property(TARGET physically-cringe-renderer-v1.0.0 PROPERTY
+                 MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions(physically-cringe-renderer-v1.0.0 PRIVATE
+                               NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_options(physically-cringe-renderer-v1.0.0 PRIVATE
+                        "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
 endif()

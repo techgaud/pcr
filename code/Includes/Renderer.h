@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <string>
 
 #include "Ray.h"
@@ -13,9 +15,24 @@ class Renderer
 public:
     Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples);
 
+    // Optional GUI hooks. All may be null (the CLI leaves them null and
+    // gets identical behavior to before). When non-null:
+    //   progressRows    -> incremented by 1 each time a row is finished
+    //   cancelRequested -> checked between rows, render bails if true
+    //   onPartialFrame  -> called periodically (~2 Hz) from a snapshot thread
+    //                      while the render is running, with the current (still
+    //                      mutating) framebuffer. The callback should copy out
+    //                      what it needs and return quickly.
+    std::atomic<int> *progressRows = nullptr;
+    std::atomic<bool> *cancelRequested = nullptr;
+    std::function<void(const std::vector<Vec3f> &, int width, int height)> onPartialFrame;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
+
+    // Filename of the most recently written PNG (set inside render()).
+    std::string lastOutputPath;
 
 private:
     std::vector<Plane> _planes;
