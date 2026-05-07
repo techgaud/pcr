@@ -38,8 +38,10 @@
 #ifdef _WIN32
 // CMake's pcr_apply_msvc_release_flags target already defines NOMINMAX and
 // WIN32_LEAN_AND_MEAN for the GUI binaries, so this include is safe to pull
-// in for the AllocConsole / SetConsoleCtrlHandler calls in main().
+// in for the AllocConsole / pipe / fan-out plumbing in main().
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 #endif
 
 #include "imgui/imgui.h"
@@ -611,36 +613,93 @@ int main(int, char **)
 {
 #ifdef _WIN32
     // /SUBSYSTEM:WINDOWS detaches stderr/stdout from any console, so error
-    // output from the renderer (shader compile failures, GL errors, GPU
-    // readback errors, GLFW errors, exception text from the worker
-    // thread's catch blocks) is silently discarded — particularly painful
-    // when the GPU dies via TDR and there's no on-screen indication of
-    // what happened.
+    // output (shader compile failures, GL errors, GPU readback errors,
+    // GLFW errors, worker-thread exception text) is silently discarded —
+    // painful when a GPU dies via TDR and there's no on-screen trace.
     //
-    // Pop a console window at startup if we don't already have one
-    // attached (the rare case is launching from cmd / powershell, where
-    // stderr already goes somewhere visible). Closing this console
-    // otherwise sends CTRL_CLOSE_EVENT which kills the process — install
-    // a handler that swallows that event so the user can dismiss the
-    // console without losing their render. Quitting still works via the
-    // GUI window's close button.
+    // Architecture for visibility:
+    //   - AllocConsole pops a real console window at startup
+    //   - stderr + stdout get redirected to the write end of a pipe
+    //   - a detached fan-out thread reads the pipe and writes each chunk
+    //     to BOTH the console (live view, copy via right-click → Mark)
+    //     AND a log file <binary>.log next to the cwd (permanent record)
+    //
+    // Existing fprintf(stderr, ...) / std::cerr calls in the codebase
+    // are teed transparently — no changes at the call sites needed.
     if (GetConsoleWindow() == nullptr)
     {
-        AllocConsole();
-        std::freopen("CONOUT$", "w", stderr);
-        std::freopen("CONOUT$", "w", stdout);
-        std::freopen("CONIN$",  "r", stdin);
-        SetConsoleTitleA(PCR_BINARY_NAME " — log");
-        SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
-            return ev == CTRL_CLOSE_EVENT; // swallow Close; let Ctrl-C through
-        }, TRUE);
-        std::fprintf(stderr,
-                     "%s starting (build " __DATE__ " " __TIME__ ")\n"
-                     "Renderer error messages, GLFW errors, and worker-thread\n"
-                     "exception text will print here. Closing this window\n"
-                     "won't quit the app.\n\n",
-                     PCR_BINARY_NAME);
-        std::fflush(stderr);
+        if (AllocConsole())
+        {
+            SetConsoleTitleA(PCR_BINARY_NAME " — log");
+            // Closing the console window otherwise kills the process via
+            // CTRL_CLOSE_EVENT; swallow that so the user can dismiss the
+            // console without losing their in-progress render. Quitting
+            // still works via the GUI window's close button.
+            SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
+                return ev == CTRL_CLOSE_EVENT;
+            }, TRUE);
+
+            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+            std::string logPath = std::string(PCR_BINARY_NAME) + ".log";
+            HANDLE hLog = CreateFileA(logPath.c_str(),
+                                      FILE_APPEND_DATA, FILE_SHARE_READ,
+                                      nullptr, CREATE_ALWAYS,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+
+            HANDLE hPipeRead = INVALID_HANDLE_VALUE, hPipeWrite = INVALID_HANDLE_VALUE;
+            bool teeReady = false;
+            if (CreatePipe(&hPipeRead, &hPipeWrite, nullptr, 0))
+            {
+                int writeFd = _open_osfhandle((intptr_t)hPipeWrite, _O_TEXT);
+                if (writeFd >= 0)
+                {
+                    _dup2(writeFd, _fileno(stderr));
+                    _dup2(writeFd, _fileno(stdout));
+                    _close(writeFd); // dup2'd fds keep the pipe handle alive
+                    // Unbuffered so writes pump through the pipe immediately
+                    // — otherwise short error messages might sit in the CRT
+                    // buffer until a crash flushes them, defeating the
+                    // whole point of a live console.
+                    std::setvbuf(stderr, nullptr, _IONBF, 0);
+                    std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+                    std::thread([hPipeRead, hConsole, hLog]() {
+                        char buf[4096];
+                        DWORD n;
+                        while (ReadFile(hPipeRead, buf, sizeof(buf), &n, nullptr) && n > 0)
+                        {
+                            DWORD written;
+                            WriteFile(hConsole, buf, n, &written, nullptr);
+                            if (hLog != INVALID_HANDLE_VALUE)
+                                WriteFile(hLog, buf, n, &written, nullptr);
+                        }
+                    }).detach();
+                    teeReady = true;
+                }
+                else
+                {
+                    CloseHandle(hPipeWrite);
+                    CloseHandle(hPipeRead);
+                }
+            }
+
+            // Fallback if the pipe wiring failed for any reason: at least
+            // get console output, even without the file copy.
+            if (!teeReady)
+            {
+                std::freopen("CONOUT$", "w", stderr);
+                std::freopen("CONOUT$", "w", stdout);
+                if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+            }
+
+            std::fprintf(stderr,
+                         "%s starting (build " __DATE__ " " __TIME__ ")\n"
+                         "Output goes here AND to %s in the working dir.\n"
+                         "Right-click → Mark to select & copy. Closing this\n"
+                         "window won't quit the app.\n\n",
+                         PCR_BINARY_NAME, logPath.c_str());
+            std::fflush(stderr);
+        }
     }
 #endif
 
