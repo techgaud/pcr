@@ -1197,32 +1197,41 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // both dimensions, so a Picture-class render on a 70k-tri mesh at 1080
     // dispatches small enough chunks regardless of resolution.
     //
-    // Tile size is computed from per-pixel work × BVH overhead, targeting
-    // ~0.5 sec per dispatch on a Threadripper-class GPU (calibrated from
-    // a measured cornell-spheres render of 245 sec / 4.59e11 ops ≈ 0.53
-    // ns per op). Sides clamped to [16, 256] and rounded down to a 16-px
-    // multiple (the work-group local size), so each tile aligns cleanly
-    // and the work-group bounds-check in the shader doesn't waste many
-    // invocations.
+    // Tile size is computed from per-pixel work × BVH overhead. Target
+    // ~0.15 sec per dispatch on the calibration GPU — a 13x safety margin
+    // from the 2-sec Windows TDR cliff. The previous 0.5-sec target hit
+    // TDR in practice because (a) GPU clock varies under thermal load
+    // (the same shader runs ~2x slower a few seconds in than at peak),
+    // (b) first-dispatch driver overhead inflates the early tiles, and
+    // (c) workload variance across the image means some tiles do more
+    // work than the average.
+    //
+    // Calibration source: cornell-spheres at 1080² × 393216 work units
+    // took 245 sec ≈ 1.87e9 work-units-per-second. 0.15 sec target =
+    // ~2.8e8 work units per dispatch.
     int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
     double bvhMult = 1.0;
     if ((int)scene.triangles.size() > 4)
     {
         // Each ray traverses ~log2(N/leafSize) BVH nodes. AABB tests are
         // cheap (~1/4 of a triangle test); the 4-tri leaves add a few
-        // full triangle tests per ray. Approximation calibrated against
-        // bunny-on-Picture observations.
+        // full triangle tests per ray.
         double depth = std::log2((double)scene.triangles.size() / 4.0);
         bvhMult = 1.0 + depth * 0.25;
     }
     double effectivePerPixel = (double)workPerPixel * bvhMult;
-    constexpr double kTargetOpsPerDispatch = 9.4e8; // ~0.5 sec on the dev GPU
-    int maxPixelsPerDispatch = (int)(kTargetOpsPerDispatch / effectivePerPixel);
-    if (maxPixelsPerDispatch < 256) maxPixelsPerDispatch = 256;
+    constexpr double kTargetWorkPerDispatch = 2.8e8;
+    double maxPixelsD = kTargetWorkPerDispatch / effectivePerPixel;
+    int maxPixelsPerDispatch = std::max(64, (int)maxPixelsD);
     int tileSide = (int)std::sqrt((double)maxPixelsPerDispatch);
-    tileSide = std::clamp(tileSide, 16, 256);
-    tileSide = (tileSide / 16) * 16; // align to work-group multiples
-    if (tileSide < 16) tileSide = 16;
+    // Tile floor: heavy per-pixel work needs aggressive small tiles even at
+    // the cost of more dispatch overhead. Light work uses bigger tiles to
+    // avoid drowning in glFinish overhead.
+    int minTileSide = (effectivePerPixel > 5e5) ? 8 : 16;
+    tileSide = std::clamp(tileSide, minTileSide, 256);
+    // No work-group-multiple rounding; the shader's per-axis bounds check
+    // handles non-multiples. The 16x16 work-group still dispatches a few
+    // wasted invocations at the tile edge, but only ~6% on average.
 
     int tilesX = (_width  + tileSide - 1) / tileSide;
     int tilesY = (_height + tileSide - 1) / tileSide;
