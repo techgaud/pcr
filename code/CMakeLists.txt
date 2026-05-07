@@ -22,7 +22,31 @@ set(PCR_RENDERER_SOURCES
     Scenes/Cornell.cpp
     Scenes/CornellSpheres.cpp
     Scenes/CornellLargeLight.cpp
+    Scenes/SceneLoader.cpp
+    Scenes/SceneDiscovery.cpp
 )
+
+# --- Scene file deployment ----------------------------------------------
+# Copy repo-root Scenes/*.json next to each built binary so running the
+# binary by path (with no special cwd) still resolves scenes via the
+# executable-dir fallback in SceneDiscovery. Uses per-file copy_if_different
+# rather than copy_directory because parallel builds otherwise race when
+# multiple targets POST_BUILD into the same destination.
+set(PCR_SCENES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Scenes)
+file(GLOB PCR_SCENE_JSON_FILES "${PCR_SCENES_DIR}/*.json")
+function(pcr_deploy_scenes target)
+    foreach(scene_file ${PCR_SCENE_JSON_FILES})
+        get_filename_component(scene_name ${scene_file} NAME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    $<TARGET_FILE_DIR:${target}>/Scenes
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${scene_file}
+                    $<TARGET_FILE_DIR:${target}>/Scenes/${scene_name}
+            VERBATIM
+        )
+    endforeach()
+endfunction()
 
 # --- CLI: frank-based-rendering-cli ---------------------------------------
 # CPU only, headless. Use this for scripting and homelab servers.
@@ -44,6 +68,7 @@ if(MSVC)
 else()
     target_compile_options(frank-based-rendering-cli PRIVATE -Wall -Wextra)
 endif()
+pcr_deploy_scenes(frank-based-rendering-cli)
 
 # --- GUI dependencies (shared by both GUI binaries) ---------------------
 # Fetch GLFW for static linking. First build downloads + builds it (~30s).
@@ -118,6 +143,7 @@ target_compile_definitions(frank-based-rendering PRIVATE
     PCR_USE_GPU=0
 )
 pcr_apply_msvc_release_flags(frank-based-rendering)
+pcr_deploy_scenes(frank-based-rendering)
 
 # --- GPU GUI: physically-cringe-rendering --------------------------------
 # Skipped on Apple platforms: macOS caps OpenGL at 4.1, but the compute
@@ -137,4 +163,5 @@ if(NOT APPLE)
         PCR_USE_GPU=1
     )
     pcr_apply_msvc_release_flags(physically-cringe-rendering)
+    pcr_deploy_scenes(physically-cringe-rendering)
 endif()

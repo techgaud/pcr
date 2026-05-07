@@ -42,8 +42,8 @@ namespace
     }
 }
 
-Renderer::Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples)
-    : _width{width}, _height{height}, _fov{fov}, _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples}
+Renderer::Renderer(int width, int height, int depth, int samples, int shadowSamples)
+    : _width{width}, _height{height}, _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples}
 {
 }
 
@@ -60,9 +60,9 @@ void Renderer::render(const Scenes::SceneData &scene,
         _planes.push_back(w);
 
     std::vector<Vec3f> frameBuffer(_width * _height);
-    Vec3f origin{0, 0, 0};
+    Vec3f origin = scene.camera.position;
     float aspect = _width / (float)_height;
-    float scale = std::tan((float)std::numbers::pi / 180.f * 0.5f * _fov);
+    float scale = std::tan((float)std::numbers::pi / 180.f * 0.5f * scene.camera.fov);
     unsigned int numThreads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads(numThreads);
 

@@ -94,6 +94,8 @@ All flags are optional — defaults render a 720x720 Cornell Box at decent quali
 | | `--height` | (matches `-w`) | Output height; if omitted, output is square |
 | | `--tz`, `--timezone` | system local | Timezone for filename, see below |
 | `-o` | `--output` | `$PWD/Image` | Output directory |
+| | `--scenes-dir` | (none) | Extra directory to search for `*.json` scene files. May be passed multiple times. Searched before the default `$PWD/Scenes` and `<binary-dir>/Scenes`. |
+| | `--list-scenes` | | Print all discovered scenes (hardcoded + JSON) with name, version, source, then exit. |
 | | `--denoise` | off | 5x5 cross-bilateral filter on output, reduces speckle |
 | | `--mis` | off | MIS on direct lighting (partial impl, light-side only) |
 | | `--russian` | off | Russian roulette path termination at depth >= 1 |
@@ -104,13 +106,28 @@ The four "techniques" flags are off by default to keep behavior matching v1.0.0;
 
 ### Scenes
 
-Currently shipped:
+Scenes can be hardcoded in C++ (always available, baked into the binary) or authored as JSON files dropped into a `Scenes/` directory. Currently shipped:
 
-| Name | Version |
-|------|---------|
-| `cornell` | `1.0.0` |
+| Name | Version | Source |
+|------|---------|--------|
+| `cornell`             | `1.1.0` | `Scenes/cornell.json` (1.0.0 hardcoded fallback if JSON missing) |
+| `cornell-spheres`     | `1.0.0` | `Scenes/cornell-spheres.json` (1.0.0 hardcoded fallback) |
+| `cornell-large-light` | `1.0.0` | `Scenes/cornell-large-light.json` (1.0.0 hardcoded fallback) |
 
-Each scene declares its own version number that bumps when the scene definition changes. The scene name and version are baked into the output filename and the PNG metadata, so renders stay traceable to the exact scene revision that produced them.
+Each scene declares its own version number that bumps when the scene definition changes. The scene name and version are baked into the output filename and PNG metadata, so renders stay traceable to the exact scene revision that produced them.
+
+Run with `--list-scenes` to see what the binary discovers in your environment, including which file (or "hardcoded") backs each one.
+
+### Scene file search path
+
+When the binary starts it merges scenes from:
+
+1. Any directory passed via `--scenes-dir` (CLI; may be passed multiple times)
+2. `$PWD/Scenes/`
+3. The directory containing the running binary, plus `Scenes/`
+4. Hardcoded C++ scenes baked into the binary (fallback for any name not found in steps 1-3)
+
+JSON wins over hardcoded on name collision. Within JSON dirs, earlier dirs in the search order win.
 
 ### Output filename
 
@@ -193,11 +210,52 @@ start Image/*.png      # Windows
 
 ## Scenes
 
-Each scene lives in `code/Scenes/`. A scene defines its name, version, geometry (walls + spheres), and area light. To add a new scene:
+A scene defines its name, version, camera, geometry (walls + spheres), and area light. There are two ways to add one.
+
+### JSON (preferred)
+
+Drop a `*.json` file in `Scenes/` at the repo root (or anywhere `--scenes-dir` points). Schema is `1.0`; comments (`//`) are supported. Smallest possible scene:
+
+```jsonc
+{
+  "schema": "1.0",
+  "name": "my-scene",
+  "version": "1.0.0",
+
+  "camera": { "position": [0, 0, 0], "fov": 65 },
+
+  "materials": {
+    "white": { "albedo": [0.74, 0.74, 0.64] },
+    "light": { "emissive": [80, 68, 48] }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7],
+      "material": "white" },
+
+    { "type": "sphere", "center": [0, -1, -4.5], "radius": 0.75,
+      "material": "white" },
+
+    // Exactly one primitive must be flagged as the area light.
+    { "type": "plane", "light": true,
+      "origin": [-0.375, 2, -4.25], "u": [0.75, 0, 0], "v": [0, 0, 0.4],
+      "material": "light" }
+  ]
+}
+```
+
+Primitive types: `sphere`, `plane`. (A `mesh` discriminator is reserved in the schema for future triangle-mesh support; the loader rejects it with a clear error today.) Materials are a named registry referenced by name from each primitive. Bump `version` whenever geometry changes meaningfully — it shows up in the output filename and PNG metadata, so renders stay traceable.
+
+The CLI rescans on every invocation; the GUI rescans on combo open. Use `--list-scenes` to see what the binary picks up.
+
+### C++ (only for hardcoded fallbacks)
+
+Use this only if the scene must work without `Scenes/` next to the binary (e.g. cornell, which ships as a 1.0.0 fallback so a standalone binary download still has at least one scene to render). To add one:
 
 1. Create `code/Scenes/<Name>.h` declaring `Scenes::make<Name>()` and a `<NAME>_VERSION` constexpr.
-2. Create `code/Scenes/<Name>.cpp` implementing the factory.
-3. Add the `.cpp` to `code/CMakeLists.txt`.
-4. Register it in the `sceneRegistry()` map in `code/Cli/Main.cpp`.
+2. Create `code/Scenes/<Name>.cpp` implementing the factory (populate `SceneData` including `camera`).
+3. Add the `.cpp` to `PCR_RENDERER_SOURCES` in `code/CMakeLists.txt`.
+4. Register it in `kHardcoded[]` inside `code/Scenes/SceneDiscovery.cpp`.
 
-Bump `<NAME>_VERSION` whenever you make a change to the scene that produces a visibly different render.
+Bump `<NAME>_VERSION` whenever the scene changes visibly. JSON files of the same name override the hardcoded version.

@@ -13,7 +13,7 @@
 class Renderer
 {
 public:
-    Renderer(int width, int height, float fov, int depth, int samples, int shadowSamples);
+    Renderer(int width, int height, int depth, int samples, int shadowSamples);
 
     // Optional GUI hooks. All may be null (the CLI leaves them null and
     // gets identical behavior to before). When non-null:
@@ -44,7 +44,6 @@ public:
 private:
     std::vector<Plane> _planes;
     Plane _light;
-    const float _fov;
     const int _width;
     const int _height;
     const int _maxDepth;

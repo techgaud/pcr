@@ -64,9 +64,8 @@
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Scenes/Scene.h"
-#include "Scenes/Cornell.h"
-#include "Scenes/CornellSpheres.h"
-#include "Scenes/CornellLargeLight.h"
+#include "Scenes/SceneDiscovery.h"
+#include "Scenes/SceneLoader.h"
 
 #if PCR_USE_GPU
 #include "Gpu/GpuRenderer.h"
@@ -88,7 +87,9 @@ struct Settings
     int width = 720;
     int height = 720;
     bool square = true;
-    int sceneIndex = 0;     // index into the scene combo
+    // Scene by name, not by combo index, so reordering or adding scenes
+    // doesn't silently rebind the user's last choice.
+    std::string sceneName = "cornell";
     int timezoneIndex = 0;  // index into the tz combo
     std::string outputDir;
     bool darkTheme = true;
@@ -123,7 +124,7 @@ static void loadSettings(Settings &s)
         s.width = j.value("width", s.width);
         s.height = j.value("height", s.height);
         s.square = j.value("square", s.square);
-        s.sceneIndex = j.value("sceneIndex", s.sceneIndex);
+        s.sceneName = j.value("sceneName", s.sceneName);
         s.timezoneIndex = j.value("timezoneIndex", s.timezoneIndex);
         s.outputDir = j.value("outputDir", s.outputDir);
         s.darkTheme = j.value("darkTheme", s.darkTheme);
@@ -147,7 +148,7 @@ static void saveSettings(const Settings &s)
     j["width"] = s.width;
     j["height"] = s.height;
     j["square"] = s.square;
-    j["sceneIndex"] = s.sceneIndex;
+    j["sceneName"] = s.sceneName;
     j["timezoneIndex"] = s.timezoneIndex;
     j["outputDir"] = s.outputDir;
     j["darkTheme"] = s.darkTheme;
@@ -182,21 +183,6 @@ static void applyTimezone(const std::string &tz)
     setenv("TZ", resolved.c_str(), 1);
 #endif
     tzset();
-}
-
-// --- Scene registry ------------------------------------------------------
-
-using SceneFactory = std::function<Scenes::SceneData()>;
-struct SceneEntry { const char *name; SceneFactory factory; };
-
-static const std::vector<SceneEntry> &sceneRegistry()
-{
-    static const std::vector<SceneEntry> r = {
-        {"cornell",             &Scenes::makeCornell},
-        {"cornell-spheres",     &Scenes::makeCornellSpheres},
-        {"cornell-large-light", &Scenes::makeCornellLargeLight},
-    };
-    return r;
 }
 
 // --- Render job state (shared between GUI thread and worker) -------------
@@ -236,6 +222,7 @@ struct LivePreview
 // on its worker thread. Created at startup with share=mainWindow so they can
 // see each other's GL resources. Ignored by the CPU build.
 static void runRender(RenderJob *job, LivePreview *live, Settings settings,
+                      std::function<Scenes::SceneData()> sceneLoader,
                       GLFWwindow *gpuShared)
 {
     job->running = true;
@@ -251,26 +238,25 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
     {
         applyTimezone(kTimezones[settings.timezoneIndex]);
 
-        const auto &reg = sceneRegistry();
-        if (settings.sceneIndex < 0 || settings.sceneIndex >= (int)reg.size())
+        if (!sceneLoader)
         {
-            job->errorMessage = "Invalid scene selection";
+            job->errorMessage = "No scene selected";
             job->running = false;
             return;
         }
-        Scenes::SceneData sceneData = reg[settings.sceneIndex].factory();
+        Scenes::SceneData sceneData = sceneLoader();
 
         std::string outDir = settings.outputDir;
         if (outDir.empty())
             outDir = (fs::current_path() / "Image").string();
 
 #if PCR_USE_GPU
-        PCRRenderer renderer{settings.width, settings.height, 65.f,
+        PCRRenderer renderer{settings.width, settings.height,
                              settings.depth, settings.samples, settings.shadowSamples,
                              gpuShared};
 #else
         (void)gpuShared;
-        PCRRenderer renderer{settings.width, settings.height, 65.f,
+        PCRRenderer renderer{settings.width, settings.height,
                              settings.depth, settings.samples, settings.shadowSamples};
 #endif
         renderer.progressRows = &job->rowsCompleted;
@@ -559,6 +545,28 @@ int main(int, char **)
     Settings settings;
     loadSettings(settings);
 
+    // Discovered scenes are cached and refreshed on demand. The GUI rescans
+    // every time the user opens the scene combo so JSON files dropped into
+    // Scenes/ at runtime show up without restarting.
+    std::vector<Scenes::DiscoveredScene> sceneRegistry;
+    std::string sceneScanError;
+    auto rescanScenes = [&]() {
+        sceneScanError.clear();
+        sceneRegistry = Scenes::discoverScenes({}, [&](const std::string &msg) {
+            if (!sceneScanError.empty()) sceneScanError += "\n";
+            sceneScanError += msg;
+        });
+    };
+    rescanScenes();
+
+    // Find the index for the scene the settings pointed at; fall back to the
+    // first scene in the registry if the saved name no longer exists.
+    auto findSceneIndex = [&](const std::string &name) -> int {
+        for (int i = 0; i < (int)sceneRegistry.size(); i++)
+            if (sceneRegistry[i].name == name) return i;
+        return sceneRegistry.empty() ? -1 : 0;
+    };
+
     auto applyTheme = [](bool dark) {
         if (dark) ImGui::StyleColorsDark();
         else      ImGui::StyleColorsLight();
@@ -665,20 +673,41 @@ int main(int, char **)
             ImGui::EndPopup();
         }
 
-        // Scene picker.
-        const auto &reg = sceneRegistry();
-        if (ImGui::BeginCombo("Scene", reg[settings.sceneIndex].name))
+        // Scene picker. Rescan every time the user opens the combo so a JSON
+        // file dropped into Scenes/ shows up without an app restart.
+        int curSceneIdx = findSceneIndex(settings.sceneName);
+        const char *curSceneLabel = curSceneIdx >= 0
+            ? sceneRegistry[curSceneIdx].name.c_str()
+            : "(none)";
+        bool comboOpen = ImGui::BeginCombo("Scene", curSceneLabel);
+        // BeginCombo returns true the frame the popup is open, but we only
+        // want to rescan once when it transitions closed -> open.
+        static bool wasComboOpen = false;
+        if (comboOpen && !wasComboOpen)
+            rescanScenes();
+        wasComboOpen = comboOpen;
+        if (comboOpen)
         {
-            for (int i = 0; i < (int)reg.size(); i++)
+            for (int i = 0; i < (int)sceneRegistry.size(); i++)
             {
-                bool sel = (i == settings.sceneIndex);
-                if (ImGui::Selectable(reg[i].name, sel))
-                    settings.sceneIndex = i;
+                const auto &s = sceneRegistry[i];
+                bool sel = (i == curSceneIdx);
+                if (ImGui::Selectable(s.name.c_str(), sel))
+                    settings.sceneName = s.name;
                 if (sel)
                     ImGui::SetItemDefaultFocus();
+                if (ImGui::IsItemHovered())
+                {
+                    if (s.source == Scenes::DiscoveredScene::Source::Hardcoded)
+                        ImGui::SetTooltip("v%s — built into binary", s.version.c_str());
+                    else
+                        ImGui::SetTooltip("v%s — %s", s.version.c_str(), s.filePath.c_str());
+                }
             }
             ImGui::EndCombo();
         }
+        if (!sceneScanError.empty())
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Scene scan: %s", sceneScanError.c_str());
 
         ImGui::SeparatorText("Quality");
 
@@ -766,7 +795,12 @@ int main(int, char **)
         }
 
         bool isRunning = job.running.load();
-        ImGui::BeginDisabled(isRunning);
+        // Snapshot the loader closure now so the worker uses what was
+        // selected at click-time, not whatever the user picks during render.
+        std::function<Scenes::SceneData()> sceneLoader;
+        if (curSceneIdx >= 0)
+            sceneLoader = sceneRegistry[curSceneIdx].load;
+        ImGui::BeginDisabled(isRunning || !sceneLoader);
         if (ImGui::Button("Render", ImVec2(120, 0)))
         {
             // Capture settings by value, kick worker.
@@ -774,7 +808,8 @@ int main(int, char **)
                 job.worker.join();
             freeImage(previewImg);
             previewLoadedFrom.clear();
-            job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
+            job.worker = std::thread(runRender, &job, &live, settings,
+                                     sceneLoader, gpuShared);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -853,7 +888,8 @@ int main(int, char **)
                     job.worker.join();
                 freeImage(previewImg);
                 previewLoadedFrom.clear();
-                job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
+                job.worker = std::thread(runRender, &job, &live, settings,
+                                         sceneLoader, gpuShared);
             }
 
             if (!previewMetadata.empty() && ImGui::TreeNode("Metadata (PNG tEXt chunks)"))

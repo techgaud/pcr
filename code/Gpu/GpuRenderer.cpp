@@ -106,6 +106,7 @@ using GLintptr = ptrdiff_t;
     X(GLint,  GetUniformLocation,   GLuint, const GLchar *)                       \
     X(void,   Uniform1i,            GLint, GLint)                                 \
     X(void,   Uniform1f,            GLint, GLfloat)                               \
+    X(void,   Uniform3f,            GLint, GLfloat, GLfloat, GLfloat)             \
     X(void,   Uniform2i,            GLint, GLint, GLint)                          \
     X(void,   GenBuffers,           GLsizei, GLuint *)                            \
     X(void,   DeleteBuffers,        GLsizei, const GLuint *)                      \
@@ -147,6 +148,7 @@ PCR_GL_FUNCS(PCR_DECLARE_GL_FN)
 #define glGetUniformLocation  pcr_glGetUniformLocation
 #define glUniform1i           pcr_glUniform1i
 #define glUniform1f           pcr_glUniform1f
+#define glUniform3f           pcr_glUniform3f
 #define glUniform2i           pcr_glUniform2i
 #define glGenBuffers          pcr_glGenBuffers
 #define glDeleteBuffers       pcr_glDeleteBuffers
@@ -191,6 +193,7 @@ layout(rgba8, binding = 0) uniform writeonly image2D uOutput;
 uniform int   uWidth;
 uniform int   uHeight;
 uniform float uFov;
+uniform vec3  uOrigin;
 uniform int   uDepth;
 uniform int   uSamples;
 uniform int   uShadowSamples;
@@ -326,7 +329,7 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
     float x = ((2.0 * (pix.x + 0.5) / float(uWidth)) - 1.0) * scale * aspect;
     float y = -((2.0 * (pix.y + 0.5) / float(uHeight)) - 1.0) * scale;
     vec3 rd = normalize(vec3(x, y, -1.0));
-    vec3 ro = vec3(0.0);
+    vec3 ro = uOrigin;
 
     vec3 throughput = vec3(1.0);
     vec3 radiance = vec3(0.0);
@@ -545,10 +548,10 @@ namespace
 
 // ---------- GpuRenderer ---------------------------------------------------
 
-GpuRenderer::GpuRenderer(int width, int height, float fov,
+GpuRenderer::GpuRenderer(int width, int height,
                          int depth, int samples, int shadowSamples,
                          GLFWwindow *sharedContext)
-    : _width{width}, _height{height}, _fov{fov},
+    : _width{width}, _height{height},
       _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples},
       _sharedContext{sharedContext}
 {
@@ -710,10 +713,16 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     auto setF = [&](const char *name, float v) {
         glUniform1f(glGetUniformLocation(_program, name), v);
     };
+    auto setV3 = [&](const char *name, float x, float y, float z) {
+        glUniform3f(glGetUniformLocation(_program, name), x, y, z);
+    };
 
     setI("uWidth",          _width);
     setI("uHeight",         _height);
-    setF("uFov",            _fov);
+    setF("uFov",            scene.camera.fov);
+    setV3("uOrigin",        scene.camera.position[0],
+                            scene.camera.position[1],
+                            scene.camera.position[2]);
     setI("uDepth",          _maxDepth);
     setI("uSamples",        _samples);
     setI("uShadowSamples",  _shadowSamples);

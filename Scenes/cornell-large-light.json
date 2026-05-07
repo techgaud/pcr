@@ -1,0 +1,44 @@
+{
+  "schema": "1.0",
+  "name": "cornell-large-light",
+  "version": "1.0.0",
+
+  "camera": {
+    "position": [0, 0, 0],
+    "fov": 65
+  },
+
+  "materials": {
+    "cream":      { "albedo": [0.74, 0.74, 0.64] },
+    "red":        { "albedo": [0.63, 0.06, 0.05] },
+    "green":      { "albedo": [0.13, 0.45, 0.10] },
+    "nonemissive":{ "albedo": [0.40, 0.40, 0.30] },
+    "warmlight":  { "emissive": [80.0, 68.0, 48.0] }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7],
+      "material": "cream" },
+    { "type": "plane", "name": "back-wall",
+      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "floor",
+      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6],
+      "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6],
+      "material": "red" },
+
+    { "type": "sphere", "center": [0, -1, -4.5], "radius": 0.75, "material": "nonemissive" },
+
+    // Larger ceiling light: 2.0 wide x 0.4 deep instead of 0.75 x 0.4. Softer
+    // shadows and faster convergence at any sample count.
+    { "type": "plane", "name": "area-light", "light": true,
+      "origin": [-1, 2, -4.25], "u": [2.0, 0, 0], "v": [0, 0, 0.4],
+      "material": "warmlight" }
+  ]
+}

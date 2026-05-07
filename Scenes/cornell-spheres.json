@@ -1,0 +1,48 @@
+{
+  "schema": "1.0",
+  "name": "cornell-spheres",
+  "version": "1.0.0",
+
+  "camera": {
+    "position": [0, 0, 0],
+    "fov": 65
+  },
+
+  "materials": {
+    "cream":      { "albedo": [0.74, 0.74, 0.64] },
+    "red":        { "albedo": [0.63, 0.06, 0.05] },
+    "green":      { "albedo": [0.13, 0.45, 0.10] },
+    "nonemissive":{ "albedo": [0.40, 0.40, 0.30] },
+    "warmlight":  { "emissive": [80.0, 68.0, 48.0] }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7],
+      "material": "cream" },
+    { "type": "plane", "name": "back-wall",
+      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "floor",
+      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6],
+      "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6],
+      "material": "red" },
+
+    // Center big sphere + four small scattered ones on the floor. Positions
+    // recovered from the original commented-out vector in pre-refactor Main.cpp.
+    { "type": "sphere", "center": [0, -1, -4.5],         "radius": 0.75, "material": "nonemissive" },
+    { "type": "sphere", "center": [-0.75, -1.5, -3.75],  "radius": 0.25, "material": "nonemissive" },
+    { "type": "sphere", "center": [-0.75, -1.45, -4.75], "radius": 0.65, "material": "nonemissive" },
+    { "type": "sphere", "center": [0.3, -1.6, -4.45],    "radius": 0.4,  "material": "nonemissive" },
+    { "type": "sphere", "center": [0.75, -0.75, -4.75],  "radius": 0.35, "material": "nonemissive" },
+
+    { "type": "plane", "name": "area-light", "light": true,
+      "origin": [-0.375, 2, -4.25], "u": [0.75, 0, 0], "v": [0, 0, 0.4],
+      "material": "warmlight" }
+  ]
+}

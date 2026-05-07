@@ -1,9 +1,9 @@
+#include <algorithm>
 #include <vector>
 #include <iostream>
 #include <chrono>
 #include <string>
 #include <unordered_map>
-#include <functional>
 #include <filesystem>
 #include <cstdlib>
 #include <ctime>
@@ -11,9 +11,8 @@
 #include "Includes/CLI11.hpp"
 #include "Includes/Renderer.h"
 #include "Scenes/Scene.h"
-#include "Scenes/Cornell.h"
-#include "Scenes/CornellSpheres.h"
-#include "Scenes/CornellLargeLight.h"
+#include "Scenes/SceneDiscovery.h"
+#include "Scenes/SceneLoader.h"
 
 namespace
 {
@@ -48,18 +47,6 @@ namespace
         tzset();
     }
 
-    // One entry per available scene. Add new scenes by including their header
-    // above and adding a row here.
-    using SceneFactory = std::function<Scenes::SceneData()>;
-    const std::unordered_map<std::string, SceneFactory> &sceneRegistry()
-    {
-        static const std::unordered_map<std::string, SceneFactory> map = {
-            {"cornell",             &Scenes::makeCornell},
-            {"cornell-spheres",     &Scenes::makeCornellSpheres},
-            {"cornell-large-light", &Scenes::makeCornellLargeLight},
-        };
-        return map;
-    }
 }
 
 int main(int argc, char *argv[])
@@ -74,6 +61,8 @@ int main(int argc, char *argv[])
     std::string scene = "cornell";
     std::string timezone;
     std::string outputDir;
+    std::vector<std::string> extraSceneDirs;
+    bool listScenes = false;
     bool useDenoise = false;
     bool useMIS = false;
     bool useRussian = false;
@@ -102,6 +91,13 @@ int main(int argc, char *argv[])
                    "are mapped to DST-aware POSIX strings; anything else passes through "
                    "(e.g. America/New_York). Default: system local time.");
     app.add_option("-o,--output", outputDir, "Output directory (default: $PWD/Image)");
+    app.add_option("--scenes-dir", extraSceneDirs,
+                   "Additional directory to search for *.json scene files. May be "
+                   "passed multiple times. Searched before the default $PWD/Scenes "
+                   "and <binary-dir>/Scenes locations.");
+    app.add_flag("--list-scenes", listScenes,
+                 "Print all discovered scenes (hardcoded + JSON) with name, version, "
+                 "and source, then exit.");
 
     app.add_flag("--denoise", useDenoise,
                  "Apply a 5x5 cross-bilateral filter to the output to reduce noise.");
@@ -125,19 +121,53 @@ int main(int argc, char *argv[])
     if (outputDir.empty())
         outputDir = (std::filesystem::current_path() / "Image").string();
 
-    const auto &registry = sceneRegistry();
-    auto it = registry.find(scene);
+    std::vector<std::filesystem::path> extraDirPaths;
+    extraDirPaths.reserve(extraSceneDirs.size());
+    for (const auto &d : extraSceneDirs)
+        extraDirPaths.emplace_back(d);
+
+    auto onDiscoveryError = [](const std::string &msg) {
+        std::cerr << "warning: " << msg << "\n";
+    };
+    auto registry = Scenes::discoverScenes(extraDirPaths, onDiscoveryError);
+
+    if (listScenes)
+    {
+        std::cout << "Available scenes:\n";
+        for (const auto &s : registry)
+        {
+            std::cout << "  " << s.name << "  " << s.version << "  ";
+            if (s.source == Scenes::DiscoveredScene::Source::Hardcoded)
+                std::cout << "(hardcoded)";
+            else
+                std::cout << "(" << s.filePath << ")";
+            std::cout << "\n";
+        }
+        return 0;
+    }
+
+    auto it = std::find_if(registry.begin(), registry.end(),
+                           [&](const Scenes::DiscoveredScene &s) { return s.name == scene; });
     if (it == registry.end())
     {
         std::cerr << "Unknown scene: " << scene << "\nAvailable scenes:\n";
-        for (const auto &kv : registry)
-            std::cerr << "  " << kv.first << "\n";
+        for (const auto &s : registry)
+            std::cerr << "  " << s.name << "\n";
         return 1;
     }
 
-    Scenes::SceneData sceneData = it->second();
+    Scenes::SceneData sceneData;
+    try
+    {
+        sceneData = it->load();
+    }
+    catch (const Scenes::SceneLoaderError &e)
+    {
+        std::cerr << "Error loading scene: " << e.what() << "\n";
+        return 1;
+    }
 
-    Renderer renderer{width, height, 65.f, depth, samples, shadowSamples};
+    Renderer renderer{width, height, depth, samples, shadowSamples};
     renderer.useDenoise   = useDenoise;
     renderer.useMIS       = useMIS;
     renderer.useRussian   = useRussian;

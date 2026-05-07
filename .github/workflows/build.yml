@@ -32,6 +32,9 @@ jobs:
           cp code/Build/Release/frank-based-rendering-cli.exe stage/
           cp code/Build/Release/frank-based-rendering.exe stage/
           cp code/Build/Release/physically-cringe-rendering.exe stage/
+          # Scenes/ rides along so each binary in the artifact zip resolves
+          # JSON scenes via the executable-dir fallback out of the box.
+          cp -r Scenes stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -68,6 +71,7 @@ jobs:
           cp code/Build/frank-based-rendering-cli stage/
           cp code/Build/frank-based-rendering stage/
           cp code/Build/physically-cringe-rendering stage/
+          cp -r Scenes stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -97,6 +101,7 @@ jobs:
           mkdir -p stage
           cp code/Build/frank-based-rendering-cli stage/
           cp code/Build/frank-based-rendering stage/
+          cp -r Scenes stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -149,6 +154,13 @@ jobs:
                    release/frank-based-rendering-${VER}-linux-x64 \
                    release/frank-based-rendering-${VER}-macos-arm64 \
                    release/physically-cringe-rendering-${VER}-linux-x64
+
+          # JSON scenes are OS-agnostic. Ship them as a single archive so
+          # users grabbing standalone binaries can drop a matching Scenes/
+          # next to their downloaded binary. The hardcoded cornell fallback
+          # still works without this archive, but JSON-only scenes (and the
+          # version-bumped cornell.json) need it.
+          (cd pcr-linux-x64 && zip -r "../release/pcr-scenes-${VER}.zip" Scenes)
 
           ls -la release/
 

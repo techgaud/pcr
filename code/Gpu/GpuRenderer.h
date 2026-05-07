@@ -26,7 +26,7 @@ public:
     // sharedContext must be a hidden GLFW window created with the GUI's main
     // window passed as the share parameter. The GpuRenderer doesn't own it,
     // doesn't destroy it.
-    GpuRenderer(int width, int height, float fov,
+    GpuRenderer(int width, int height,
                 int depth, int samples, int shadowSamples,
                 GLFWwindow *sharedContext);
     ~GpuRenderer();
@@ -50,7 +50,6 @@ public:
 
 private:
     int _width, _height;
-    float _fov;
     int _maxDepth, _samples, _shadowSamples;
     GLFWwindow *_sharedContext;
 
