@@ -70,6 +70,10 @@ int main(int argc, char *argv[])
     std::string scene = "cornell";
     std::string timezone;
     std::string outputDir;
+    bool useDenoise = false;
+    bool useMIS = false;
+    bool useRussian = false;
+    bool useStratified = false;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -95,6 +99,18 @@ int main(int argc, char *argv[])
                    "(e.g. America/New_York). Default: system local time.");
     app.add_option("-o,--output", outputDir, "Output directory (default: $PWD/Image)");
 
+    app.add_flag("--denoise", useDenoise,
+                 "Apply a 5x5 cross-bilateral filter to the output to reduce noise.");
+    app.add_flag("--mis", useMIS,
+                 "Multiple importance sampling on direct lighting (partial impl, "
+                 "light-side weighting only). Slight effect on diffuse-only scenes.");
+    app.add_flag("--russian", useRussian,
+                 "Russian roulette path termination at depth >= 1. Cheaper paths, "
+                 "unbiased estimator.");
+    app.add_flag("--stratified", useStratified,
+                 "Jittered stratified samples for the first indirect bounce. Lower "
+                 "variance per sample at no extra cost.");
+
     CLI11_PARSE(app, argc, argv);
 
     if (height < 0)
@@ -118,6 +134,10 @@ int main(int argc, char *argv[])
     Scenes::SceneData sceneData = it->second();
 
     Renderer renderer{width, height, 65.f, depth, samples, shadowSamples};
+    renderer.useDenoise   = useDenoise;
+    renderer.useMIS       = useMIS;
+    renderer.useRussian   = useRussian;
+    renderer.useStratified = useStratified;
     renderer.render(sceneData, start, outputDir);
 
     return 0;

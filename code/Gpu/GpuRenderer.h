@@ -36,6 +36,12 @@ public:
     std::atomic<bool> *cancelRequested = nullptr;
     std::function<void(const std::vector<Vec3f> &, int width, int height)> onPartialFrame;
 
+    // Same quality knobs as the CPU Renderer; passed to GLSL as uniforms.
+    bool useDenoise   = false;
+    bool useMIS       = false;
+    bool useRussian   = false;
+    bool useStratified = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

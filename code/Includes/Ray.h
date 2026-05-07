@@ -16,26 +16,31 @@ public:
     Vec3f dir;
     Vec3f origin;
 
+    // Random-sample variant. Caller-blind: pulls two PRNG values internally.
     static Ray genRayFromIntersection(Vec3f &N, Vec3f &o)
     {
+        return genRayFromIntersection(N, o, NumGen::Epsilon(), NumGen::Epsilon());
+    }
+
+    // Stratified-friendly variant. Caller supplies two values in [0,1).
+    // Used by stratified sampling so the renderer can place the (r1,r2)
+    // pairs on a jittered grid rather than fully random.
+    static Ray genRayFromIntersection(Vec3f &N, Vec3f &o, float r1, float r2)
+    {
         Vec3f T, B;
-        createBasis(N, T, B); // effectively a transformation matrix for our random sample
-
-        auto v = sampleDisk(); // random vector (in local space)
-
-        return Ray(T * v[0] + B * v[1] + N * v[2], o); // converts the random sample to world space
+        createBasis(N, T, B);
+        auto v = sampleDiskFrom(r1, r2);
+        return Ray(T * v[0] + B * v[1] + N * v[2], o);
     }
 
 private:
-    static Vec3f sampleDisk()
+    static Vec3f sampleDiskFrom(float r1, float r2)
     {
-        // auto r = NumGen::Epsilon();                 // uniform sampling
-        auto r = std::sqrt(NumGen::Epsilon());   // cosine weighted
-        auto row = 2.f * (float)std::numbers::pi * NumGen::Epsilon();
-
-        auto x = r * std::cos(row);
-        auto y = r * std::sin(row);
-        auto z = std::sqrt(1 - x * x - y * y);
+        auto r = std::sqrt(r1);                            // cosine weighted
+        auto phi = 2.f * (float)std::numbers::pi * r2;
+        auto x = r * std::cos(phi);
+        auto y = r * std::sin(phi);
+        auto z = std::sqrt(std::max(0.f, 1.f - x * x - y * y));
         return {x, y, z};
     }
 

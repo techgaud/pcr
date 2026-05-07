@@ -90,6 +90,10 @@ struct Settings
     int timezoneIndex = 0;  // index into the tz combo
     std::string outputDir;
     bool darkTheme = true;
+    bool useDenoise = false;
+    bool useMIS = false;
+    bool useRussian = false;
+    bool useStratified = false;
 };
 
 static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
@@ -121,6 +125,10 @@ static void loadSettings(Settings &s)
         s.timezoneIndex = j.value("timezoneIndex", s.timezoneIndex);
         s.outputDir = j.value("outputDir", s.outputDir);
         s.darkTheme = j.value("darkTheme", s.darkTheme);
+        s.useDenoise   = j.value("useDenoise",   s.useDenoise);
+        s.useMIS       = j.value("useMIS",       s.useMIS);
+        s.useRussian   = j.value("useRussian",   s.useRussian);
+        s.useStratified = j.value("useStratified", s.useStratified);
     }
     catch (...)
     {
@@ -141,6 +149,10 @@ static void saveSettings(const Settings &s)
     j["timezoneIndex"] = s.timezoneIndex;
     j["outputDir"] = s.outputDir;
     j["darkTheme"] = s.darkTheme;
+    j["useDenoise"]   = s.useDenoise;
+    j["useMIS"]       = s.useMIS;
+    j["useRussian"]   = s.useRussian;
+    j["useStratified"] = s.useStratified;
     std::ofstream out(settingsPath());
     out << j.dump(2);
 }
@@ -259,6 +271,10 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 #endif
         renderer.progressRows = &job->rowsCompleted;
         renderer.cancelRequested = &job->cancelRequested;
+        renderer.useDenoise   = settings.useDenoise;
+        renderer.useMIS       = settings.useMIS;
+        renderer.useRussian   = settings.useRussian;
+        renderer.useStratified = settings.useStratified;
         if (live)
         {
             renderer.onPartialFrame = [live](const std::vector<Vec3f> &fb, int w, int h) {
@@ -683,8 +699,14 @@ int main(int, char **)
         }
 
         pcrSliderInt("Depth",   &settings.depth,         1, 8,    1, 2);
-        pcrSliderInt("Samples", &settings.samples,       1, 512,  1, 16);
-        pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 32,   1, 4);
+        pcrSliderInt("Samples", &settings.samples,       1, 4096, 1, 16);
+        pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 64,   1, 4);
+
+        ImGui::SeparatorText("Techniques");
+        ImGui::Checkbox("Denoise (5x5 cross-bilateral on output)", &settings.useDenoise);
+        ImGui::Checkbox("MIS (light-side balance heuristic, partial)", &settings.useMIS);
+        ImGui::Checkbox("Russian roulette (terminate paths at depth >= 1)", &settings.useRussian);
+        ImGui::Checkbox("Stratified samples (jittered grid first bounce)", &settings.useStratified);
 
         ImGui::SeparatorText("Output");
         pcrSliderInt("Width", &settings.width, 64, 2160, 8, 64);

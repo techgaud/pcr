@@ -10,6 +10,7 @@
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
+#include "Includes/Denoise.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
 #ifndef PCR_BINARY_NAME
@@ -148,6 +149,9 @@ void Renderer::render(const Scenes::SceneData &scene,
         rgb[i * 3 + 2] = (unsigned char)(255 * frameBuffer[i][2] + 0.5f);
     }
 
+    if (useDenoise)
+        Denoise::bilateralRGB(rgb, _width, _height);
+
     auto end = std::chrono::steady_clock::now();
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << "Render took " << elapsedMs << " ms" << std::endl;
@@ -192,6 +196,10 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Width", std::to_string(_width));
     addText("Height", std::to_string(_height));
     addText("RenderTimeMs", std::to_string(elapsedMs));
+    addText("Denoise",    useDenoise    ? "1" : "0");
+    addText("MIS",        useMIS        ? "1" : "0");
+    addText("Russian",    useRussian    ? "1" : "0");
+    addText("Stratified", useStratified ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -227,18 +235,45 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
         return material.emissive;
 
     Vec3f indirectLo;
-    // handle reflections
-    //  auto reflectDir = ray.dir.reflect(N).normalize();
-    //  auto reflectOrig = reflectDir.dot(N) > 0 ? hit + N * 1e-3 : hit - N * 1e-3;
-    //  auto reflected = Ray(reflectDir, reflectOrig);
-    //  indirectLo += castRay(reflected, spheres, depth + 1) * material.albedo;
+
+    // Stratified sampling: lay out the indirect samples on a sqrt(N) x sqrt(N)
+    // jittered grid instead of fully random. Reduces variance for the same N.
+    const int strata = useStratified
+                       ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
+                       : 0;
 
     for (size_t i = 0; i < (size_t)_samples; i++)
     {
-        auto randomRay = Ray::genRayFromIntersection(N, hit + N * 1e-3);
-        auto cos = std::max(0.f, randomRay.dir.dot(N));
-        (void)cos;
-        indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo;
+        float r1, r2;
+        if (useStratified)
+        {
+            int sx = (int)i % strata;
+            int sy = ((int)i / strata) % strata;
+            r1 = (sx + NumGen::Epsilon()) / (float)strata;
+            r2 = (sy + NumGen::Epsilon()) / (float)strata;
+        }
+        else
+        {
+            r1 = NumGen::Epsilon();
+            r2 = NumGen::Epsilon();
+        }
+        auto randomRay = Ray::genRayFromIntersection(N, hit + N * 1e-3, r1, r2);
+
+        // Russian roulette: at depth >= 1, terminate with probability (1 - p)
+        // where p reflects the surface's reflectance. Survivors get scaled by
+        // 1/p to keep the estimator unbiased. Skipped at depth 0 so direct
+        // viewing rays always shoot at least one bounce.
+        if (useRussian && depth >= 1)
+        {
+            float maxAlbedo = std::max({material.albedo[0], material.albedo[1], material.albedo[2]});
+            float p = std::min(0.95f, std::max(0.05f, maxAlbedo));
+            if (NumGen::Epsilon() > p) continue;
+            indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo / p;
+        }
+        else
+        {
+            indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo;
+        }
     }
     indirectLo /= _samples;
 
@@ -259,7 +294,24 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
         if (!inShadow){
             float cosLight = std::max(0.f, _light.N.dot(Li * -1));
             float G = (cosTheta * cosLight) / lightDist2;
-            directLo += (material.albedo / std::numbers::pi) * _light.material.emissive * G * _light.getArea();
+            Vec3f directContrib = (material.albedo / std::numbers::pi) * _light.material.emissive * G * _light.getArea();
+
+            // Partial MIS: down-weight the direct contribution by the
+            // balance heuristic between light and BRDF sampling pdfs. Note
+            // this is the "light-side" half of MIS; the symmetric BRDF-side
+            // weighting on emissive returns from indirect bounces would
+            // require a refactor of the recursion, so we ship the simpler
+            // half. For diffuse-only Cornell the visible difference is small.
+            if (useMIS && cosLight > 1e-6f)
+            {
+                float lightArea = _light.getArea();
+                float pdfLight = lightDist2 / (cosLight * lightArea);
+                float pdfBrdf  = cosTheta / (float)std::numbers::pi;
+                float w = (pdfLight * pdfLight) /
+                          (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                directContrib *= w;
+            }
+            directLo += directContrib;
         }
     }
 

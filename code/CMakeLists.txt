@@ -18,6 +18,7 @@ set(PCR_RENDERER_SOURCES
     Renderer.cpp
     NumGen.cpp
     lodepng.cpp
+    Denoise.cpp
     Scenes/Cornell.cpp
 )
 

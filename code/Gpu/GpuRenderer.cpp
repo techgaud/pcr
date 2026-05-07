@@ -33,6 +33,9 @@
 
 #include "Gpu/GpuRenderer.h"
 #include "Includes/lodepng.h"
+#include "Includes/Denoise.h"
+
+#include <cmath>
 
 namespace fs = std::filesystem;
 
@@ -197,6 +200,10 @@ uniform int   uLightPlaneIdx;
 uniform int   uYOffset;
 uniform int   uYEnd;
 uniform int   uFrameSeed;
+uniform int   uUseMIS;        // 0/1
+uniform int   uUseRussian;    // 0/1
+uniform int   uUseStratified; // 0/1
+uniform int   uStrata;        // round(sqrt(uSamples)) when stratified, else 0
 
 const float PI = 3.14159265358979323846;
 
@@ -234,9 +241,9 @@ float rand(inout uint seed) {
     return float(pcg(seed)) / 4294967295.0;
 }
 
-vec3 sampleHemisphere(vec3 N, inout uint seed) {
-    float r = sqrt(rand(seed));
-    float phi = 2.0 * PI * rand(seed);
+vec3 sampleHemisphereFrom(vec3 N, float r1, float r2) {
+    float r = sqrt(r1);
+    float phi = 2.0 * PI * r2;
     float x = r * cos(phi);
     float y = r * sin(phi);
     float z = sqrt(max(0.0, 1.0 - x*x - y*y));
@@ -244,6 +251,10 @@ vec3 sampleHemisphere(vec3 N, inout uint seed) {
     vec3 T = normalize(cross(N, helper));
     vec3 B = cross(N, T);
     return T * x + B * y + N * z;
+}
+
+vec3 sampleHemisphere(vec3 N, inout uint seed) {
+    return sampleHemisphereFrom(N, rand(seed), rand(seed));
 }
 
 bool intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, out float t) {
@@ -309,7 +320,7 @@ bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) 
     return found;
 }
 
-vec3 tracePath(vec2 pix, inout uint seed) {
+vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
     float aspect = float(uWidth) / float(uHeight);
     float scale = tan(PI / 180.0 * 0.5 * uFov);
     float x = ((2.0 * (pix.x + 0.5) / float(uWidth)) - 1.0) * scale * aspect;
@@ -323,6 +334,11 @@ vec3 tracePath(vec2 pix, inout uint seed) {
     GpuPlane light = planes[uLightPlaneIdx];
     vec3 lightEmissive = materials[light.matIdx].emissive.rgb;
 
+    // pr1, pr2 only seed the FIRST indirect bounce when stratified is on; later
+    // bounces fall back to PCG. Stratifying every bounce would require N^depth
+    // strata, which isn't worth the bookkeeping.
+    bool firstBounce = true;
+
     for (int bounce = 0; bounce < uDepth; bounce++) {
         vec3 hit, N;
         int matIdx;
@@ -332,13 +348,12 @@ vec3 tracePath(vec2 pix, inout uint seed) {
 
         GpuMaterial mat = materials[matIdx];
 
-        // Emissive hit -> add emission, terminate path.
         if (any(greaterThan(mat.emissive.rgb, vec3(0.0)))) {
             radiance += throughput * mat.emissive.rgb;
             break;
         }
 
-        // Direct lighting (explicit area-light sampling with shadow rays)
+        // Direct lighting
         vec3 directLo = vec3(0.0);
         for (int s = 0; s < uShadowSamples; s++) {
             vec3 lpos = light.origin.xyz + light.u.xyz * rand(seed) + light.v.xyz * rand(seed);
@@ -363,14 +378,42 @@ vec3 tracePath(vec2 pix, inout uint seed) {
             if (!occluded) {
                 float cosLight = max(0.0, dot(light.normal_area.xyz, -wi));
                 float G = (cosTheta * cosLight) / lightDist2;
-                directLo += (mat.albedo.rgb / PI) * lightEmissive * G * light.normal_area.w;
+                vec3 directContrib = (mat.albedo.rgb / PI) * lightEmissive * G * light.normal_area.w;
+
+                // Partial MIS: down-weight by balance heuristic on the
+                // light-side. Same caveat as the CPU renderer about the
+                // BRDF-side weighting on emissive returns being omitted.
+                if (uUseMIS != 0 && cosLight > 1e-6) {
+                    float pdfLight = lightDist2 / (cosLight * light.normal_area.w);
+                    float pdfBrdf  = cosTheta / PI;
+                    float w = (pdfLight * pdfLight) /
+                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                    directContrib *= w;
+                }
+                directLo += directContrib;
             }
         }
         directLo /= float(uShadowSamples);
         radiance += throughput * directLo;
 
-        // Indirect bounce: cosine-weighted hemisphere sample
-        vec3 newDir = sampleHemisphere(N, seed);
+        // Russian roulette: at bounce >= 1, terminate with prob (1 - p) where
+        // p reflects surface reflectance. Survivors get scaled to compensate.
+        if (uUseRussian != 0 && bounce >= 1) {
+            float p = clamp(max(max(mat.albedo.r, mat.albedo.g), mat.albedo.b), 0.05, 0.95);
+            if (rand(seed) > p) break;
+            throughput /= p;
+        }
+
+        // Indirect bounce: cosine-weighted hemisphere. Use stratified r1/r2
+        // for the first bounce only; subsequent bounces use plain random.
+        vec3 newDir;
+        if (uUseStratified != 0 && firstBounce) {
+            newDir = sampleHemisphereFrom(N, pr1, pr2);
+        } else {
+            newDir = sampleHemisphere(N, seed);
+        }
+        firstBounce = false;
+
         ro = hit + N * 1e-3;
         rd = newDir;
         throughput *= mat.albedo.rgb;
@@ -390,7 +433,19 @@ void main() {
 
     vec3 accum = vec3(0.0);
     for (int s = 0; s < uSamples; s++) {
-        accum += tracePath(vec2(pix), seed);
+        // Stratified sample placement on a sqrt(N) x sqrt(N) jittered grid
+        // for the first bounce of each path.
+        float r1, r2;
+        if (uUseStratified != 0 && uStrata > 0) {
+            int sx = s % uStrata;
+            int sy = (s / uStrata) % uStrata;
+            r1 = (float(sx) + rand(seed)) / float(uStrata);
+            r2 = (float(sy) + rand(seed)) / float(uStrata);
+        } else {
+            r1 = rand(seed);
+            r2 = rand(seed);
+        }
+        accum += tracePath(vec2(pix), r1, r2, seed);
     }
     accum /= float(uSamples);
     accum = reinhard(accum);
@@ -668,6 +723,12 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uFrameSeed",      (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())
                                        .count() & 0x7FFFFFFF));
+    setI("uUseMIS",         useMIS ? 1 : 0);
+    setI("uUseRussian",     useRussian ? 1 : 0);
+    setI("uUseStratified",  useStratified ? 1 : 0);
+    setI("uStrata",         useStratified
+                            ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
+                            : 0);
 
     // Dispatch in row strips so cancel + progress are responsive and we stay
     // well under any GPU TDR (Timeout Detection and Recovery) window.
@@ -725,6 +786,9 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         rgb[i * 3 + 2] = rgba[i * 4 + 2];
     }
 
+    if (useDenoise)
+        Denoise::bilateralRGB(rgb, _width, _height);
+
     std::string timestamp = formatTimestamp(false);
     std::string filename = scene.name + "-" + scene.version + "-"
                          + timestamp
@@ -760,6 +824,10 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     addText("Width",         std::to_string(_width));
     addText("Height",        std::to_string(_height));
     addText("RenderTimeMs",  std::to_string(elapsedMs));
+    addText("Denoise",       useDenoise    ? "1" : "0");
+    addText("MIS",           useMIS        ? "1" : "0");
+    addText("Russian",       useRussian    ? "1" : "0");
+    addText("Stratified",    useStratified ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

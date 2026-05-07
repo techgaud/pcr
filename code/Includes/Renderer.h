@@ -27,6 +27,13 @@ public:
     std::atomic<bool> *cancelRequested = nullptr;
     std::function<void(const std::vector<Vec3f> &, int width, int height)> onPartialFrame;
 
+    // Quality knobs. All default off so behavior matches the historical
+    // baseline; flip on per-render via CLI flag or GUI toggle.
+    bool useDenoise   = false; // post-process bilateral filter on the final RGB
+    bool useMIS       = false; // multiple importance sampling for direct lighting
+    bool useRussian   = false; // Russian roulette path termination at depth >= 1
+    bool useStratified = false; // jittered stratified samples instead of pure random
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

@@ -87,14 +87,20 @@ All flags are optional — defaults render a 720x720 Cornell Box at decent quali
 | Short | Long | Default | Meaning |
 |-------|------|---------|---------|
 | | `--scene` | `cornell` | Which scene to render |
-| `-d` | `--depth` | `4` | Max ray bounces |
-| `-s` | `--samples` | `16` | Indirect-light samples per hit |
-| `-S` | `--shadow` | `4` | Direct-light shadow rays per hit |
+| `-d` | `--depth` | `4` | Max ray bounces (GUI cap: 8) |
+| `-s` | `--samples` | `16` | Indirect-light samples per hit (GUI cap: 4096) |
+| `-S` | `--shadow` | `4` | Direct-light shadow rays per hit (GUI cap: 64) |
 | `-w` | `--width` | `720` | Output width in pixels |
 | | `--height` | (matches `-w`) | Output height; if omitted, output is square |
 | | `--tz`, `--timezone` | system local | Timezone for filename, see below |
 | `-o` | `--output` | `$PWD/Image` | Output directory |
+| | `--denoise` | off | 5x5 cross-bilateral filter on output, reduces speckle |
+| | `--mis` | off | MIS on direct lighting (partial impl, light-side only) |
+| | `--russian` | off | Russian roulette path termination at depth >= 1 |
+| | `--stratified` | off | Jittered stratified samples for first indirect bounce |
 | `-h` | `--help` | | Print usage and exit |
+
+The four "techniques" flags are off by default to keep behavior matching v1.0.0; flip on to compare. In the GUI they appear as checkboxes under "Techniques" and persist in the per-binary JSON. PNG metadata records which techniques were active for any given render so renders stay diff-able.
 
 ### Scenes
 
@@ -136,6 +142,10 @@ Each render embeds the following uncompressed `tEXt` chunks, readable by any PNG
 | `Width` | `720` |
 | `Height` | `720` |
 | `RenderTimeMs` | `12345` |
+| `Denoise` | `0` or `1` |
+| `MIS` | `0` or `1` |
+| `Russian` | `0` or `1` |
+| `Stratified` | `0` or `1` |
 
 Inspect with ImageMagick (`identify -verbose foo.png | grep -A1 tEXt`), Pillow (`PIL.Image.open(path).text`), or any other PNG tool that reads metadata.
 
