@@ -602,6 +602,26 @@ static void glfwErrorCallback(int err, const char *desc)
 
 int main(int, char **)
 {
+#ifdef _WIN32
+    // /SUBSYSTEM:WINDOWS detaches stderr/stdout from any console, so error
+    // output from the renderer (shader compile failures, GL errors, GPU
+    // readback errors, GLFW errors, exception text from the worker
+    // thread's catch blocks) is silently discarded — particularly painful
+    // when the GPU dies via TDR and there's no on-screen indication of
+    // what happened. Redirect both streams to a log file next to the
+    // current working directory so errors survive crashes.
+    {
+        std::string logPath = std::string(PCR_BINARY_NAME) + ".log";
+        // Truncate on launch; a stale log from a previous run shouldn't
+        // confuse the next debugging session.
+        std::freopen(logPath.c_str(), "w", stderr);
+        std::freopen(logPath.c_str(), "a", stdout);
+        std::fprintf(stderr, "%s starting (build " __DATE__ " " __TIME__ ")\n",
+                     PCR_BINARY_NAME);
+        std::fflush(stderr);
+    }
+#endif
+
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit())
         return 1;

@@ -405,9 +405,12 @@ bool intersectBvh(vec3 ro, vec3 rd, float closest_t,
                   out vec3 hit, out vec3 N, out int matIdx, out float t_out) {
     if (uBvhNodeCount == 0) return false;
 
-    // 64-deep stack handles any reasonable BVH; even adversarially-skewed
-    // object-median trees on 2^64 triangles fit.
-    int stack[64];
+    // 32-deep stack covers BVH trees up to 2^32 triangles, which is far
+    // past anything we'd actually render. Smaller-than-CPU stack because
+    // GLSL allocates one of these per pixel-thread in private memory; a
+    // 64-deep version was tipping bunny + Picture-class scenes over GPU
+    // scratch-space limits on some Windows drivers.
+    int stack[32];
     int top = 0;
     stack[top++] = 0; // root
 
@@ -436,7 +439,7 @@ bool intersectBvh(vec3 ro, vec3 rd, float closest_t,
             }
         } else {
             // Internal: push both children. Bounds-check the stack push.
-            if (top + 2 <= 64) {
+            if (top + 2 <= 32) {
                 stack[top++] = n.leftOrFirst;
                 stack[top++] = n.rightChild;
             }
@@ -1175,9 +1178,20 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
                             : 0);
 
-    // Dispatch in row strips so cancel + progress are responsive and we stay
-    // well under any GPU TDR (Timeout Detection and Recovery) window.
-    const int STRIP_HEIGHT = 32;
+    // Dispatch in row strips so cancel + progress are responsive and we
+    // stay well under any GPU TDR (Timeout Detection and Recovery) window.
+    // Windows defaults to a 2-second TDR; a single dispatch that exceeds
+    // that is killed by the driver, taking the whole process with it (no
+    // exception, no GL error — the kernel just resets the GPU).
+    //
+    // Per-pixel cost grows roughly with samples * depth * shadow. Scale
+    // strip height inversely so a heavy preset gets smaller strips than
+    // a light one. Empirical baseline: workPerPixel ~512 is fine at 32
+    // rows on the dev hardware; double the work, halve the strip. Floor
+    // at 1 row (so Picture-class settings on a high-poly mesh dispatch
+    // pixel-row-by-row).
+    int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
+    int STRIP_HEIGHT = std::clamp(32 * 512 / workPerPixel, 1, 32);
     int doneRows = 0;
     for (int yStart = 0; yStart < _height; yStart += STRIP_HEIGHT)
     {
