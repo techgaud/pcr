@@ -24,6 +24,7 @@ set(PCR_RENDERER_SOURCES
     Scenes/CornellLargeLight.cpp
     Scenes/SceneLoader.cpp
     Scenes/SceneDiscovery.cpp
+    Bvh/Bvh.cpp
 )
 
 # --- Scene file deployment ----------------------------------------------

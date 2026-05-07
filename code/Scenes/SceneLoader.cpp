@@ -309,6 +309,12 @@ namespace Scenes
         auto materials = parseMaterials(j, path);
         parsePrimitives(j, materials, out, path);
 
+        // Build the BVH now so renders don't pay the cost (and so the GPU
+        // upload path in phase 4 can ship pre-built nodes verbatim). The
+        // builder permutes out.triangles in place into leaf order; from this
+        // point on the order in `out.triangles` is what the BVH expects.
+        out.triangleBvh = Bvh::build(out.triangles);
+
         return out;
     }
 }

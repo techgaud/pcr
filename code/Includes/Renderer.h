@@ -9,6 +9,7 @@
 #include "Sphere.h"
 #include "Plane.h"
 #include "Triangle.h"
+#include "../Bvh/Bvh.h"
 #include "../Scenes/Scene.h"
 
 class Renderer
@@ -52,9 +53,11 @@ private:
     const int _shadowSamples;
 
     Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres,
-                  const std::vector<Triangle> &triangles, int depth);
+                  const std::vector<Triangle> &triangles,
+                  const std::vector<Bvh::Node> &bvh, int depth);
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
+                        const std::vector<Bvh::Node> &bvh,
                         Vec3f &hit, Vec3f &N, Material &material);
     void reinhardToneMap(Vec3f &color);
 };

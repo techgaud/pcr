@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "../Bvh/Bvh.h"
 #include "../Includes/Sphere.h"
 #include "../Includes/Plane.h"
 #include "../Includes/Triangle.h"
@@ -31,6 +32,10 @@ namespace Scenes
         std::vector<Sphere> spheres;
         std::vector<Plane> walls;
         std::vector<Triangle> triangles;
+        // BVH over `triangles`. Built at scene-load time after triangles are
+        // populated. Empty when triangles is empty (the BVH builder permutes
+        // `triangles` in place, so `triangles` is in BVH-leaf order after build).
+        std::vector<Bvh::Node> triangleBvh;
         Plane lightSource;
     };
 }
