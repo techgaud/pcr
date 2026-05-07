@@ -24,6 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -1192,7 +1193,18 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // pixel-row-by-row).
     int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
     int STRIP_HEIGHT = std::clamp(32 * 512 / workPerPixel, 1, 32);
+    int totalStrips = (_height + STRIP_HEIGHT - 1) / STRIP_HEIGHT;
     int doneRows = 0;
+
+#ifdef _WIN32
+    // Activity log: written before each dispatch so the post-mortem
+    // MessageBox on the next launch knows exactly which strip was running
+    // when the GPU died. The CPU GUI's runRender() also stamps a
+    // render-level activity message; this overwrites that with finer
+    // granularity once we're in the dispatch loop.
+    fs::path activityPath = fs::current_path() /
+                            (std::string(PCR_BINARY_NAME) + ".lastrun.txt");
+#endif
     for (int yStart = 0; yStart < _height; yStart += STRIP_HEIGHT)
     {
         if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
@@ -1205,6 +1217,24 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         int stripH = yEnd - yStart;
         setI("uYOffset", yStart);
         setI("uYEnd", yEnd);
+
+#ifdef _WIN32
+        {
+            char act[512];
+            std::snprintf(act, sizeof(act),
+                "Rendering '%s' v%s at d=%d s=%d S=%d w=%d h=%d (GPU)\n"
+                "Triangles: %d (BVH nodes: %d). Lights: %d.\n"
+                "About to dispatch strip %d/%d, rows %d..%d (strip-height %d).",
+                scene.name.c_str(), scene.version.c_str(),
+                _maxDepth, _samples, _shadowSamples, _width, _height,
+                (int)scene.triangles.size(), (int)scene.triangleBvh.size(),
+                (int)scene.areaLights.size(),
+                yStart / STRIP_HEIGHT + 1, totalStrips,
+                yStart, yEnd, STRIP_HEIGHT);
+            std::ofstream f(activityPath);
+            if (f) f << act;
+        }
+#endif
 
         // 16x16 work group, one item per pixel. ceil division.
         GLuint gx = (GLuint)((_width  + 15) / 16);

@@ -138,6 +138,11 @@ struct Settings
     bool useRussian = false;
     bool useStratified = false;
 
+    // Pop a debug console + log file at startup. Toggled by the Debug
+    // button in the GUI top-right (or the PCR_DEBUG env var). Persisted
+    // so it survives across launches.
+    bool debugMode = false;
+
     // Editable from the Edit Presets popup; persisted in <binary>.json.
     // Default to per-binary code constants when settings file is missing
     // or doesn't carry presets yet.
@@ -186,6 +191,7 @@ static void loadSettings(Settings &s)
         s.useMIS       = j.value("useMIS",       s.useMIS);
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
+        s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
             std::vector<Preset> loaded;
@@ -210,7 +216,11 @@ static void loadSettings(Settings &s)
     }
 }
 
-static void saveSettings(const Settings &s)
+// Build the JSON representation of the current Settings. Pulled out of
+// saveSettings so we can capture a snapshot at startup, compare to the
+// snapshot at exit, and skip writing the file if nothing changed —
+// avoids creating a settings file for users who never customize anything.
+static json buildSettingsJson(const Settings &s)
 {
     json j;
     j["depth"] = s.depth;
@@ -227,6 +237,7 @@ static void saveSettings(const Settings &s)
     j["useMIS"]       = s.useMIS;
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
+    j["debugMode"]    = s.debugMode;
     json arr = json::array();
     for (const auto &p : s.presets)
     {
@@ -238,8 +249,13 @@ static void saveSettings(const Settings &s)
         arr.push_back(std::move(pj));
     }
     j["presets"] = std::move(arr);
+    return j;
+}
+
+static void saveSettings(const Settings &s)
+{
     std::ofstream out(settingsPath());
-    out << j.dump(2);
+    out << buildSettingsJson(s).dump(2);
 }
 
 // --- Timezone application (matches CLI behavior) -------------------------
@@ -684,18 +700,25 @@ static void reportPreviousCrash()
     if (content.empty()) return;
 
     std::string body =
-        "The previous run did not exit cleanly.\n\n"
-        "Last activity:\n  " + content + "\n\n"
-        "Most likely cause: Windows TDR (Timeout Detection and Recovery — "
-        "the GPU watchdog reset the driver because a single dispatch took "
-        "longer than ~2 seconds, and the kernel terminated this process as "
-        "part of the recovery). Confirmable in Event Viewer (Windows Logs > "
-        "System) under source 'nvlddmkm' / 'amdkmdag' / 'Display'.\n\n"
-        "Workarounds:\n"
-        "  - Step the preset down (Production or Decent) for high-poly meshes.\n"
-        "  - Reduce samples or depth.\n"
-        "  - Set PCR_DEBUG=1 in your environment to enable a console + log "
-        "for the next run, in case the failure is something other than TDR.";
+        "The previous run was forcibly terminated.\n\n"
+        "Last activity:\n" + content + "\n\n"
+        "We can't capture the actual error from inside the process — when "
+        "this happens it's almost always a Windows kernel-level GPU reset "
+        "(TDR), and the kernel kills the process before any of our error-"
+        "reporting code runs. There's no exception to catch, no GL error "
+        "code to print.\n\n"
+        "To find the real cause:\n"
+        "  1. Open Event Viewer (Windows+R -> eventvwr).\n"
+        "  2. Windows Logs -> System.\n"
+        "  3. Look for an Error/Warning in the last few minutes from\n"
+        "     source nvlddmkm / amdkmdag / Display.\n\n"
+        "If those events appear, it's TDR — the GPU watchdog killed a "
+        "single dispatch that took longer than ~2 seconds. Common fixes: "
+        "lower preset, smaller samples, smaller resolution.\n\n"
+        "If those events DON'T appear, the failure was something else "
+        "(driver bug, memory pressure, our code). Click the Debug button "
+        "in the top-right before the next render — that pops a console "
+        "with renderer error output.";
     MessageBoxA(nullptr, body.c_str(),
                 PCR_BINARY_NAME " — previous run crashed",
                 MB_OK | MB_ICONWARNING);
@@ -802,10 +825,24 @@ int main(int, char **)
     // enough — typically when developing rather than just rendering.
     SetUnhandledExceptionFilter(unhandledExceptionFilter);
     reportPreviousCrash();
+#endif
 
-    const char *debugEnv = std::getenv("PCR_DEBUG");
-    if (debugEnv && debugEnv[0] && debugEnv[0] != '0')
-        openDebugConsole();
+    // Load settings early — debug-mode opt-in lives in there, and we want
+    // the console to pop before any renderer activity starts. Snapshot
+    // the loaded JSON so we can skip writing the file on exit if the user
+    // never customized anything (avoids creating <binary>.json by default
+    // for fresh-install users).
+    Settings settings;
+    loadSettings(settings);
+    std::string loadedSettingsJson = buildSettingsJson(settings).dump(2);
+
+#ifdef _WIN32
+    {
+        const char *debugEnv = std::getenv("PCR_DEBUG");
+        bool envOn = debugEnv && debugEnv[0] && debugEnv[0] != '0';
+        if (envOn || settings.debugMode)
+            openDebugConsole();
+    }
 #endif
 
     glfwSetErrorCallback(glfwErrorCallback);
@@ -841,9 +878,6 @@ int main(int, char **)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
-
-    Settings settings;
-    loadSettings(settings);
 
     // Discovered scenes are cached and refreshed on demand. The GUI rescans
     // every time the user opens the scene combo so JSON files dropped into
@@ -930,18 +964,45 @@ int main(int, char **)
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-        // Top-right Theme + About buttons.
+        // Top-right Theme + Debug + About buttons.
         {
             const float aboutW = 70.f;
             const float themeW = 70.f;
+            const float debugW = 70.f;
             const float gap = ImGui::GetStyle().ItemSpacing.x;
             float windowW = ImGui::GetWindowSize().x;
             float padX = ImGui::GetStyle().WindowPadding.x;
-            ImGui::SetCursorPosX(windowW - aboutW - themeW - gap - padX);
+            ImGui::SetCursorPosX(windowW - aboutW - debugW - themeW - 2 * gap - padX);
             if (ImGui::Button(settings.darkTheme ? "Light" : "Dark", ImVec2(themeW, 0)))
             {
                 settings.darkTheme = !settings.darkTheme;
                 applyTheme(settings.darkTheme);
+            }
+            ImGui::SameLine();
+            // Debug button: toggles persistent debugMode. On Windows,
+            // turning ON immediately allocates a console + log file
+            // (handy when you want output for the render you're about
+            // to start). Turning OFF only persists for next launch —
+            // closing an already-allocated console mid-session would
+            // leave stderr pointed at a dead handle.
+            if (settings.debugMode)
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.55f, 0.30f, 1.0f));
+            if (ImGui::Button("Debug", ImVec2(debugW, 0)))
+            {
+                settings.debugMode = !settings.debugMode;
+#ifdef _WIN32
+                if (settings.debugMode && GetConsoleWindow() == nullptr)
+                    openDebugConsole();
+#endif
+            }
+            if (settings.debugMode)
+                ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip(
+                    "Pop a console + log file with renderer diagnostics.\n"
+                    "Persists across sessions. Once opened during a\n"
+                    "session, the console stays until app exit.");
             }
             ImGui::SameLine();
             if (ImGui::Button("About", ImVec2(aboutW, 0)))
@@ -1325,7 +1386,15 @@ int main(int, char **)
         job.worker.join();
     }
 
-    saveSettings(settings);
+    // Only write <binary>.json if the user actually changed something
+    // during the session. Compares the current Settings serialization
+    // against the snapshot taken at load time. If they match, the file
+    // (which may not even exist) is left alone.
+    {
+        std::string currentSettingsJson = buildSettingsJson(settings).dump(2);
+        if (currentSettingsJson != loadedSettingsJson)
+            saveSettings(settings);
+    }
 
     freeImage(previewImg);
     if (liveTex) glDeleteTextures(1, &liveTex);
