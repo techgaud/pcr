@@ -1,7 +1,7 @@
 {
   "schema": "1.0",
   "name": "cornell-spec",
-  "version": "1.1.0",
+  "version": "1.1.1",
 
   // Cornell Box, spec-faithful version. Reproduces the canonical 1984
   // Goral et al. setup (cf. http://www.graphics.cornell.edu/online/box/data.html)
@@ -92,8 +92,15 @@
       "origin": [1.4089, -2.0, -7.3782], "u": [-0.3575, 0, 1.134], "v": [0, 1.189, 0],
       "material": "white" },
 
+    // Coplanar with the ceiling (y=2.0). Earlier versions floated the
+    // light 0.05 below the ceiling out of misplaced concern about
+    // coplanar intersection ties — but the renderer already wins those
+    // ties in the light's favor (Renderer pushes plane-kind area lights
+    // into _planes ahead of walls). The 0.05 gap let the light's
+    // double-sided emission bounce off the ceiling and create a visible
+    // halo around the fixture.
     { "type": "plane", "name": "area-light", "light": true,
-      "origin": [-0.469, 1.95, -7.41], "u": [0.937, 0, 0], "v": [0, 0, 0.757],
+      "origin": [-0.469, 2.0, -7.41], "u": [0.937, 0, 0], "v": [0, 0, 0.757],
       "material": "neutrallight" }
   ]
 }
