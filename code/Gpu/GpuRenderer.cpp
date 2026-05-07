@@ -31,7 +31,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-#include "Includes/GpuRenderer.h"
+#include "Gpu/GpuRenderer.h"
 #include "Includes/lodepng.h"
 
 namespace fs = std::filesystem;

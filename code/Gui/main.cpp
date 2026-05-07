@@ -67,7 +67,7 @@
 #include "Scenes/Cornell.h"
 
 #if PCR_USE_GPU
-#include "Includes/GpuRenderer.h"
+#include "Gpu/GpuRenderer.h"
 using PCRRenderer = GpuRenderer;
 #else
 using PCRRenderer = Renderer;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(pcr-cornell CXX)
+project(pcr CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,7 +11,9 @@ endif()
 
 find_package(Threads REQUIRED)
 
-# --- Shared renderer sources used by all binaries ------------------------
+# --- Shared sources used by all binaries ---------------------------------
+# These compile cleanly into every target even though some targets don't
+# call all the symbols (linker drops dead code).
 set(PCR_RENDERER_SOURCES
     Renderer.cpp
     NumGen.cpp
@@ -19,21 +21,25 @@ set(PCR_RENDERER_SOURCES
     Scenes/Cornell.cpp
 )
 
-# --- CLI target (CPU only, headless) -------------------------------------
-add_executable(pcr-cornell
-    Main.cpp
+# --- CLI: frank-based-rendering-cli ---------------------------------------
+# CPU only, headless. Use this for scripting and homelab servers.
+add_executable(frank-based-rendering-cli
+    Cli/Main.cpp
     ${PCR_RENDERER_SOURCES}
 )
-target_include_directories(pcr-cornell PRIVATE
+target_include_directories(frank-based-rendering-cli PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/Includes
 )
-target_link_libraries(pcr-cornell PRIVATE Threads::Threads)
+target_link_libraries(frank-based-rendering-cli PRIVATE Threads::Threads)
+target_compile_definitions(frank-based-rendering-cli PRIVATE
+    PCR_BINARY_NAME="frank-based-rendering-cli"
+)
 
 if(MSVC)
-    target_compile_options(pcr-cornell PRIVATE /W4)
+    target_compile_options(frank-based-rendering-cli PRIVATE /W4)
 else()
-    target_compile_options(pcr-cornell PRIVATE -Wall -Wextra)
+    target_compile_options(frank-based-rendering-cli PRIVATE -Wall -Wextra)
 endif()
 
 # --- GUI dependencies (shared by both GUI binaries) ---------------------
@@ -97,8 +103,6 @@ function(pcr_apply_msvc_release_flags target)
 endfunction()
 
 # --- CPU GUI: frank-based-rendering --------------------------------------
-# Path traces on CPU threads. Stable, runs anywhere with a working OpenGL
-# context (only needed for the GUI itself, not the rendering math).
 add_executable(frank-based-rendering
     Gui/main.cpp
     ${IMGUI_SOURCES}
@@ -113,20 +117,21 @@ target_compile_definitions(frank-based-rendering PRIVATE
 pcr_apply_msvc_release_flags(frank-based-rendering)
 
 # --- GPU GUI: physically-cringe-rendering --------------------------------
-# Path traces on the GPU via OpenGL 4.3 compute shaders. Needs a GPU that
-# supports OpenGL 4.3+ (basically any discrete GPU from the last decade).
-# macOS is capped at OpenGL 4.1 and will fail at runtime; that's expected
-# until we add a Metal/Vulkan backend.
-add_executable(physically-cringe-rendering
-    Gui/main.cpp
-    GpuRenderer.cpp
-    ${IMGUI_SOURCES}
-    ${PCR_RENDERER_SOURCES}
-)
-target_include_directories(physically-cringe-rendering PRIVATE ${PCR_GUI_INCLUDES})
-target_link_libraries(physically-cringe-rendering PRIVATE ${PCR_GUI_LIBS})
-target_compile_definitions(physically-cringe-rendering PRIVATE
-    PCR_BINARY_NAME="physically-cringe-rendering"
-    PCR_USE_GPU=1
-)
-pcr_apply_msvc_release_flags(physically-cringe-rendering)
+# Skipped on Apple platforms: macOS caps OpenGL at 4.1, but the compute
+# shader requires 4.3. The right path forward there is a Metal or Vulkan
+# backend; until then, the macOS GPU build is omitted from CI releases.
+if(NOT APPLE)
+    add_executable(physically-cringe-rendering
+        Gui/main.cpp
+        Gpu/GpuRenderer.cpp
+        ${IMGUI_SOURCES}
+        ${PCR_RENDERER_SOURCES}
+    )
+    target_include_directories(physically-cringe-rendering PRIVATE ${PCR_GUI_INCLUDES})
+    target_link_libraries(physically-cringe-rendering PRIVATE ${PCR_GUI_LIBS})
+    target_compile_definitions(physically-cringe-rendering PRIVATE
+        PCR_BINARY_NAME="physically-cringe-rendering"
+        PCR_USE_GPU=1
+    )
+    pcr_apply_msvc_release_flags(physically-cringe-rendering)
+endif()

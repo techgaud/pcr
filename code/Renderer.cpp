@@ -11,6 +11,11 @@
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
 
+// PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
+#ifndef PCR_BINARY_NAME
+#define PCR_BINARY_NAME "frank-based-rendering"
+#endif
+
 namespace
 {
     // Format current time as "YYYYMMDD-HHMMSS-<ZONE>". When utc=false, uses
@@ -177,7 +182,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     auto addText = [&](const char *key, const std::string &val) {
         lodepng_add_text(&state.info_png, key, val.c_str());
     };
-    addText("Software", "pcr-cornell");
+    addText("Software", PCR_BINARY_NAME);
     addText("Scene", scene.name);
     addText("SceneVersion", scene.version);
     addText("CreationTime", timestamp);

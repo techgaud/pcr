@@ -8,7 +8,7 @@ Three binaries ship from one codebase:
 
 | Binary | Backend | Use |
 |--------|---------|-----|
-| `pcr-cornell` | CPU | CLI for headless / scripting / homelab servers |
+| `frank-based-rendering-cli` | CPU | CLI for headless / scripting / homelab servers |
 | `frank-based-rendering` | CPU | Desktop GUI (sliders, render button, preview, history) |
 | `physically-cringe-rendering` | GPU (OpenGL 4.3 compute) | Same GUI, on the GPU. Fast. Needs OpenGL 4.3+. |
 
@@ -35,7 +35,7 @@ cmake --build code/Build --config Release
 
 This produces three executables:
 
-- **`pcr-cornell`** — CLI, CPU only (headless, scriptable)
+- **`frank-based-rendering-cli`** — CLI, CPU only (headless, scriptable)
 - **`frank-based-rendering`** — desktop GUI, CPU
 - **`physically-cringe-rendering`** — desktop GUI, GPU (OpenGL 4.3 compute)
 
@@ -77,7 +77,7 @@ Sliders set every parameter the CLI exposes (depth, samples, shadow, width, squa
 Run from the repo root so the default `$PWD/Image/` resolves to `pcr/Image/`:
 
 ```bash
-./code/Build/pcr-cornell -d 4 -s 16 -S 4
+./code/Build/frank-based-rendering-cli -d 4 -s 16 -S 4
 ```
 
 All flags are optional — defaults render a 720x720 Cornell Box at decent quality. Pass `-o <dir>` to send renders elsewhere.
@@ -126,7 +126,7 @@ Each render embeds the following uncompressed `tEXt` chunks, readable by any PNG
 
 | Key | Example |
 |-----|---------|
-| `Software` | `pcr-cornell` |
+| `Software` | `frank-based-rendering-cli` |
 | `Scene` | `cornell` |
 | `SceneVersion` | `1.0.0` |
 | `CreationTime` | `20260506-143234-EDT` |
@@ -159,16 +159,16 @@ Times below are wall-clock from a Linux x86_64 container, multi-threaded across 
 
 ```bash
 # Quick noisy preview (~150 ms at 720, ~325 ms at 1080)
-./code/Build/pcr-cornell -d 2 -s 4 -S 2
+./code/Build/frank-based-rendering-cli -d 2 -s 4 -S 2
 
 # Decent quality, visible noise (~4 min at 720, ~10 min at 1080)
-./code/Build/pcr-cornell -d 4 -s 16 -S 4
+./code/Build/frank-based-rendering-cli -d 4 -s 16 -S 4
 
 # Picture-perfect, near-zero noise (~1 hr at 720, ~2-3 hr at 1080)
-./code/Build/pcr-cornell -d 4 -s 256 -S 4 -w 1080 --tz EST -o ~/renders
+./code/Build/frank-based-rendering-cli -d 4 -s 256 -S 4 -w 1080 --tz EST -o ~/renders
 
 # Non-square (1920x1080)
-./code/Build/pcr-cornell -w 1920 --height 1080
+./code/Build/frank-based-rendering-cli -w 1920 --height 1080
 ```
 
 Rule of thumb: doubling `--samples` roughly doubles render time and roughly halves visible noise (sqrt scaling). To go from "decent" to "clean" usually costs 4-16x more time.
@@ -188,6 +188,6 @@ Each scene lives in `code/Scenes/`. A scene defines its name, version, geometry 
 1. Create `code/Scenes/<Name>.h` declaring `Scenes::make<Name>()` and a `<NAME>_VERSION` constexpr.
 2. Create `code/Scenes/<Name>.cpp` implementing the factory.
 3. Add the `.cpp` to `code/CMakeLists.txt`.
-4. Register it in the `sceneRegistry()` map in `code/Main.cpp`.
+4. Register it in the `sceneRegistry()` map in `code/Cli/Main.cpp`.
 
 Bump `<NAME>_VERSION` whenever you make a change to the scene that produces a visibly different render.
