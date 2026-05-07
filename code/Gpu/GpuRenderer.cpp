@@ -539,7 +539,13 @@ void sampleAreaLight(inout uint seed,
         sampleEmissive = lightTriangles[triIdx].emissive.rgb;
     }
 }
-
+)GLSL"
+// MSVC has a 16380-byte limit on a single string literal. The GLSL source
+// crosses that around phase 4 once BVH traversal + multi-light sampling
+// land, so split into two adjacent literals — C++ concatenates them at
+// compile time. Pick a clean function boundary so the source still reads
+// linearly.
+R"GLSL(
 vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
     float aspect = float(uWidth) / float(uHeight);
     float scale = tan(PI / 180.0 * 0.5 * uFov);
