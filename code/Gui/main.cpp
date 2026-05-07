@@ -35,6 +35,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+// CMake's pcr_apply_msvc_release_flags target already defines NOMINMAX and
+// WIN32_LEAN_AND_MEAN for the GUI binaries, so this include is safe to pull
+// in for the AllocConsole / SetConsoleCtrlHandler calls in main().
+#include <windows.h>
+#endif
+
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_glfw.h"
 #include "imgui/backends/imgui_impl_opengl3.h"
@@ -608,15 +615,30 @@ int main(int, char **)
     // readback errors, GLFW errors, exception text from the worker
     // thread's catch blocks) is silently discarded — particularly painful
     // when the GPU dies via TDR and there's no on-screen indication of
-    // what happened. Redirect both streams to a log file next to the
-    // current working directory so errors survive crashes.
+    // what happened.
+    //
+    // Pop a console window at startup if we don't already have one
+    // attached (the rare case is launching from cmd / powershell, where
+    // stderr already goes somewhere visible). Closing this console
+    // otherwise sends CTRL_CLOSE_EVENT which kills the process — install
+    // a handler that swallows that event so the user can dismiss the
+    // console without losing their render. Quitting still works via the
+    // GUI window's close button.
+    if (GetConsoleWindow() == nullptr)
     {
-        std::string logPath = std::string(PCR_BINARY_NAME) + ".log";
-        // Truncate on launch; a stale log from a previous run shouldn't
-        // confuse the next debugging session.
-        std::freopen(logPath.c_str(), "w", stderr);
-        std::freopen(logPath.c_str(), "a", stdout);
-        std::fprintf(stderr, "%s starting (build " __DATE__ " " __TIME__ ")\n",
+        AllocConsole();
+        std::freopen("CONOUT$", "w", stderr);
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONIN$",  "r", stdin);
+        SetConsoleTitleA(PCR_BINARY_NAME " — log");
+        SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
+            return ev == CTRL_CLOSE_EVENT; // swallow Close; let Ctrl-C through
+        }, TRUE);
+        std::fprintf(stderr,
+                     "%s starting (build " __DATE__ " " __TIME__ ")\n"
+                     "Renderer error messages, GLFW errors, and worker-thread\n"
+                     "exception text will print here. Closing this window\n"
+                     "won't quit the app.\n\n",
                      PCR_BINARY_NAME);
         std::fflush(stderr);
     }
