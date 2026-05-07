@@ -323,6 +323,29 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         if (outDir.empty())
             outDir = (fs::current_path() / "Image").string();
 
+#ifdef _WIN32
+        // Stamp the activity log just before the renderer touches the GPU.
+        // If the next thing that happens is a TDR-driven process death, the
+        // next launch will MessageBox this content. Cleared on the success
+        // path below; the exception catch leaves it intact too (the
+        // exception filter MessageBox will reference it).
+        {
+            char act[256];
+            std::snprintf(act, sizeof(act),
+                "Rendering '%s' at d=%d s=%d S=%d w=%d h=%d (%s)",
+                sceneData.name.c_str(),
+                settings.depth, settings.samples, settings.shadowSamples,
+                settings.width, settings.height,
+#if PCR_USE_GPU
+                "GPU"
+#else
+                "CPU"
+#endif
+            );
+            setActivity(act);
+        }
+#endif
+
 #if PCR_USE_GPU
         PCRRenderer renderer{settings.width, settings.height,
                              settings.depth, settings.samples, settings.shadowSamples,
@@ -361,10 +384,17 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         }
         renderer.render(sceneData, start, outDir);
         job->finishedPath = renderer.lastOutputPath;
+#ifdef _WIN32
+        // Render returned without crashing — the activity log can go.
+        clearActivity();
+#endif
     }
     catch (const std::exception &ex)
     {
         job->errorMessage = ex.what();
+        // Leave activity log in place; reportPreviousCrash on next launch
+        // surfaces it. We also surface ex.what() inline in the GUI right
+        // now, so the user sees both.
     }
     catch (...)
     {
@@ -609,98 +639,164 @@ static void glfwErrorCallback(int err, const char *desc)
     std::fprintf(stderr, "GLFW error %d: %s\n", err, desc);
 }
 
+#ifdef _WIN32
+// Activity log: a tiny "what was the renderer doing" file that we write
+// at render start and delete on clean exit. If the process dies before
+// the delete runs (the canonical TDR case — Windows kernel hard-resets
+// the GPU and terminates us, no exception filter ever fires), the file
+// survives. The next launch finds it and shows a MessageBox so the user
+// gets some signal that the previous run died and what it was rendering.
+static fs::path activityLogPath()
+{
+    return fs::current_path() / (std::string(PCR_BINARY_NAME) + ".lastrun.txt");
+}
+
+static void setActivity(const std::string &what)
+{
+    std::ofstream f(activityLogPath());
+    if (f) f << what;
+}
+
+static void clearActivity()
+{
+    std::error_code ec;
+    fs::remove(activityLogPath(), ec);
+}
+
+static void reportPreviousCrash()
+{
+    fs::path p = activityLogPath();
+    std::error_code ec;
+    if (!fs::exists(p, ec)) return;
+    std::ifstream f(p);
+    std::string content((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+    fs::remove(p, ec);
+    if (content.empty()) return;
+
+    std::string body =
+        "The previous run did not exit cleanly.\n\n"
+        "Last activity:\n  " + content + "\n\n"
+        "Most likely cause: Windows TDR (Timeout Detection and Recovery — "
+        "the GPU watchdog reset the driver because a single dispatch took "
+        "longer than ~2 seconds, and the kernel terminated this process as "
+        "part of the recovery). Confirmable in Event Viewer (Windows Logs > "
+        "System) under source 'nvlddmkm' / 'amdkmdag' / 'Display'.\n\n"
+        "Workarounds:\n"
+        "  - Step the preset down (Production or Decent) for high-poly meshes.\n"
+        "  - Reduce samples or depth.\n"
+        "  - Set PCR_DEBUG=1 in your environment to enable a console + log "
+        "for the next run, in case the failure is something other than TDR.";
+    MessageBoxA(nullptr, body.c_str(),
+                PCR_BINARY_NAME " — previous run crashed",
+                MB_OK | MB_ICONWARNING);
+}
+
+// In-process unhandled exception (segfault, divide-by-zero, etc. — NOT
+// TDR; TDR doesn't go through SEH). Show a MessageBox with what we know
+// before unwinding. The activity-log path also fires for these because
+// we don't get to clearActivity().
+static LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS *ep)
+{
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "%s crashed with unhandled exception.\n\n"
+                  "Code: 0x%08lx\nAddress: %p\n\n"
+                  "See %s.lastrun.txt next to the binary for what the\n"
+                  "renderer was doing.\n\n"
+                  "Set PCR_DEBUG=1 for verbose logging on the next run.",
+                  PCR_BINARY_NAME,
+                  ep->ExceptionRecord->ExceptionCode,
+                  ep->ExceptionRecord->ExceptionAddress,
+                  PCR_BINARY_NAME);
+    MessageBoxA(nullptr, buf, PCR_BINARY_NAME " — crashed",
+                MB_OK | MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Optional debug console + log (via the same pipe-tee as before, but now
+// gated behind PCR_DEBUG so the default GUI launch is silent). Returns
+// true on success.
+static bool openDebugConsole()
+{
+    if (GetConsoleWindow() != nullptr) return false; // already attached
+    if (!AllocConsole()) return false;
+    SetConsoleTitleA(PCR_BINARY_NAME " — debug log");
+    SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
+        return ev == CTRL_CLOSE_EVENT;
+    }, TRUE);
+
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::string logPath = std::string(PCR_BINARY_NAME) + ".log";
+    HANDLE hLog = CreateFileA(logPath.c_str(),
+                              FILE_APPEND_DATA, FILE_SHARE_READ,
+                              nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    HANDLE hPipeRead = INVALID_HANDLE_VALUE, hPipeWrite = INVALID_HANDLE_VALUE;
+    if (CreatePipe(&hPipeRead, &hPipeWrite, nullptr, 0))
+    {
+        int writeFd = _open_osfhandle((intptr_t)hPipeWrite, _O_TEXT);
+        if (writeFd >= 0)
+        {
+            _dup2(writeFd, _fileno(stderr));
+            _dup2(writeFd, _fileno(stdout));
+            _close(writeFd);
+            std::setvbuf(stderr, nullptr, _IONBF, 0);
+            std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+            std::thread([hPipeRead, hConsole, hLog]() {
+                char buf[4096];
+                DWORD n;
+                while (ReadFile(hPipeRead, buf, sizeof(buf), &n, nullptr) && n > 0)
+                {
+                    DWORD written;
+                    WriteFile(hConsole, buf, n, &written, nullptr);
+                    if (hLog != INVALID_HANDLE_VALUE)
+                        WriteFile(hLog, buf, n, &written, nullptr);
+                }
+            }).detach();
+
+            std::fprintf(stderr,
+                         "%s debug log (build " __DATE__ " " __TIME__ ")\n"
+                         "Output is also tee'd to %s in the cwd.\n"
+                         "Closing this window won't quit the app.\n\n",
+                         PCR_BINARY_NAME, logPath.c_str());
+            std::fflush(stderr);
+            return true;
+        }
+        CloseHandle(hPipeWrite);
+        CloseHandle(hPipeRead);
+    }
+    if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
+    // Fallback: console without the log-file tee.
+    std::freopen("CONOUT$", "w", stderr);
+    std::freopen("CONOUT$", "w", stdout);
+    return true;
+}
+#endif
+
 int main(int, char **)
 {
 #ifdef _WIN32
-    // /SUBSYSTEM:WINDOWS detaches stderr/stdout from any console, so error
-    // output (shader compile failures, GL errors, GPU readback errors,
-    // GLFW errors, worker-thread exception text) is silently discarded —
-    // painful when a GPU dies via TDR and there's no on-screen trace.
+    // Default behavior is silent — no popup console, no log file. The GUI
+    // is the GUI. Two diagnostic hooks layered on top:
     //
-    // Architecture for visibility:
-    //   - AllocConsole pops a real console window at startup
-    //   - stderr + stdout get redirected to the write end of a pipe
-    //   - a detached fan-out thread reads the pipe and writes each chunk
-    //     to BOTH the console (live view, copy via right-click → Mark)
-    //     AND a log file <binary>.log next to the cwd (permanent record)
+    //  - reportPreviousCrash() shows a MessageBox if the previous launch
+    //    didn't clean up its activity log (the TDR signature, since
+    //    TDR-killed processes can't run any cleanup code).
+    //  - unhandledExceptionFilter shows a MessageBox on any in-process
+    //    crash that isn't TDR (segfault, etc.).
     //
-    // Existing fprintf(stderr, ...) / std::cerr calls in the codebase
-    // are teed transparently — no changes at the call sites needed.
-    if (GetConsoleWindow() == nullptr)
-    {
-        if (AllocConsole())
-        {
-            SetConsoleTitleA(PCR_BINARY_NAME " — log");
-            // Closing the console window otherwise kills the process via
-            // CTRL_CLOSE_EVENT; swallow that so the user can dismiss the
-            // console without losing their in-progress render. Quitting
-            // still works via the GUI window's close button.
-            SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
-                return ev == CTRL_CLOSE_EVENT;
-            }, TRUE);
+    // PCR_DEBUG=1 in the environment opts back into the always-on
+    // console + tee'd log file for cases where the crash output isn't
+    // enough — typically when developing rather than just rendering.
+    SetUnhandledExceptionFilter(unhandledExceptionFilter);
+    reportPreviousCrash();
 
-            HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-            std::string logPath = std::string(PCR_BINARY_NAME) + ".log";
-            HANDLE hLog = CreateFileA(logPath.c_str(),
-                                      FILE_APPEND_DATA, FILE_SHARE_READ,
-                                      nullptr, CREATE_ALWAYS,
-                                      FILE_ATTRIBUTE_NORMAL, nullptr);
-
-            HANDLE hPipeRead = INVALID_HANDLE_VALUE, hPipeWrite = INVALID_HANDLE_VALUE;
-            bool teeReady = false;
-            if (CreatePipe(&hPipeRead, &hPipeWrite, nullptr, 0))
-            {
-                int writeFd = _open_osfhandle((intptr_t)hPipeWrite, _O_TEXT);
-                if (writeFd >= 0)
-                {
-                    _dup2(writeFd, _fileno(stderr));
-                    _dup2(writeFd, _fileno(stdout));
-                    _close(writeFd); // dup2'd fds keep the pipe handle alive
-                    // Unbuffered so writes pump through the pipe immediately
-                    // — otherwise short error messages might sit in the CRT
-                    // buffer until a crash flushes them, defeating the
-                    // whole point of a live console.
-                    std::setvbuf(stderr, nullptr, _IONBF, 0);
-                    std::setvbuf(stdout, nullptr, _IONBF, 0);
-
-                    std::thread([hPipeRead, hConsole, hLog]() {
-                        char buf[4096];
-                        DWORD n;
-                        while (ReadFile(hPipeRead, buf, sizeof(buf), &n, nullptr) && n > 0)
-                        {
-                            DWORD written;
-                            WriteFile(hConsole, buf, n, &written, nullptr);
-                            if (hLog != INVALID_HANDLE_VALUE)
-                                WriteFile(hLog, buf, n, &written, nullptr);
-                        }
-                    }).detach();
-                    teeReady = true;
-                }
-                else
-                {
-                    CloseHandle(hPipeWrite);
-                    CloseHandle(hPipeRead);
-                }
-            }
-
-            // Fallback if the pipe wiring failed for any reason: at least
-            // get console output, even without the file copy.
-            if (!teeReady)
-            {
-                std::freopen("CONOUT$", "w", stderr);
-                std::freopen("CONOUT$", "w", stdout);
-                if (hLog != INVALID_HANDLE_VALUE) CloseHandle(hLog);
-            }
-
-            std::fprintf(stderr,
-                         "%s starting (build " __DATE__ " " __TIME__ ")\n"
-                         "Output goes here AND to %s in the working dir.\n"
-                         "Right-click → Mark to select & copy. Closing this\n"
-                         "window won't quit the app.\n\n",
-                         PCR_BINARY_NAME, logPath.c_str());
-            std::fflush(stderr);
-        }
-    }
+    const char *debugEnv = std::getenv("PCR_DEBUG");
+    if (debugEnv && debugEnv[0] && debugEnv[0] != '0')
+        openDebugConsole();
 #endif
 
     glfwSetErrorCallback(glfwErrorCallback);
