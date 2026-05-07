@@ -1490,6 +1490,28 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                             (std::string(PCR_BINARY_NAME) + ".lastrun.txt");
 #endif
 
+    // Cold-start warmup dispatch. The first compute dispatch on this
+    // shader pays one-time costs the steady-state work formula doesn't
+    // account for: JIT to GPU machine code, resource state validation,
+    // GPU clock ramp from idle. On nvlddmkm + heavy shaders (all
+    // techniques on) those costs add enough latency that a normal-
+    // sized first tile blows past the 2-sec TDR cliff even with the
+    // 1.5e8 work budget. Run one pixel of full work up front; the
+    // shader gets fully exercised, the driver finishes its lazy JIT,
+    // and the real tile loop starts on a warm pipeline.
+    //
+    // Why one pixel and not a no-op dispatch: drivers can lazy-compile
+    // only the code paths actually executed. A one-pixel dispatch with
+    // real uniforms exercises the full shader body so JIT covers
+    // everything before the real loop hits it.
+    setI("uXOffset", 0);
+    setI("uXEnd",    1);
+    setI("uYOffset", 0);
+    setI("uYEnd",    1);
+    glDispatchCompute(1, 1, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    glFinish();
+
     for (int yStart = 0; yStart < _height; yStart += tileSide)
     {
         for (int xStart = 0; xStart < _width; xStart += tileSide)
