@@ -200,7 +200,9 @@ uniform int   uShadowSamples;
 uniform int   uSphereCount;
 uniform int   uPlaneCount;
 uniform int   uTriangleCount;
-uniform int   uLightPlaneIdx;
+uniform int   uBvhNodeCount;
+uniform int   uLightCount;
+uniform float uTotalLightArea;
 uniform int   uYOffset;
 uniform int   uYEnd;
 uniform int   uFrameSeed;
@@ -244,10 +246,51 @@ struct GpuTriangle {
     int  _pad0, _pad1;
 };
 
-layout(std430, binding = 1) buffer Spheres   { GpuSphere   spheres[];   };
-layout(std430, binding = 2) buffer Planes    { GpuPlane    planes[];    };
-layout(std430, binding = 3) buffer Materials { GpuMaterial materials[]; };
-layout(std430, binding = 4) buffer Triangles { GpuTriangle triangles[]; };
+// BVH node: mirrors CPU Bvh::Node with two extra pad floats per AABB so
+// boxMin/boxMax sit on vec4 boundaries (std430 alignment).
+struct GpuBvhNode {
+    vec4 boxMin;          // xyz=AABB min
+    vec4 boxMax;          // xyz=AABB max
+    int  leftOrFirst;     // internal: left-child idx; leaf: first triangle idx
+    int  rightChild;      // internal: right-child idx; leaf: unused
+    int  count;           // 0 = internal; > 0 = leaf with this many tris
+    int  _pad;
+};
+
+// Multi-light SSBO. Plane and TriangleSet kinds share one struct via tag
+// discriminator. firstTri/count index into LightTriangles[] for the
+// TriangleSet kind (Plane lights ignore those fields).
+struct GpuLight {
+    vec4 origin;          // xyz=plane origin (Plane kind only)
+    vec4 u;               // xyz=plane u    (Plane kind only)
+    vec4 v;               // xyz=plane v    (Plane kind only)
+    vec4 normal_area;     // xyz=plane N, w=this light's total area
+    vec4 emissive;        // representative emissive (Plane: that material's;
+                          // TriangleSet: first tri's, used as fallback only)
+    int  kind;            // 0 = Plane, 1 = TriangleSet
+    int  firstTri;        // TriangleSet only
+    int  count;           // TriangleSet only
+    int  _pad;
+};
+
+// Compact triangle for area-light sampling. flatN.w stores the cumulative
+// area of triangles 0..i within the parent light, so binary search on .w
+// picks a triangle proportional to area in O(log count).
+struct GpuLightTriangle {
+    vec4 v0;
+    vec4 v1;
+    vec4 v2;
+    vec4 flatN;           // xyz=N, w=cumulative area within parent light
+    vec4 emissive;
+};
+
+layout(std430, binding = 1) buffer Spheres        { GpuSphere        spheres[];        };
+layout(std430, binding = 2) buffer Planes         { GpuPlane         planes[];         };
+layout(std430, binding = 3) buffer Materials      { GpuMaterial      materials[];      };
+layout(std430, binding = 4) buffer Triangles      { GpuTriangle      triangles[];      };
+layout(std430, binding = 5) buffer BvhNodes       { GpuBvhNode       bvhNodes[];       };
+layout(std430, binding = 6) buffer Lights         { GpuLight         lights[];         };
+layout(std430, binding = 7) buffer LightTriangles { GpuLightTriangle lightTriangles[]; };
 
 // PCG random number generator. Each pixel gets its own seeded state.
 uint pcg(inout uint state) {
@@ -338,6 +381,72 @@ bool intersectPlane(vec3 ro, vec3 rd, GpuPlane p, out float t, out vec3 hitOut) 
     return true;
 }
 
+// Slab-method ray-AABB. Returns true if the ray segment (0, segMax)
+// intersects the box. Mirrors CPU Bvh::rayAabb.
+bool intersectAabb(vec3 ro, vec3 rd, vec3 mn, vec3 mx, float segMax) {
+    float tmin = 0.0;
+    float tmax = segMax;
+    for (int i = 0; i < 3; i++) {
+        float invD = 1.0 / rd[i];
+        float t1 = (mn[i] - ro[i]) * invD;
+        float t2 = (mx[i] - ro[i]) * invD;
+        if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+        tmin = max(tmin, t1);
+        tmax = min(tmax, t2);
+        if (tmin > tmax) return false;
+    }
+    return true;
+}
+
+// Stack-based BVH closest-hit traversal. Mirrors CPU Bvh::intersect.
+// Returns true on hit; out params (hit, N, matIdx, t_out) are set to the
+// closest intersection within (EPS, closest_t).
+bool intersectBvh(vec3 ro, vec3 rd, float closest_t,
+                  out vec3 hit, out vec3 N, out int matIdx, out float t_out) {
+    if (uBvhNodeCount == 0) return false;
+
+    // 64-deep stack handles any reasonable BVH; even adversarially-skewed
+    // object-median trees on 2^64 triangles fit.
+    int stack[64];
+    int top = 0;
+    stack[top++] = 0; // root
+
+    bool anyHit = false;
+    float closest = closest_t;
+
+    while (top > 0) {
+        int idx = stack[top - 1];
+        top -= 1;
+        GpuBvhNode n = bvhNodes[idx];
+
+        if (!intersectAabb(ro, rd, n.boxMin.xyz, n.boxMax.xyz, closest)) continue;
+
+        if (n.count > 0) {
+            for (int i = 0; i < n.count; i++) {
+                int triIdx = n.leftOrFirst + i;
+                float tt;
+                vec3 ph, pn;
+                if (intersectTriangle(ro, rd, triangles[triIdx], tt, ph, pn) && tt < closest) {
+                    closest = tt;
+                    hit = ph;
+                    N = pn;
+                    matIdx = triangles[triIdx].matIdx;
+                    anyHit = true;
+                }
+            }
+        } else {
+            // Internal: push both children. Bounds-check the stack push.
+            if (top + 2 <= 64) {
+                stack[top++] = n.leftOrFirst;
+                stack[top++] = n.rightChild;
+            }
+        }
+    }
+
+    if (anyHit) t_out = closest;
+    return anyHit;
+}
+
 bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) {
     float closest = 1e30;
     bool found = false;
@@ -367,20 +476,68 @@ bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) 
             }
         }
     }
-    for (int i = 0; i < uTriangleCount; i++) {
-        float t;
-        vec3 ph, pn;
-        if (intersectTriangle(ro, rd, triangles[i], t, ph, pn)) {
-            if (t < closest) {
-                closest = t;
-                hit = ph;
-                N = pn;
-                matIdx = triangles[i].matIdx;
-                found = true;
-            }
+
+    // Triangles go through the BVH (built once at scene load and uploaded
+    // verbatim from the CPU's Bvh::Node array). Empty BVH = no triangles.
+    if (uTriangleCount > 0) {
+        vec3 triHit, triN;
+        int triMat;
+        float triT;
+        if (intersectBvh(ro, rd, closest, triHit, triN, triMat, triT) && triT < closest) {
+            closest = triT;
+            hit = triHit;
+            N = triN;
+            matIdx = triMat;
+            found = true;
         }
     }
     return found;
+}
+
+// Pick one area light proportional to area, then sample uniformly within
+// it. Mirrors CPU pick-and-sample. PDF over total light surface area =
+// 1/uTotalLightArea regardless of which light got picked.
+void sampleAreaLight(inout uint seed,
+                     out vec3 sampleP, out vec3 sampleN, out vec3 sampleEmissive) {
+    float pickTarget = rand(seed) * uTotalLightArea;
+    int lightIdx = 0;
+    float cumul = 0.0;
+    for (int i = 0; i < uLightCount; i++) {
+        cumul += lights[i].normal_area.w;
+        if (pickTarget <= cumul) { lightIdx = i; break; }
+    }
+
+    GpuLight L = lights[lightIdx];
+    if (L.kind == 0) {
+        // Plane kind: uniform on parallelogram.
+        float ru = rand(seed);
+        float rv = rand(seed);
+        sampleP = L.origin.xyz + L.u.xyz * ru + L.v.xyz * rv;
+        sampleN = L.normal_area.xyz;
+        sampleEmissive = L.emissive.rgb;
+    } else {
+        // TriangleSet: binary-search the cumulative area (stored in flatN.w
+        // of each light triangle), then uniform-sample within that triangle.
+        float rtri = rand(seed) * L.normal_area.w;
+        int lo = L.firstTri;
+        int hi = L.firstTri + L.count - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (lightTriangles[mid].flatN.w < rtri) lo = mid + 1;
+            else hi = mid;
+        }
+        int triIdx = lo;
+
+        float r1 = rand(seed);
+        float r2 = rand(seed);
+        if (r1 + r2 > 1.0) { r1 = 1.0 - r1; r2 = 1.0 - r2; }
+        vec3 v0 = lightTriangles[triIdx].v0.xyz;
+        vec3 v1 = lightTriangles[triIdx].v1.xyz;
+        vec3 v2 = lightTriangles[triIdx].v2.xyz;
+        sampleP = v0 + (v1 - v0) * r1 + (v2 - v0) * r2;
+        sampleN = lightTriangles[triIdx].flatN.xyz;
+        sampleEmissive = lightTriangles[triIdx].emissive.rgb;
+    }
 }
 
 vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
@@ -393,9 +550,6 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
 
     vec3 throughput = vec3(1.0);
     vec3 radiance = vec3(0.0);
-
-    GpuPlane light = planes[uLightPlaneIdx];
-    vec3 lightEmissive = materials[light.matIdx].emissive.rgb;
 
     // pr1, pr2 only seed the FIRST indirect bounce when stratified is on; later
     // bounces fall back to PCG. Stratifying every bounce would require N^depth
@@ -416,47 +570,51 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
             break;
         }
 
-        // Direct lighting
+        // Direct lighting (multi-light: pick by area, sample within).
         vec3 directLo = vec3(0.0);
-        for (int s = 0; s < uShadowSamples; s++) {
-            vec3 lpos = light.origin.xyz + light.u.xyz * rand(seed) + light.v.xyz * rand(seed);
-            vec3 Li = lpos - hit;
-            vec3 wi = normalize(Li);
-            float cosTheta = max(0.0, dot(wi, N));
-            float lightDist2 = dot(Li, Li);
-            vec3 shadowOrigin = (cosTheta <= 0.0) ? hit - N * 1e-3 : hit + N * 1e-3;
+        if (uTotalLightArea > 0.0) {
+            for (int s = 0; s < uShadowSamples; s++) {
+                vec3 sampleP, sampleN, sampleEmissive;
+                sampleAreaLight(seed, sampleP, sampleN, sampleEmissive);
 
-            vec3 sh, sN;
-            int sMat;
-            bool occluded = false;
-            if (sceneIntersect(shadowOrigin, wi, sh, sN, sMat)) {
-                vec3 d = sh - shadowOrigin;
-                float occluderDist2 = dot(d, d);
-                if (occluderDist2 < lightDist2 - 1e-3) {
-                    GpuMaterial om = materials[sMat];
-                    if (!any(greaterThan(om.emissive.rgb, vec3(0.0)))) occluded = true;
+                vec3 Li = sampleP - hit;
+                vec3 wi = normalize(Li);
+                float cosTheta = max(0.0, dot(wi, N));
+                float lightDist2 = dot(Li, Li);
+                vec3 shadowOrigin = (cosTheta <= 0.0) ? hit - N * 1e-3 : hit + N * 1e-3;
+
+                vec3 sh, sN;
+                int sMat;
+                bool occluded = false;
+                if (sceneIntersect(shadowOrigin, wi, sh, sN, sMat)) {
+                    vec3 d = sh - shadowOrigin;
+                    float occluderDist2 = dot(d, d);
+                    if (occluderDist2 < lightDist2 - 1e-3) {
+                        GpuMaterial om = materials[sMat];
+                        if (!any(greaterThan(om.emissive.rgb, vec3(0.0)))) occluded = true;
+                    }
+                }
+
+                if (!occluded) {
+                    float cosLight = max(0.0, dot(sampleN, -wi));
+                    float G = (cosTheta * cosLight) / lightDist2;
+                    // pdf = 1/uTotalLightArea, so divide-by-pdf = uTotalLightArea.
+                    vec3 directContrib = (mat.albedo.rgb / PI) * sampleEmissive * G * uTotalLightArea;
+
+                    // Partial MIS: light-side balance heuristic, same caveat
+                    // as CPU renderer (BRDF-side weighting omitted).
+                    if (uUseMIS != 0 && cosLight > 1e-6) {
+                        float pdfLight = lightDist2 / (cosLight * uTotalLightArea);
+                        float pdfBrdf  = cosTheta / PI;
+                        float w = (pdfLight * pdfLight) /
+                                  (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                        directContrib *= w;
+                    }
+                    directLo += directContrib;
                 }
             }
-
-            if (!occluded) {
-                float cosLight = max(0.0, dot(light.normal_area.xyz, -wi));
-                float G = (cosTheta * cosLight) / lightDist2;
-                vec3 directContrib = (mat.albedo.rgb / PI) * lightEmissive * G * light.normal_area.w;
-
-                // Partial MIS: down-weight by balance heuristic on the
-                // light-side. Same caveat as the CPU renderer about the
-                // BRDF-side weighting on emissive returns being omitted.
-                if (uUseMIS != 0 && cosLight > 1e-6) {
-                    float pdfLight = lightDist2 / (cosLight * light.normal_area.w);
-                    float pdfBrdf  = cosTheta / PI;
-                    float w = (pdfLight * pdfLight) /
-                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
-                    directContrib *= w;
-                }
-                directLo += directContrib;
-            }
+            directLo /= float(uShadowSamples);
         }
-        directLo /= float(uShadowSamples);
         radiance += throughput * directLo;
 
         // Russian roulette: at bounce >= 1, terminate with prob (1 - p) where
@@ -600,6 +758,35 @@ namespace
         int   smooth_;
         int   _pad[2];
     };
+    struct GpuBvhNode
+    {
+        float boxMin[4];   // xyz=AABB min, w=padding
+        float boxMax[4];   // xyz=AABB max, w=padding
+        int   leftOrFirst;
+        int   rightChild;
+        int   count;
+        int   _pad;
+    };
+    struct GpuLight
+    {
+        float origin[4];      // Plane only
+        float u[4];           // Plane only
+        float v[4];           // Plane only
+        float normal_area[4]; // xyz=N (Plane only), w=this light's totalArea
+        float emissive[4];    // representative
+        int   kind;           // 0 = Plane, 1 = TriangleSet
+        int   firstTri;       // TriangleSet only
+        int   count;          // TriangleSet only
+        int   _pad;
+    };
+    struct GpuLightTriangle
+    {
+        float v0[4];
+        float v1[4];
+        float v2[4];
+        float flatN[4];   // xyz=N, w=cumulative area within parent light
+        float emissive[4];
+    };
 
     std::string formatTimestamp(bool utc)
     {
@@ -664,12 +851,15 @@ bool GpuRenderer::initGL()
     glGenBuffers(1, &_planeSSBO);
     glGenBuffers(1, &_triangleSSBO);
     glGenBuffers(1, &_materialSSBO);
+    glGenBuffers(1, &_bvhSSBO);
+    glGenBuffers(1, &_lightSSBO);
+    glGenBuffers(1, &_lightTriSSBO);
 
     _initialized = true;
     return true;
 }
 
-void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
+void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLightArea)
 {
     // Build a flat material table: one material per scene material seen.
     // For simplicity, materials are deduplicated by pointer identity (we
@@ -720,13 +910,15 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
         gpuPlanes.push_back(gp);
     };
 
-    // Add light as planes[0] so we can refer to it by index. Render() above
-    // has already enforced "exactly one plane light" for this code path.
-    const Plane &lightPlane = scene.areaLights.front().plane;
-    int lightMatIdx = addMaterial(lightPlane.material);
-    addPlane(lightPlane, lightMatIdx);
-    outLightIdx = 0;
-
+    // Plane lights go into the GpuPlane SSBO front-loaded so coplanar ties
+    // (cornell ceiling-cutout case) are won by the light, mirroring the CPU
+    // _planes ordering. Walls follow.
+    for (const auto &L : scene.areaLights)
+    {
+        if (L.kind != Scenes::AreaLightKind::Plane) continue;
+        int mi = addMaterial(L.plane.material);
+        addPlane(L.plane, mi);
+    }
     for (const auto &w : scene.walls)
     {
         int wmi = addMaterial(w.material);
@@ -781,10 +973,113 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
                      gpuTris.data(), GL_DYNAMIC_DRAW);
     }
 
+    // Convert the CPU BVH node array (3-component AABBs) into the GPU
+    // layout (4-component AABBs with explicit pad). The CPU code is
+    // free to use the smaller layout because std::vector handles its
+    // own alignment; std430 forces the vec4 boundaries.
+    std::vector<GpuBvhNode> gpuBvh;
+    gpuBvh.reserve(scene.triangleBvh.size());
+    for (const auto &n : scene.triangleBvh)
+    {
+        GpuBvhNode gn{};
+        for (int i = 0; i < 3; i++)
+        {
+            gn.boxMin[i] = n.boxMin[i];
+            gn.boxMax[i] = n.boxMax[i];
+        }
+        gn.leftOrFirst = n.leftOrFirst;
+        gn.rightChild = n.rightChild;
+        gn.count = n.count;
+        gpuBvh.push_back(gn);
+    }
+
+    // Build the multi-light buffers. Plane lights store geometry in the
+    // GpuLight struct directly; TriangleSet lights store firstTri/count
+    // pointing into the parallel GpuLightTriangle SSBO. flatN.w on each
+    // light triangle holds the cumulative area within its parent light
+    // for binary-search picking on the GPU.
+    std::vector<GpuLight> gpuLights;
+    std::vector<GpuLightTriangle> gpuLightTris;
+    float totalLightArea = 0.f;
+    for (const auto &L : scene.areaLights)
+    {
+        GpuLight gl{};
+        gl.normal_area[3] = L.totalArea;
+        totalLightArea += L.totalArea;
+        if (L.kind == Scenes::AreaLightKind::Plane)
+        {
+            gl.kind = 0;
+            const Vec3f &u = L.plane.getU();
+            const Vec3f &v = L.plane.getV();
+            for (int i = 0; i < 3; i++)
+            {
+                gl.origin[i] = L.plane.origin[i];
+                gl.u[i] = u[i];
+                gl.v[i] = v[i];
+                gl.normal_area[i] = L.plane.N[i];
+                gl.emissive[i] = L.plane.material.emissive[i];
+            }
+            gl.firstTri = 0;
+            gl.count = 0;
+        }
+        else
+        {
+            gl.kind = 1;
+            gl.firstTri = (int)gpuLightTris.size();
+            gl.count = (int)L.triangles.size();
+            // First-triangle emissive as a representative; the GLSL
+            // sampler reads per-triangle emissive directly.
+            if (!L.triangles.empty())
+                for (int i = 0; i < 3; i++)
+                    gl.emissive[i] = L.triangles.front().material.emissive[i];
+
+            for (size_t ti = 0; ti < L.triangles.size(); ti++)
+            {
+                const Triangle &t = L.triangles[ti];
+                GpuLightTriangle glt{};
+                for (int i = 0; i < 3; i++)
+                {
+                    glt.v0[i] = t.v0[i];
+                    glt.v1[i] = t.v1[i];
+                    glt.v2[i] = t.v2[i];
+                    glt.flatN[i] = t.flatN[i];
+                    glt.emissive[i] = t.material.emissive[i];
+                }
+                glt.flatN[3] = L.cumulativeArea[ti];
+                gpuLightTris.push_back(glt);
+            }
+        }
+        gpuLights.push_back(gl);
+    }
+    outTotalLightArea = totalLightArea;
+
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _materialSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER,
                  (GLsizeiptr)(mats.size() * sizeof(GpuMaterial)),
                  mats.data(), GL_DYNAMIC_DRAW);
+
+    // BVH and light SSBOs use the same dummy-1-element trick as the
+    // triangle SSBO so drivers don't choke on zero-byte allocations.
+    auto uploadOrDummy = [&](unsigned ssbo, const void *data, size_t bytes,
+                             const void *dummy, size_t dummyBytes) {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+        if (bytes == 0)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)dummyBytes,
+                         dummy, GL_DYNAMIC_DRAW);
+        else
+            glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes,
+                         data, GL_DYNAMIC_DRAW);
+    };
+    GpuBvhNode bvhDummy{};
+    GpuLight lightDummy{};
+    GpuLightTriangle ltDummy{};
+    uploadOrDummy(_bvhSSBO, gpuBvh.data(), gpuBvh.size() * sizeof(GpuBvhNode),
+                  &bvhDummy, sizeof(bvhDummy));
+    uploadOrDummy(_lightSSBO, gpuLights.data(), gpuLights.size() * sizeof(GpuLight),
+                  &lightDummy, sizeof(lightDummy));
+    uploadOrDummy(_lightTriSSBO, gpuLightTris.data(),
+                  gpuLightTris.size() * sizeof(GpuLightTriangle),
+                  &ltDummy, sizeof(ltDummy));
 }
 
 void GpuRenderer::render(const Scenes::SceneData &scene,
@@ -799,21 +1094,10 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    // GPU support is plane-light-only for now. Multi-light + triangle area
-    // lights land in phase 4 alongside GPU BVH; until then the GPU binary
-    // refuses scenes that need them with a clear pointer to the CPU binary.
-    if (scene.areaLights.size() != 1 ||
-        scene.areaLights.front().kind != Scenes::AreaLightKind::Plane)
+    if (scene.areaLights.empty())
     {
-        std::cerr << "physically-cringe-rendering: this scene uses "
-                  << scene.areaLights.size() << " light(s)";
-        if (!scene.areaLights.empty() &&
-            scene.areaLights.front().kind == Scenes::AreaLightKind::TriangleSet)
-            std::cerr << " (including a triangle/mesh light)";
-        std::cerr << ". The GPU path tracer currently supports a single "
-                  << "plane area light; multi-light + triangle-area-light "
-                  << "sampling on GPU lands in phase 4. Render this scene "
-                  << "with frank-based-rendering (CPU) instead." << std::endl;
+        std::cerr << "physically-cringe-rendering: scene has no area lights"
+                  << std::endl;
         return;
     }
 
@@ -825,8 +1109,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    int lightIdx = 0;
-    uploadScene(scene, lightIdx);
+    float totalLightArea = 0.f;
+    uploadScene(scene, totalLightArea);
 
     glUseProgram(_program);
 
@@ -838,6 +1122,9 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, _planeSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, _materialSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, _triangleSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, _bvhSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, _lightSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, _lightTriSSBO);
 
     // Set uniforms
     auto setI = [&](const char *name, int v) {
@@ -859,10 +1146,19 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uDepth",          _maxDepth);
     setI("uSamples",        _samples);
     setI("uShadowSamples",  _shadowSamples);
+    // Plane count = walls + plane-kind area lights (TriangleSet lights
+    // don't contribute to the plane SSBO; their geometry lives in the
+    // light-triangle SSBO and the main triangle SSBO).
+    int planeLightCount = 0;
+    for (const auto &L : scene.areaLights)
+        if (L.kind == Scenes::AreaLightKind::Plane) planeLightCount++;
+
     setI("uSphereCount",    (int)scene.spheres.size());
-    setI("uPlaneCount",     (int)(scene.walls.size() + 1)); // walls + light
+    setI("uPlaneCount",     (int)scene.walls.size() + planeLightCount);
     setI("uTriangleCount",  (int)scene.triangles.size());
-    setI("uLightPlaneIdx",  lightIdx);
+    setI("uBvhNodeCount",   (int)scene.triangleBvh.size());
+    setI("uLightCount",     (int)scene.areaLights.size());
+    setF("uTotalLightArea", totalLightArea);
     setI("uFrameSeed",      (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())
                                        .count() & 0x7FFFFFFF));

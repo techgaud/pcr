@@ -61,9 +61,12 @@ private:
     unsigned _planeSSBO = 0;
     unsigned _triangleSSBO = 0;
     unsigned _materialSSBO = 0;
+    unsigned _bvhSSBO = 0;
+    unsigned _lightSSBO = 0;
+    unsigned _lightTriSSBO = 0;
     bool _initialized = false;
 
     bool initGL();
-    void uploadScene(const Scenes::SceneData &scene, int &outLightIdx);
+    void uploadScene(const Scenes::SceneData &scene, float &outTotalLightArea);
     void destroyGL();
 };
