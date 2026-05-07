@@ -68,9 +68,17 @@ void Renderer::render(const Scenes::SceneData &scene,
             for (size_t i = t; i < (size_t)_height; i += numThreads)
             {
                 if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-                    break;
+                    return;
                 for (size_t j = 0; j < (size_t)_width; j++)
                 {
+                    // Check cancel periodically inside the row, not just
+                    // between rows. At high quality settings a single row
+                    // can take many seconds; without this, cancel feels broken.
+                    // Once every 64 pixels is plenty responsive (sub-second on
+                    // typical hardware) and the atomic load is cheap.
+                    if ((j & 63) == 0 && cancelRequested &&
+                        cancelRequested->load(std::memory_order_relaxed))
+                        return;
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
                     auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
