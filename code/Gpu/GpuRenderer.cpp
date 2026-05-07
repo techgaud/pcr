@@ -1399,18 +1399,19 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // both dimensions, so a Picture-class render on a 70k-tri mesh at 1080
     // dispatches small enough chunks regardless of resolution.
     //
-    // Tile size is computed from per-pixel work × BVH overhead. Target
-    // ~0.15 sec per dispatch on the calibration GPU — a 13x safety margin
-    // from the 2-sec Windows TDR cliff. The previous 0.5-sec target hit
-    // TDR in practice because (a) GPU clock varies under thermal load
-    // (the same shader runs ~2x slower a few seconds in than at peak),
-    // (b) first-dispatch driver overhead inflates the early tiles, and
-    // (c) workload variance across the image means some tiles do more
-    // work than the average.
+    // Tile size is computed from per-pixel work × BVH overhead. The
+    // target below sets the per-dispatch budget. Lower = shorter tile
+    // times = more cold-start margin against the 2-sec Windows TDR
+    // cliff. The previous 0.5-sec target hit TDR in practice because
+    // (a) GPU clock varies under thermal load (the same shader runs
+    // ~2x slower a few seconds in than at peak), (b) first-dispatch
+    // driver overhead inflates the early tiles, and (c) workload
+    // variance across the image means some tiles do more work than
+    // the average.
     //
     // Calibration source: cornell-spheres at 1080² × 393216 work units
-    // took 245 sec ≈ 1.87e9 work-units-per-second. 0.15 sec target =
-    // ~2.8e8 work units per dispatch.
+    // took 245 sec ≈ 1.87e9 work-units-per-second.
+    //
     // aaSamples multiplies primary-ray count; folds into per-pixel work
     // for tile sizing so AA-enabled renders shrink tiles to compensate.
     int aaMult = std::max(1, aaSamples);
@@ -1437,7 +1438,31 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         bvhMult = depth * 0.25;
     }
     double effectivePerPixel = (double)workPerPixel * (primMult + bvhMult);
-    constexpr double kTargetWorkPerDispatch = 2.8e8;
+
+    // Adaptive sampling adds Welford running-variance bookkeeping (sqrt,
+    // div, branch on threshold) inside the per-sample inner loop. The
+    // average case is faster (early-exit on converged pixels), but the
+    // worst case (deep-shadow corners that take all AA samples) is
+    // slightly slower than the non-adaptive baseline. The 1.15x penalty
+    // budgets for the worst case so tile sizing doesn't over-commit on
+    // adaptive renders.
+    if (useAdaptive) effectivePerPixel *= 1.15;
+
+    // OIDN aux capture is one extra primary-ray sceneIntersect at the
+    // top of every pixel. Constant cost per pixel (not multiplied by
+    // samples), so the absolute add is tiny relative to the main loop.
+    // Folded in for completeness and so the formula is honest about
+    // what the GPU is doing.
+    if (useOIDN) effectivePerPixel += (primMult + bvhMult);
+
+    // 1.5e8 work units per dispatch ~= 0.08 sec on the calibration GPU.
+    // 25x safety margin against the 2-sec TDR cliff. Cold-start
+    // overhead (first-dispatch shader compile, GPU clock ramp, driver
+    // resource validation) can inflate the first tile by 5-10x, so we
+    // budget against an inflated first dispatch rather than the
+    // steady-state average. Was 2.8e8 (0.15 sec / 13x margin), which
+    // crashed at d=4 s=1024 S=32 + AA + adaptive + OIDN on tile 1.
+    constexpr double kTargetWorkPerDispatch = 1.5e8;
     double maxPixelsD = kTargetWorkPerDispatch / effectivePerPixel;
     int maxPixelsPerDispatch = std::max(64, (int)maxPixelsD);
     int tileSide = (int)std::sqrt((double)maxPixelsPerDispatch);
