@@ -154,10 +154,58 @@ void Renderer::render(const Scenes::SceneData &scene,
                     if ((j & 63) == 0 && cancelRequested &&
                         cancelRequested->load(std::memory_order_relaxed))
                         return;
-                    auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
-                    auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
-                    Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
-                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0);
+                    // Per-pixel primary-ray loop. aaSamples=1 (default) keeps
+                    // legacy behavior — one ray dead through pixel center,
+                    // no jitter. aaSamples>1 fires jittered primary rays
+                    // across the pixel area and averages, integrating edge
+                    // coverage. Welford's algorithm tracks running mean and
+                    // M2 (sum of squared deviations) so we can early-exit
+                    // adaptive renders once relative variance drops below
+                    // the convergence threshold.
+                    int aa = std::max(1, aaSamples);
+                    Vec3f mean{0, 0, 0};
+                    Vec3f M2{0, 0, 0};
+                    int taken = 0;
+                    for (int s = 0; s < aa; s++)
+                    {
+                        float jx = (aa > 1) ? (NumGen::Epsilon() - 0.5f) : 0.f;
+                        float jy = (aa > 1) ? (NumGen::Epsilon() - 0.5f) : 0.f;
+                        auto x = ((2 * (j + 0.5f + jx) / (float)_width) - 1) * scale * aspect;
+                        auto y = -((2 * (i + 0.5f + jy) / (float)_height) - 1) * scale;
+                        Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
+                        Vec3f c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0);
+
+                        taken++;
+                        Vec3f delta{c[0] - mean[0], c[1] - mean[1], c[2] - mean[2]};
+                        mean[0] += delta[0] / taken;
+                        mean[1] += delta[1] / taken;
+                        mean[2] += delta[2] / taken;
+                        Vec3f delta2{c[0] - mean[0], c[1] - mean[1], c[2] - mean[2]};
+                        M2[0] += delta[0] * delta2[0];
+                        M2[1] += delta[1] * delta2[1];
+                        M2[2] += delta[2] * delta2[2];
+
+                        // Adaptive convergence check. After at least 4
+                        // samples, stop if every channel's relative
+                        // variance is below threshold. Relative form
+                        // (variance/(mean²+eps)) handles HDR scenes where
+                        // a fixed absolute threshold would mis-fire on
+                        // bright pixels.
+                        if (useAdaptive && taken >= 4)
+                        {
+                            constexpr float absMin = 0.01f;
+                            constexpr float relThreshold = 0.05f;
+                            bool converged = true;
+                            for (int ch = 0; ch < 3; ch++)
+                            {
+                                float v = M2[ch] / (float)(taken - 1);
+                                float rel = v / (mean[ch] * mean[ch] + absMin);
+                                if (rel >= relThreshold) { converged = false; break; }
+                            }
+                            if (converged) break;
+                        }
+                    }
+                    frameBuffer[i * _width + j] = mean;
                 }
                 if (progressRows)
                     progressRows->fetch_add(1, std::memory_order_relaxed);
@@ -240,6 +288,11 @@ void Renderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
+    if (aaSamples > 1)
+    {
+        filename += "-aa" + std::to_string(aaSamples);
+        if (useAdaptive) filename += "adaptive";
+    }
     if (useACES)
         filename += "-aces";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
@@ -275,6 +328,8 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Russian",    useRussian    ? "1" : "0");
     addText("Stratified", useStratified ? "1" : "0");
     addText("Tonemap",    useACES       ? "ACES" : "Reinhard");
+    addText("AASamples",  std::to_string(aaSamples));
+    addText("Adaptive",   useAdaptive ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

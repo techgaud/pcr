@@ -216,6 +216,8 @@ uniform int   uUseRussian;    // 0/1
 uniform int   uUseStratified; // 0/1
 uniform int   uStrata;        // round(sqrt(uSamples)) when stratified, else 0
 uniform int   uUseACES;       // 0 = Reinhard, 1 = ACES filmic (Narkowicz)
+uniform int   uAaSamples;     // 1 = no AA; >1 = jittered primary rays per pixel
+uniform int   uUseAdaptive;   // 0/1; meaningful only when uAaSamples > 1
 
 const float PI = 3.14159265358979323846;
 
@@ -685,26 +687,51 @@ void main() {
 
     uint seed = uint(pix.x) * 1973u + uint(pix.y) * 9277u + uint(uFrameSeed) * 26699u;
 
-    vec3 accum = vec3(0.0);
-    for (int s = 0; s < uSamples; s++) {
-        // Stratified sample placement on a sqrt(N) x sqrt(N) jittered grid
-        // for the first bounce of each path.
-        float r1, r2;
-        if (uUseStratified != 0 && uStrata > 0) {
-            int sx = s % uStrata;
-            int sy = (s / uStrata) % uStrata;
-            r1 = (float(sx) + rand(seed)) / float(uStrata);
-            r2 = (float(sy) + rand(seed)) / float(uStrata);
-        } else {
-            r1 = rand(seed);
-            r2 = rand(seed);
+    // AA outer loop with optional adaptive early-exit. Welford's algorithm
+    // tracks running mean + M2 (sum of squared deviations) so we can
+    // check relative variance after each sample without recomputing.
+    int aaN = max(1, uAaSamples);
+    vec3 mean = vec3(0.0);
+    vec3 M2 = vec3(0.0);
+    int taken = 0;
+    for (int aa = 0; aa < aaN; aa++) {
+        vec2 jpix = vec2(pix);
+        if (aaN > 1) {
+            jpix.x += rand(seed) - 0.5;
+            jpix.y += rand(seed) - 0.5;
         }
-        accum += tracePath(vec2(pix), r1, r2, seed);
-    }
-    accum /= float(uSamples);
-    accum = (uUseACES != 0) ? aces(accum) : reinhard(accum);
+        vec3 accum = vec3(0.0);
+        for (int s = 0; s < uSamples; s++) {
+            float r1, r2;
+            if (uUseStratified != 0 && uStrata > 0) {
+                int sx = s % uStrata;
+                int sy = (s / uStrata) % uStrata;
+                r1 = (float(sx) + rand(seed)) / float(uStrata);
+                r2 = (float(sy) + rand(seed)) / float(uStrata);
+            } else {
+                r1 = rand(seed);
+                r2 = rand(seed);
+            }
+            accum += tracePath(jpix, r1, r2, seed);
+        }
+        accum /= float(uSamples);
 
-    imageStore(uOutput, pix, vec4(accum, 1.0));
+        // Welford update.
+        taken += 1;
+        vec3 delta = accum - mean;
+        mean += delta / float(taken);
+        vec3 delta2 = accum - mean;
+        M2 += delta * delta2;
+
+        if (uUseAdaptive != 0 && taken >= 4) {
+            vec3 variance = M2 / float(taken - 1);
+            vec3 rel = variance / (mean * mean + vec3(0.01));
+            if (max(max(rel.r, rel.g), rel.b) < 0.05) break;
+        }
+    }
+    vec3 outColor = (uUseACES != 0) ? aces(mean) : reinhard(mean);
+
+    imageStore(uOutput, pix, vec4(outColor, 1.0));
 }
 )GLSL";
 
@@ -1249,6 +1276,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uUseRussian",     useRussian ? 1 : 0);
     setI("uUseStratified",  useStratified ? 1 : 0);
     setI("uUseACES",        useACES ? 1 : 0);
+    setI("uAaSamples",      std::max(1, aaSamples));
+    setI("uUseAdaptive",    useAdaptive ? 1 : 0);
     setI("uStrata",         useStratified
                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
                             : 0);
@@ -1277,7 +1306,10 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // Calibration source: cornell-spheres at 1080² × 393216 work units
     // took 245 sec ≈ 1.87e9 work-units-per-second. 0.15 sec target =
     // ~2.8e8 work units per dispatch.
-    int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
+    // aaSamples multiplies primary-ray count; folds into per-pixel work
+    // for tile sizing so AA-enabled renders shrink tiles to compensate.
+    int aaMult = std::max(1, aaSamples);
+    int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples * aaMult);
 
     // Per-ray cost depends on how many primitives sceneIntersect tests.
     // Spheres + planes are linear in count; triangles go through the BVH
@@ -1426,6 +1458,11 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
+    if (aaSamples > 1)
+    {
+        filename += "-aa" + std::to_string(aaSamples);
+        if (useAdaptive) filename += "adaptive";
+    }
     if (useACES)
         filename += "-aces";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
@@ -1459,6 +1496,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     addText("Russian",       useRussian    ? "1" : "0");
     addText("Stratified",    useStratified ? "1" : "0");
     addText("Tonemap",       useACES       ? "ACES" : "Reinhard");
+    addText("AASamples",     std::to_string(aaSamples));
+    addText("Adaptive",      useAdaptive ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

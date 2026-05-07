@@ -68,6 +68,9 @@ int main(int argc, char *argv[])
     bool useRussian = false;
     bool useStratified = false;
     bool useACES = false;
+    bool useAA = false;
+    int aaSamples = 4;
+    bool useAdaptive = false;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -115,6 +118,21 @@ int main(int argc, char *argv[])
                  "ACES filmic tone mapping (Narkowicz approximation) instead of "
                  "the default Reinhard. Better midtone contrast; slight hue shift "
                  "in saturated highlights. Output filename gets -aces appended.");
+    app.add_flag("--aa", useAA,
+                 "Anti-aliasing via jittered primary rays. When set, each pixel "
+                 "fires --aa-samples primary rays at sub-pixel jitters (default 4) "
+                 "and averages, integrating pixel-edge coverage. Linear cost in "
+                 "the AA sample count. Filename gets -aa<N> appended.");
+    app.add_option("--aa-samples", aaSamples,
+                   "Number of jittered primary rays per pixel when --aa is set. "
+                   "Default 4. Ignored when --aa is off.")
+        ->default_str("4")
+        ->check(CLI::PositiveNumber);
+    app.add_flag("--adaptive", useAdaptive,
+                 "Adaptive sampling: within the per-pixel AA loop, early-exit "
+                 "once relative variance converges below threshold. Speeds up "
+                 "well-converged regions at the cost of more samples in noisy "
+                 "regions. Only meaningful with --aa.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -178,6 +196,8 @@ int main(int argc, char *argv[])
     renderer.useRussian   = useRussian;
     renderer.useStratified = useStratified;
     renderer.useACES      = useACES;
+    renderer.aaSamples    = useAA ? std::max(1, aaSamples) : 1;
+    renderer.useAdaptive  = useAdaptive;
     renderer.render(sceneData, start, outputDir);
 
     return 0;

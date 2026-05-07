@@ -37,6 +37,20 @@ public:
     bool useStratified = false; // jittered stratified samples instead of pure random
     bool useACES      = false; // ACES filmic tone-map (default: Reinhard)
 
+    // Per-pixel primary-ray count for anti-aliasing. 1 = no AA (one ray
+    // dead through pixel center, current behavior). >1 = jittered primary
+    // rays sampled across the pixel area, results averaged. Linear cost
+    // multiplier (aaSamples=4 → 4× total render time).
+    int aaSamples = 1;
+
+    // Adaptive sampling: within the per-pixel AA loop, track running
+    // variance via Welford's algorithm and early-exit once relative
+    // variance drops below threshold. Speeds up well-converged regions
+    // (smooth walls, shadow-free direct light) at the cost of more
+    // samples in noisy regions (corners, deep shadows). Only meaningful
+    // when aaSamples > 1.
+    bool useAdaptive = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

@@ -138,6 +138,9 @@ struct Settings
     bool useRussian = false;
     bool useStratified = false;
     bool useACES = false;
+    bool useAA = false;
+    int aaSamples = 4;
+    bool useAdaptive = false;
 
     // Pop a debug console + log file at startup. Toggled by the Debug
     // button in the GUI top-right (or the PCR_DEBUG env var). Persisted
@@ -193,6 +196,9 @@ static void loadSettings(Settings &s)
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
         s.useACES       = j.value("useACES",       s.useACES);
+        s.useAA         = j.value("useAA",         s.useAA);
+        s.aaSamples     = j.value("aaSamples",     s.aaSamples);
+        s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
@@ -240,6 +246,9 @@ static json buildSettingsJson(const Settings &s)
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
     j["useACES"]       = s.useACES;
+    j["useAA"]         = s.useAA;
+    j["aaSamples"]     = s.aaSamples;
+    j["useAdaptive"]   = s.useAdaptive;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
     for (const auto &p : s.presets)
@@ -390,6 +399,8 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useRussian   = settings.useRussian;
         renderer.useStratified = settings.useStratified;
         renderer.useACES       = settings.useACES;
+        renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
+        renderer.useAdaptive   = settings.useAdaptive;
         if (live)
         {
             renderer.onPartialFrame = [live](const std::vector<Vec3f> &fb, int w, int h) {
@@ -1171,6 +1182,19 @@ int main(int, char **)
         ImGui::Checkbox("Russian roulette (terminate paths at depth >= 1)", &settings.useRussian);
         ImGui::Checkbox("Stratified samples (jittered grid first bounce)", &settings.useStratified);
         ImGui::Checkbox("ACES filmic tone-map (off = Reinhard)", &settings.useACES);
+        ImGui::Checkbox("Anti-aliasing (jittered primary rays)", &settings.useAA);
+        if (settings.useAA)
+        {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::InputInt("AA samples##aacount", &settings.aaSamples, 1, 4);
+            if (settings.aaSamples < 1) settings.aaSamples = 1;
+            if (settings.aaSamples > 64) settings.aaSamples = 64;
+        }
+        ImGui::Checkbox("Adaptive sampling (early-exit converged pixels)", &settings.useAdaptive);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Only meaningful when AA is on. Stops sampling a\n"
+                              "pixel once its relative variance is below 5%%.");
 
         ImGui::SeparatorText("Output");
         pcrSliderInt("Width", &settings.width, 64, 2160, 8, 64);

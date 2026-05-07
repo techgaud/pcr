@@ -42,6 +42,8 @@ public:
     bool useRussian   = false;
     bool useStratified = false;
     bool useACES      = false;
+    int  aaSamples    = 1;
+    bool useAdaptive  = false;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
