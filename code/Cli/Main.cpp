@@ -71,7 +71,7 @@ int main(int argc, char *argv[])
     std::string timezone;
     std::string outputDir;
 
-    CLI::App app{"pcr-cornell - CPU path tracer"};
+    CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
         ->default_str("cornell");
     app.add_option("-d,--depth", depth, "Max ray bounces")

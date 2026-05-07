@@ -11,6 +11,11 @@
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
 
+// PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
+#ifndef PCR_BINARY_NAME
+#define PCR_BINARY_NAME "frank-based-rendering"
+#endif
+
 namespace
 {
     // Format current time as "YYYYMMDD-HHMMSS-<ZONE>". When utc=false, uses
@@ -68,9 +73,17 @@ void Renderer::render(const Scenes::SceneData &scene,
             for (size_t i = t; i < (size_t)_height; i += numThreads)
             {
                 if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-                    break;
+                    return;
                 for (size_t j = 0; j < (size_t)_width; j++)
                 {
+                    // Check cancel periodically inside the row, not just
+                    // between rows. At high quality settings a single row
+                    // can take many seconds; without this, cancel feels broken.
+                    // Once every 64 pixels is plenty responsive (sub-second on
+                    // typical hardware) and the atomic load is cheap.
+                    if ((j & 63) == 0 && cancelRequested &&
+                        cancelRequested->load(std::memory_order_relaxed))
+                        return;
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
                     auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
@@ -169,7 +182,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     auto addText = [&](const char *key, const std::string &val) {
         lodepng_add_text(&state.info_png, key, val.c_str());
     };
-    addText("Software", "pcr-cornell");
+    addText("Software", PCR_BINARY_NAME);
     addText("Scene", scene.name);
     addText("SceneVersion", scene.version);
     addText("CreationTime", timestamp);

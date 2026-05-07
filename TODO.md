@@ -4,13 +4,13 @@ Deferred work, with enough context to pick up cold later.
 
 ## Add a `cmake --install` flow for system-wide / user-local install
 
-**Status:** not started. Today the binary lives at `Build/pcr-cornell` and you invoke it with the path. To run it as just `pcr-cornell` from any directory, add a CMake `install()` rule and `cmake --install`.
+**Status:** not started. Today the binary lives at `Build/frank-based-rendering-cli` and you invoke it with the path. To run it as just `frank-based-rendering-cli` from any directory, add a CMake `install()` rule and `cmake --install`.
 
 ### Why deferred
 
-For solo dev on this machine the explicit path (`Build/pcr-cornell`) is fine and avoids polluting `/usr/local/bin`. Worth doing when:
+For solo dev on this machine the explicit path (`Build/frank-based-rendering-cli`) is fine and avoids polluting `/usr/local/bin`. Worth doing when:
 
-- You want to type `pcr-cornell ...` from any cwd without remembering the path
+- You want to type `frank-based-rendering-cli ...` from any cwd without remembering the path
 - You distribute releases (Homebrew formula, Debian package, GitHub Releases binaries)
 - A second person wants to use it on their machine without learning the source layout
 
@@ -20,7 +20,7 @@ Add to `CMakeLists.txt` after the `add_executable` block:
 
 ```cmake
 include(GNUInstallDirs)
-install(TARGETS pcr-cornell
+install(TARGETS frank-based-rendering-cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 ```
@@ -44,20 +44,20 @@ cmake --install Build --prefix /opt/pcr
 
 Default install paths:
 
-- Linux/macOS without `--prefix`: `/usr/local/bin/pcr-cornell`
-- With `--prefix ~/.local`: `~/.local/bin/pcr-cornell`
-- Windows without `--prefix`: `C:\Program Files\pcr-cornell\bin\pcr-cornell.exe`, requires admin
+- Linux/macOS without `--prefix`: `/usr/local/bin/frank-based-rendering-cli`
+- With `--prefix ~/.local`: `~/.local/bin/frank-based-rendering-cli`
+- Windows without `--prefix`: `C:\Program Files\frank-based-rendering-cli\bin\frank-based-rendering-cli.exe`, requires admin
 
 ### PATH considerations
 
-After installing, the install dir needs to be on `$PATH` for "just type `pcr-cornell`" to work.
+After installing, the install dir needs to be on `$PATH` for "just type `frank-based-rendering-cli`" to work.
 
 - **Linux:** `/usr/local/bin` is on `$PATH` by default. `~/.local/bin` may not be. Add to `~/.bashrc` or `~/.zshrc` if needed:
   ```bash
   export PATH="$HOME/.local/bin:$PATH"
   ```
 - **macOS:** Same as Linux. `~/.local/bin` is not on `$PATH` by default on most setups.
-- **Windows:** Default install prefix `Program Files\pcr-cornell\bin` is *not* on `PATH`. Either edit System Properties → Environment Variables, or install with `--prefix %LOCALAPPDATA%\pcr` and add that bin dir to user `PATH`.
+- **Windows:** Default install prefix `Program Files\frank-based-rendering-cli\bin` is *not* on `PATH`. Either edit System Properties → Environment Variables, or install with `--prefix %LOCALAPPDATA%\pcr` and add that bin dir to user `PATH`.
 
 ### Uninstall
 
@@ -77,8 +77,8 @@ After adding the `install()` line:
 cmake -S . -B Build
 cmake --build Build
 cmake --install Build --prefix /tmp/pcr-test
-ls /tmp/pcr-test/bin/   # should contain pcr-cornell
-/tmp/pcr-test/bin/pcr-cornell --help
+ls /tmp/pcr-test/bin/   # should contain frank-based-rendering-cli
+/tmp/pcr-test/bin/frank-based-rendering-cli --help
 ```
 
 If that works, real install with `cmake --install Build` (with appropriate sudo / admin / `--prefix`).

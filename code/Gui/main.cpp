@@ -1,10 +1,20 @@
-// physically-cringe-renderer-v1.0.0
+// pcr GUI — shared source for both binaries.
 //
-// Rough v1 GUI for pcr-cornell. Sliders for the same flags the CLI exposes,
-// Render button kicks the existing path tracer on a worker thread, progress
-// bar polls atomic row counter, and on completion the resulting PNG is
-// loaded back from disk and displayed. Settings persist to JSON next to the
-// executable.
+// Same source is built twice with different compile-time defines:
+//   frank-based-rendering         PCR_USE_GPU=0   (CPU path tracer)
+//   physically-cringe-rendering   PCR_USE_GPU=1   (GPU path tracer, in progress)
+//
+// Sliders for the same flags the CLI exposes, Render button kicks the path
+// tracer on a worker thread, progress bar polls atomic row counter, and on
+// completion the resulting PNG is loaded back from disk and displayed.
+// Settings persist to JSON named after the binary.
+
+#ifndef PCR_BINARY_NAME
+#define PCR_BINARY_NAME "physically-cringe-rendering"
+#endif
+#ifndef PCR_USE_GPU
+#define PCR_USE_GPU 0
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +66,13 @@
 #include "Scenes/Scene.h"
 #include "Scenes/Cornell.h"
 
+#if PCR_USE_GPU
+#include "Gpu/GpuRenderer.h"
+using PCRRenderer = GpuRenderer;
+#else
+using PCRRenderer = Renderer;
+#endif
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -79,8 +96,9 @@ static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
 
 static fs::path settingsPath()
 {
-    // Sit next to the executable. Falls back to cwd if argv[0] resolution fails.
-    return fs::current_path() / "physically-cringe-renderer.json";
+    // Sit next to the executable, named after the binary so the CPU and GPU
+    // builds keep separate state.
+    return fs::current_path() / (std::string(PCR_BINARY_NAME) + ".json");
 }
 
 static void loadSettings(Settings &s)
@@ -198,7 +216,11 @@ struct LivePreview
     }
 };
 
-static void runRender(RenderJob *job, LivePreview *live, Settings settings)
+// gpuShared is the hidden GLFW window the GpuRenderer should make current
+// on its worker thread. Created at startup with share=mainWindow so they can
+// see each other's GL resources. Ignored by the CPU build.
+static void runRender(RenderJob *job, LivePreview *live, Settings settings,
+                      GLFWwindow *gpuShared)
 {
     job->running = true;
     job->cancelRequested = false;
@@ -226,8 +248,15 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings)
         if (outDir.empty())
             outDir = (fs::current_path() / "Image").string();
 
-        Renderer renderer{settings.width, settings.height, 65.f,
-                          settings.depth, settings.samples, settings.shadowSamples};
+#if PCR_USE_GPU
+        PCRRenderer renderer{settings.width, settings.height, 65.f,
+                             settings.depth, settings.samples, settings.shadowSamples,
+                             gpuShared};
+#else
+        (void)gpuShared;
+        PCRRenderer renderer{settings.width, settings.height, 65.f,
+                             settings.depth, settings.samples, settings.shadowSamples};
+#endif
         renderer.progressRows = &job->rowsCompleted;
         renderer.cancelRequested = &job->cancelRequested;
         if (live)
@@ -481,7 +510,7 @@ int main(int, char **)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow *window = glfwCreateWindow(1100, 800, "physically cringe renderer", nullptr, nullptr);
+    GLFWwindow *window = glfwCreateWindow(1100, 800, PCR_BINARY_NAME, nullptr, nullptr);
     if (!window)
     {
         glfwTerminate();
@@ -489,6 +518,16 @@ int main(int, char **)
     }
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
+
+    // Hidden second window with shared GL context. The GpuRenderer worker
+    // thread makes this current while it dispatches compute shaders, so the
+    // GUI thread can keep drawing on `window` independently. CPU build
+    // creates it too (cheap) and just doesn't use it.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    GLFWwindow *gpuShared = glfwCreateWindow(1, 1, "pcr-gpu-shared", nullptr, window);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    if (!gpuShared)
+        std::fprintf(stderr, "warning: could not create shared GL context; GPU renderer will fail\n");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -583,10 +622,14 @@ int main(int, char **)
 
         if (ImGui::BeginPopupModal("About##popup", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         {
-            ImGui::Text("physically cringe renderer");
-            ImGui::Text("Version 1.0.0");
+            ImGui::Text("%s", PCR_BINARY_NAME);
+#if PCR_USE_GPU
+            ImGui::TextDisabled("GPU path tracer (OpenGL 4.3 compute shaders)");
+#else
+            ImGui::TextDisabled("CPU path tracer (multi-threaded)");
+#endif
             ImGui::Separator();
-            ImGui::TextWrapped("CPU path tracer with a Cornell Box scene.");
+            ImGui::TextWrapped("Cornell Box scene path tracer.");
             ImGui::Spacing();
             ImGui::Text("Source: github.com/techgaud/pcr");
             ImGui::Spacing();
@@ -595,6 +638,7 @@ int main(int, char **)
             ImGui::BulletText("GLFW 3.4 (zlib)");
             ImGui::BulletText("lodepng v20260119 (zlib)");
             ImGui::BulletText("nlohmann json v3.11.3 (MIT)");
+            ImGui::BulletText("portable-file-dialogs (WTFPL)");
             ImGui::Spacing();
             if (ImGui::Button("Close", ImVec2(120, 0)))
                 ImGui::CloseCurrentPopup();
@@ -704,7 +748,7 @@ int main(int, char **)
                 job.worker.join();
             freeImage(previewImg);
             previewLoadedFrom.clear();
-            job.worker = std::thread(runRender, &job, &live, settings);
+            job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -783,7 +827,7 @@ int main(int, char **)
                     job.worker.join();
                 freeImage(previewImg);
                 previewLoadedFrom.clear();
-                job.worker = std::thread(runRender, &job, &live, settings);
+                job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
             }
 
             if (!previewMetadata.empty() && ImGui::TreeNode("Metadata (PNG tEXt chunks)"))

@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, gui]
+    branches: [main, gui, gpu]
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -23,14 +23,20 @@ jobs:
 
       - name: Smoke test (CLI)
         shell: bash
-        run: ./code/Build/Release/pcr-cornell.exe -d 2 -s 4 -S 2
+        run: ./code/Build/Release/frank-based-rendering-cli.exe -d 2 -s 4 -S 2
+
+      - name: Stage flat artifacts
+        shell: bash
+        run: |
+          mkdir -p stage
+          cp code/Build/Release/frank-based-rendering-cli.exe stage/
+          cp code/Build/Release/frank-based-rendering.exe stage/
+          cp code/Build/Release/physically-cringe-rendering.exe stage/
 
       - uses: actions/upload-artifact@v4
         with:
           name: pcr-windows-x64
-          path: |
-            code/Build/Release/pcr-cornell.exe
-            code/Build/Release/physically-cringe-renderer-v1.0.0.exe
+          path: stage/
           if-no-files-found: error
           retention-days: 90
 
@@ -54,14 +60,19 @@ jobs:
         run: cmake --build code/Build -j
 
       - name: Smoke test (CLI)
-        run: ./code/Build/pcr-cornell -d 2 -s 4 -S 2
+        run: ./code/Build/frank-based-rendering-cli -d 2 -s 4 -S 2
+
+      - name: Stage flat artifacts
+        run: |
+          mkdir -p stage
+          cp code/Build/frank-based-rendering-cli stage/
+          cp code/Build/frank-based-rendering stage/
+          cp code/Build/physically-cringe-rendering stage/
 
       - uses: actions/upload-artifact@v4
         with:
           name: pcr-linux-x64
-          path: |
-            code/Build/pcr-cornell
-            code/Build/physically-cringe-renderer-v1.0.0
+          path: stage/
           if-no-files-found: error
           retention-days: 90
 
@@ -78,14 +89,19 @@ jobs:
         run: cmake --build code/Build -j
 
       - name: Smoke test (CLI)
-        run: ./code/Build/pcr-cornell -d 2 -s 4 -S 2
+        run: ./code/Build/frank-based-rendering-cli -d 2 -s 4 -S 2
+
+      # macOS skips physically-cringe-rendering (OpenGL 4.1 cap; needs Metal).
+      - name: Stage flat artifacts
+        run: |
+          mkdir -p stage
+          cp code/Build/frank-based-rendering-cli stage/
+          cp code/Build/frank-based-rendering stage/
 
       - uses: actions/upload-artifact@v4
         with:
           name: pcr-macos-arm64
-          path: |
-            code/Build/pcr-cornell
-            code/Build/physically-cringe-renderer-v1.0.0
+          path: stage/
           if-no-files-found: error
           retention-days: 90
 
@@ -99,12 +115,41 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
 
-      - name: Stage release archives
+      - name: Rename and stage release assets
+        env:
+          VER: ${{ github.ref_name }}
         run: |
           mkdir -p release
-          (cd pcr-windows-x64 && zip -r ../release/pcr-windows-x64.zip .)
-          (cd pcr-linux-x64 && chmod +x * && tar -czf ../release/pcr-linux-x64.tar.gz .)
-          (cd pcr-macos-arm64 && chmod +x * && tar -czf ../release/pcr-macos-arm64.tar.gz .)
+
+          # CPU CLI (3 OSes)
+          cp pcr-windows-x64/frank-based-rendering-cli.exe \
+             "release/frank-based-rendering-cli-${VER}-windows-x64.exe"
+          cp pcr-linux-x64/frank-based-rendering-cli \
+             "release/frank-based-rendering-cli-${VER}-linux-x64"
+          cp pcr-macos-arm64/frank-based-rendering-cli \
+             "release/frank-based-rendering-cli-${VER}-macos-arm64"
+
+          # CPU GUI (3 OSes)
+          cp pcr-windows-x64/frank-based-rendering.exe \
+             "release/frank-based-rendering-${VER}-windows-x64.exe"
+          cp pcr-linux-x64/frank-based-rendering \
+             "release/frank-based-rendering-${VER}-linux-x64"
+          cp pcr-macos-arm64/frank-based-rendering \
+             "release/frank-based-rendering-${VER}-macos-arm64"
+
+          # GPU GUI (Windows + Linux only)
+          cp pcr-windows-x64/physically-cringe-rendering.exe \
+             "release/physically-cringe-rendering-${VER}-windows-x64.exe"
+          cp pcr-linux-x64/physically-cringe-rendering \
+             "release/physically-cringe-rendering-${VER}-linux-x64"
+
+          # download-artifact strips +x on Unix; restore.
+          chmod +x release/frank-based-rendering-cli-${VER}-linux-x64 \
+                   release/frank-based-rendering-cli-${VER}-macos-arm64 \
+                   release/frank-based-rendering-${VER}-linux-x64 \
+                   release/frank-based-rendering-${VER}-macos-arm64 \
+                   release/physically-cringe-rendering-${VER}-linux-x64
+
           ls -la release/
 
       - uses: softprops/action-gh-release@v2
