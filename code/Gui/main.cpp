@@ -370,9 +370,30 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         // path below; the exception catch leaves it intact too (the
         // exception filter MessageBox will reference it).
         {
-            char act[256];
+            // Build a short technique list so the post-mortem MessageBox
+            // tells us which knobs were on if the GPU dies. Order matches
+            // the GUI checkboxes for easy mental mapping.
+            std::string techs;
+            auto add = [&](bool on, const char *label) {
+                if (!on) return;
+                if (!techs.empty()) techs += ",";
+                techs += label;
+            };
+            add(settings.useDenoise,    "denoise");
+            add(settings.useMIS,        "mis");
+            add(settings.useRussian,    "russian");
+            add(settings.useStratified, "strat");
+            add(settings.useACES,       "aces");
+            if (settings.aaSamples > 1)
+                add(true, ("aa" + std::to_string(settings.aaSamples)).c_str());
+            add(settings.useAdaptive,   "adaptive");
+            add(settings.useOIDN,       "oidn");
+            if (techs.empty()) techs = "(none)";
+
+            char act[512];
             std::snprintf(act, sizeof(act),
-                "Rendering '%s' at d=%d s=%d S=%d w=%d h=%d (%s)",
+                "Rendering '%s' at d=%d s=%d S=%d w=%d h=%d (%s)\n"
+                "Techniques: %s",
                 sceneData.name.c_str(),
                 settings.depth, settings.samples, settings.shadowSamples,
                 settings.width, settings.height,
@@ -381,6 +402,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 #else
                 "CPU"
 #endif
+                , techs.c_str()
             );
             setActivity(act);
         }

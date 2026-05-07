@@ -1512,14 +1512,37 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
 
 #ifdef _WIN32
             {
-                char act[640];
+                // Technique list, duplicated short form so the popup
+                // shows what was on without us having to plumb settings
+                // back from the GUI. If the next line of output is a
+                // forced process death, this is what the user sees.
+                std::string techs;
+                auto addT = [&](bool on, const char *label) {
+                    if (!on) return;
+                    if (!techs.empty()) techs += ",";
+                    techs += label;
+                };
+                addT(useDenoise,    "denoise");
+                addT(useMIS,        "mis");
+                addT(useRussian,    "russian");
+                addT(useStratified, "strat");
+                addT(useACES,       "aces");
+                if (aaSamples > 1)
+                    addT(true, ("aa" + std::to_string(aaSamples)).c_str());
+                addT(useAdaptive,   "adaptive");
+                addT(useOIDN,       "oidn");
+                if (techs.empty()) techs = "(none)";
+
+                char act[768];
                 std::snprintf(act, sizeof(act),
                     "Rendering '%s' v%s at d=%d s=%d S=%d w=%d h=%d (GPU)\n"
+                    "Techniques: %s\n"
                     "Triangles: %d (BVH nodes: %d). Lights: %d.\n"
                     "Tile size: %d. Tile %d/%d, "
                     "pixels x=[%d..%d) y=[%d..%d).",
                     scene.name.c_str(), scene.version.c_str(),
                     _maxDepth, _samples, _shadowSamples, _width, _height,
+                    techs.c_str(),
                     (int)scene.triangles.size(), (int)scene.triangleBvh.size(),
                     (int)scene.areaLights.size(),
                     tileSide, doneTiles + 1, totalTiles,
@@ -1645,15 +1668,13 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
-    if (aaSamples > 1)
-    {
-        filename += "-aa" + std::to_string(aaSamples);
-        if (useAdaptive) filename += "adaptive";
-    }
+    // ACES is the only technique that ends up in the filename, since it
+    // changes the look of the image meaningfully (different tone curve)
+    // and naming it makes side-by-side comparison easier. AA / adaptive
+    // / OIDN all affect quality but produce the same "color" of image,
+    // so they live in the PNG metadata only.
     if (useACES)
         filename += "-aces";
-    if (useOIDN)
-        filename += "-oidn";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;

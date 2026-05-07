@@ -325,15 +325,13 @@ void Renderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
-    if (aaSamples > 1)
-    {
-        filename += "-aa" + std::to_string(aaSamples);
-        if (useAdaptive) filename += "adaptive";
-    }
+    // ACES is the only technique that ends up in the filename, since it
+    // changes the look of the image meaningfully (different tone curve)
+    // and naming it makes side-by-side comparison easier. AA / adaptive
+    // / OIDN all affect quality but produce the same "color" of image,
+    // so they live in the PNG metadata only.
     if (useACES)
         filename += "-aces";
-    if (useOIDN)
-        filename += "-oidn";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
