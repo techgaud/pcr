@@ -34,6 +34,8 @@ public:
         return true;
     }
 
+    float radius() const { return _radius; }
+
 private:
     float _radius;
 };

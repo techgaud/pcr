@@ -115,11 +115,11 @@ pcr_apply_msvc_release_flags(frank-based-rendering)
 # --- GPU GUI: physically-cringe-rendering --------------------------------
 # Path traces on the GPU via OpenGL 4.3 compute shaders. Needs a GPU that
 # supports OpenGL 4.3+ (basically any discrete GPU from the last decade).
-# Currently shares the same Gui/main.cpp as frank-based-rendering and falls
-# through to the CPU path; the GPU implementation lives behind PCR_USE_GPU
-# and lands in subsequent commits.
+# macOS is capped at OpenGL 4.1 and will fail at runtime; that's expected
+# until we add a Metal/Vulkan backend.
 add_executable(physically-cringe-rendering
     Gui/main.cpp
+    GpuRenderer.cpp
     ${IMGUI_SOURCES}
     ${PCR_RENDERER_SOURCES}
 )

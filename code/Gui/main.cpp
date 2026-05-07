@@ -66,6 +66,13 @@
 #include "Scenes/Scene.h"
 #include "Scenes/Cornell.h"
 
+#if PCR_USE_GPU
+#include "Includes/GpuRenderer.h"
+using PCRRenderer = GpuRenderer;
+#else
+using PCRRenderer = Renderer;
+#endif
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
@@ -209,7 +216,11 @@ struct LivePreview
     }
 };
 
-static void runRender(RenderJob *job, LivePreview *live, Settings settings)
+// gpuShared is the hidden GLFW window the GpuRenderer should make current
+// on its worker thread. Created at startup with share=mainWindow so they can
+// see each other's GL resources. Ignored by the CPU build.
+static void runRender(RenderJob *job, LivePreview *live, Settings settings,
+                      GLFWwindow *gpuShared)
 {
     job->running = true;
     job->cancelRequested = false;
@@ -237,8 +248,15 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings)
         if (outDir.empty())
             outDir = (fs::current_path() / "Image").string();
 
-        Renderer renderer{settings.width, settings.height, 65.f,
-                          settings.depth, settings.samples, settings.shadowSamples};
+#if PCR_USE_GPU
+        PCRRenderer renderer{settings.width, settings.height, 65.f,
+                             settings.depth, settings.samples, settings.shadowSamples,
+                             gpuShared};
+#else
+        (void)gpuShared;
+        PCRRenderer renderer{settings.width, settings.height, 65.f,
+                             settings.depth, settings.samples, settings.shadowSamples};
+#endif
         renderer.progressRows = &job->rowsCompleted;
         renderer.cancelRequested = &job->cancelRequested;
         if (live)
@@ -501,6 +519,16 @@ int main(int, char **)
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
+    // Hidden second window with shared GL context. The GpuRenderer worker
+    // thread makes this current while it dispatches compute shaders, so the
+    // GUI thread can keep drawing on `window` independently. CPU build
+    // creates it too (cheap) and just doesn't use it.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+    GLFWwindow *gpuShared = glfwCreateWindow(1, 1, "pcr-gpu-shared", nullptr, window);
+    glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE);
+    if (!gpuShared)
+        std::fprintf(stderr, "warning: could not create shared GL context; GPU renderer will fail\n");
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
@@ -720,7 +748,7 @@ int main(int, char **)
                 job.worker.join();
             freeImage(previewImg);
             previewLoadedFrom.clear();
-            job.worker = std::thread(runRender, &job, &live, settings);
+            job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -799,7 +827,7 @@ int main(int, char **)
                     job.worker.join();
                 freeImage(previewImg);
                 previewLoadedFrom.clear();
-                job.worker = std::thread(runRender, &job, &live, settings);
+                job.worker = std::thread(runRender, &job, &live, settings, gpuShared);
             }
 
             if (!previewMetadata.empty() && ImGui::TreeNode("Metadata (PNG tEXt chunks)"))

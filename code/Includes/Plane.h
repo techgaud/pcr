@@ -29,7 +29,9 @@ private:
     float area = 0;
 
 public:
-    inline float getArea() { return area == 0 ? u.cross(v).length() : area; }
+    inline float getArea() const { return area == 0 ? u.cross(v).length() : area; }
+    const Vec3f &getU() const { return u; }
+    const Vec3f &getV() const { return v; }
 
     bool intersect(const Ray &ray, Vec3f &hit, float &t0, const float &closest_t) const
     {
