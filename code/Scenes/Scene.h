@@ -5,6 +5,7 @@
 
 #include "../Includes/Sphere.h"
 #include "../Includes/Plane.h"
+#include "../Includes/Triangle.h"
 #include "../Includes/Vec3f.h"
 
 namespace Scenes
@@ -29,6 +30,7 @@ namespace Scenes
         Camera camera;
         std::vector<Sphere> spheres;
         std::vector<Plane> walls;
+        std::vector<Triangle> triangles;
         Plane lightSource;
     };
 }

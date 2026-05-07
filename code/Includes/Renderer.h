@@ -8,6 +8,7 @@
 #include "Ray.h"
 #include "Sphere.h"
 #include "Plane.h"
+#include "Triangle.h"
 #include "../Scenes/Scene.h"
 
 class Renderer
@@ -50,7 +51,10 @@ private:
     const int _samples;
     const int _shadowSamples;
 
-    Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth);
-    bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres, Vec3f &hit, Vec3f &N, Material &material);
+    Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres,
+                  const std::vector<Triangle> &triangles, int depth);
+    bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
+                        const std::vector<Triangle> &triangles,
+                        Vec3f &hit, Vec3f &N, Material &material);
     void reinhardToneMap(Vec3f &color);
 };

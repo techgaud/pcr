@@ -199,6 +199,7 @@ uniform int   uSamples;
 uniform int   uShadowSamples;
 uniform int   uSphereCount;
 uniform int   uPlaneCount;
+uniform int   uTriangleCount;
 uniform int   uLightPlaneIdx;
 uniform int   uYOffset;
 uniform int   uYEnd;
@@ -230,9 +231,23 @@ struct GpuMaterial {
     vec4 emissive;        // rgb
 };
 
+struct GpuTriangle {
+    vec4 v0;              // xyz=v0 vertex position
+    vec4 v1;              // xyz=v1
+    vec4 v2;              // xyz=v2
+    vec4 n0;              // xyz=per-vertex normal at v0 (smooth shading)
+    vec4 n1;
+    vec4 n2;
+    vec4 flatN;           // xyz=geometric normal (cross product of edges)
+    int  matIdx;
+    int  smooth_;         // 1 = use n0/n1/n2 with barycentric interp, 0 = use flatN
+    int  _pad0, _pad1;
+};
+
 layout(std430, binding = 1) buffer Spheres   { GpuSphere   spheres[];   };
 layout(std430, binding = 2) buffer Planes    { GpuPlane    planes[];    };
 layout(std430, binding = 3) buffer Materials { GpuMaterial materials[]; };
+layout(std430, binding = 4) buffer Triangles { GpuTriangle triangles[]; };
 
 // PCG random number generator. Each pixel gets its own seeded state.
 uint pcg(inout uint state) {
@@ -271,6 +286,38 @@ bool intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, out float t) {
     if (t0 < 0.0) t0 = t1;
     if (t0 < 0.0) return false;
     t = t0;
+    return true;
+}
+
+// Möller-Trumbore. Mirrors CPU code in Includes/Triangle.h. Returns the
+// shading normal (smooth-interpolated when t.smooth_ != 0, flat otherwise);
+// the renderer flips it to face the ray after the call, like every other
+// primitive in this scene.
+bool intersectTriangle(vec3 ro, vec3 rd, GpuTriangle t,
+                       out float tt, out vec3 hitOut, out vec3 nOut) {
+    const float EPS = 1e-6;
+    vec3 e1 = t.v1.xyz - t.v0.xyz;
+    vec3 e2 = t.v2.xyz - t.v0.xyz;
+    vec3 pvec = cross(rd, e2);
+    float det = dot(e1, pvec);
+    if (abs(det) < EPS) return false;
+    float invDet = 1.0 / det;
+    vec3 tvec = ro - t.v0.xyz;
+    float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    vec3 qvec = cross(tvec, e1);
+    float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    float thit = dot(e2, qvec) * invDet;
+    if (thit <= EPS) return false;
+    tt = thit;
+    hitOut = ro + rd * thit;
+    if (t.smooth_ != 0) {
+        float w = 1.0 - u - v;
+        nOut = normalize(t.n0.xyz * w + t.n1.xyz * u + t.n2.xyz * v);
+    } else {
+        nOut = t.flatN.xyz;
+    }
     return true;
 }
 
@@ -316,6 +363,19 @@ bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) 
                 hit = ph;
                 N = planes[i].normal_area.xyz;
                 matIdx = planes[i].matIdx;
+                found = true;
+            }
+        }
+    }
+    for (int i = 0; i < uTriangleCount; i++) {
+        float t;
+        vec3 ph, pn;
+        if (intersectTriangle(ro, rd, triangles[i], t, ph, pn)) {
+            if (t < closest) {
+                closest = t;
+                hit = ph;
+                N = pn;
+                matIdx = triangles[i].matIdx;
                 found = true;
             }
         }
@@ -527,6 +587,19 @@ namespace
         float albedo[4];
         float emissive[4];
     };
+    struct GpuTriangle
+    {
+        float v0[4];
+        float v1[4];
+        float v2[4];
+        float n0[4];
+        float n1[4];
+        float n2[4];
+        float flatN[4];
+        int   matIdx;
+        int   smooth_;
+        int   _pad[2];
+    };
 
     std::string formatTimestamp(bool utc)
     {
@@ -589,6 +662,7 @@ bool GpuRenderer::initGL()
 
     glGenBuffers(1, &_sphereSSBO);
     glGenBuffers(1, &_planeSSBO);
+    glGenBuffers(1, &_triangleSSBO);
     glGenBuffers(1, &_materialSSBO);
 
     _initialized = true;
@@ -657,6 +731,26 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
         addPlane(w, wmi);
     }
 
+    std::vector<GpuTriangle> gpuTris;
+    for (const auto &t : scene.triangles)
+    {
+        int mi = addMaterial(t.material);
+        GpuTriangle gt{};
+        for (int i = 0; i < 3; i++)
+        {
+            gt.v0[i] = t.v0[i];
+            gt.v1[i] = t.v1[i];
+            gt.v2[i] = t.v2[i];
+            gt.n0[i] = t.n0[i];
+            gt.n1[i] = t.n1[i];
+            gt.n2[i] = t.n2[i];
+            gt.flatN[i] = t.flatN[i];
+        }
+        gt.matIdx = mi;
+        gt.smooth_ = t.smooth ? 1 : 0;
+        gpuTris.push_back(gt);
+    }
+
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _sphereSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER,
                  (GLsizeiptr)(gpuSpheres.size() * sizeof(GpuSphere)),
@@ -666,6 +760,24 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
     glBufferData(GL_SHADER_STORAGE_BUFFER,
                  (GLsizeiptr)(gpuPlanes.size() * sizeof(GpuPlane)),
                  gpuPlanes.data(), GL_DYNAMIC_DRAW);
+
+    // Empty SSBO with non-zero size: GL allows zero-byte BufferData but some
+    // drivers emit a warning. Use a 1-element dummy when there are no
+    // triangles in the scene.
+    if (gpuTris.empty())
+    {
+        GpuTriangle dummy{};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _triangleSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GpuTriangle),
+                     &dummy, GL_DYNAMIC_DRAW);
+    }
+    else
+    {
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _triangleSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     (GLsizeiptr)(gpuTris.size() * sizeof(GpuTriangle)),
+                     gpuTris.data(), GL_DYNAMIC_DRAW);
+    }
 
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _materialSSBO);
     glBufferData(GL_SHADER_STORAGE_BUFFER,
@@ -705,6 +817,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, _sphereSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, _planeSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, _materialSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, _triangleSSBO);
 
     // Set uniforms
     auto setI = [&](const char *name, int v) {
@@ -728,6 +841,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uShadowSamples",  _shadowSamples);
     setI("uSphereCount",    (int)scene.spheres.size());
     setI("uPlaneCount",     (int)(scene.walls.size() + 1)); // walls + light
+    setI("uTriangleCount",  (int)scene.triangles.size());
     setI("uLightPlaneIdx",  lightIdx);
     setI("uFrameSeed",      (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
                                        std::chrono::steady_clock::now().time_since_epoch())

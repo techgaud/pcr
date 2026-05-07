@@ -8,6 +8,7 @@
 #include "../Includes/Material.h"
 #include "../Includes/Plane.h"
 #include "../Includes/Sphere.h"
+#include "../Includes/Triangle.h"
 #include "../Includes/Vec3f.h"
 
 namespace Scenes
@@ -160,6 +161,41 @@ namespace Scenes
             return Sphere(std::move(center), radius, mat);
         }
 
+        // Triangle parser. v0/v1/v2 required. Optional smooth-shading normals
+        // n0/n1/n2 (all three together or none — partial smooth normals are
+        // an authoring mistake we'd rather flag than silently zero out).
+        Triangle parseTriangle(const json &p,
+                               const std::unordered_map<std::string, Material> &mats,
+                               const std::string &fieldPath, const std::string &path)
+        {
+            auto v0it = p.find("v0");
+            auto v1it = p.find("v1");
+            auto v2it = p.find("v2");
+            if (v0it == p.end() || v1it == p.end() || v2it == p.end())
+                throw SceneLoaderError(path + ": " + fieldPath +
+                                       " triangle needs v0, v1, v2 vertices");
+            Vec3f v0 = vec3FromJson(*v0it, fieldPath + ".v0");
+            Vec3f v1 = vec3FromJson(*v1it, fieldPath + ".v1");
+            Vec3f v2 = vec3FromJson(*v2it, fieldPath + ".v2");
+
+            std::string matRef = requireString(p, "material", fieldPath, path);
+            Material mat = resolveMaterial(mats, matRef, fieldPath + ".material", path);
+
+            auto n0it = p.find("n0");
+            auto n1it = p.find("n1");
+            auto n2it = p.find("n2");
+            int normalCount = (n0it != p.end()) + (n1it != p.end()) + (n2it != p.end());
+            if (normalCount == 0)
+                return Triangle(v0, v1, v2, mat);
+            if (normalCount != 3)
+                throw SceneLoaderError(path + ": " + fieldPath +
+                                       " triangle normals require all of n0, n1, n2 or none");
+            Vec3f n0 = vec3FromJson(*n0it, fieldPath + ".n0");
+            Vec3f n1 = vec3FromJson(*n1it, fieldPath + ".n1");
+            Vec3f n2 = vec3FromJson(*n2it, fieldPath + ".n2");
+            return Triangle(v0, v1, v2, n0, n1, n2, mat);
+        }
+
         Plane parsePlane(const json &p, const std::unordered_map<std::string, Material> &mats,
                          const std::string &fieldPath, const std::string &path)
         {
@@ -208,6 +244,15 @@ namespace Scenes
                                                "(sphere area-light sampling not implemented)");
                     out.spheres.push_back(parseSphere(p, mats, fieldPath, path));
                 }
+                else if (type == "triangle")
+                {
+                    if (isLight)
+                        throw SceneLoaderError(path + ": " + fieldPath +
+                                               ": triangle area-light sampling not yet supported "
+                                               "(planned for phase 3 with mesh import); "
+                                               "use a plane light for now");
+                    out.triangles.push_back(parseTriangle(p, mats, fieldPath, path));
+                }
                 else if (type == "plane")
                 {
                     Plane pl = parsePlane(p, mats, fieldPath, path);
@@ -225,7 +270,7 @@ namespace Scenes
                 {
                     throw SceneLoaderError(path + ": " + fieldPath +
                                            ": unknown primitive type \"" + type +
-                                           "\" (expected sphere, plane, or mesh)");
+                                           "\" (expected sphere, plane, triangle, or mesh)");
                 }
             }
             if (lightCount == 0)

@@ -59,6 +59,7 @@ private:
     unsigned _outputTex = 0;
     unsigned _sphereSSBO = 0;
     unsigned _planeSSBO = 0;
+    unsigned _triangleSSBO = 0;
     unsigned _materialSSBO = 0;
     bool _initialized = false;
 

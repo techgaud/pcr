@@ -88,7 +88,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
                     auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
-                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, 0);
+                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, scene.triangles, 0);
                 }
                 if (progressRows)
                     progressRows->fetch_add(1, std::memory_order_relaxed);
@@ -220,12 +220,13 @@ void Renderer::render(const Scenes::SceneData &scene,
     lastOutputPath = outputPath.string();
 }
 
-Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int depth)
+Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
+                        const std::vector<Triangle> &triangles, int depth)
 {
     Material material;
     Vec3f hit, N;
 
-    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, hit, N, material))
+    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, hit, N, material))
         return Vec3f(0.f, 0.f, 0.f); // background color
 
     if (ray.dir.dot(N) > 0)
@@ -268,11 +269,11 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
             float maxAlbedo = std::max({material.albedo[0], material.albedo[1], material.albedo[2]});
             float p = std::min(0.95f, std::max(0.05f, maxAlbedo));
             if (NumGen::Epsilon() > p) continue;
-            indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo / p;
+            indirectLo += castRay(randomRay, spheres, triangles, depth + 1) * material.albedo / p;
         }
         else
         {
-            indirectLo += castRay(randomRay, spheres, depth + 1) * material.albedo;
+            indirectLo += castRay(randomRay, spheres, triangles, depth + 1) * material.albedo;
         }
     }
     indirectLo /= _samples;
@@ -289,7 +290,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
         auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
         Vec3f shadowHit, shadowN;
         Material tmpMat;
-        bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
+        bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
 
         if (!inShadow){
             float cosLight = std::max(0.f, _light.N.dot(Li * -1));
@@ -318,7 +319,9 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres, int 
     return directLo / _shadowSamples + indirectLo;
 }
 
-bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres, Vec3f &hit, Vec3f &N, Material &material)
+bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
+                              const std::vector<Triangle> &triangles,
+                              Vec3f &hit, Vec3f &N, Material &material)
 {
     float closest_t = std::numeric_limits<float>::max();
 
@@ -343,6 +346,20 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
         N = plane.N;
 
         material = plane.material;
+    }
+
+    // Linear scan over triangles. Phase 2 replaces this with BVH traversal
+    // once mesh imports start producing thousands of them.
+    Vec3f triHit, triN;
+    for (const auto &tri : triangles)
+    {
+        if (!tri.intersect(ray, triHit, triN, t0, closest_t) || t0 >= closest_t)
+            continue;
+
+        closest_t = t0;
+        hit = triHit;
+        N = triN;
+        material = tri.material;
     }
 
     return closest_t < std::numeric_limits<float>::max();

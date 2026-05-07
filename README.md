@@ -245,7 +245,7 @@ Drop a `*.json` file in `Scenes/` at the repo root (or anywhere `--scenes-dir` p
 }
 ```
 
-Primitive types: `sphere`, `plane`. (A `mesh` discriminator is reserved in the schema for future triangle-mesh support; the loader rejects it with a clear error today.) Materials are a named registry referenced by name from each primitive. Bump `version` whenever geometry changes meaningfully — it shows up in the output filename and PNG metadata, so renders stay traceable.
+Primitive types: `sphere`, `plane`, `triangle`. Triangles take `v0`/`v1`/`v2` plus optional `n0`/`n1`/`n2` per-vertex normals for smooth shading (omit for flat shading from the geometric normal). Triangle lights are not yet supported — keep the area light as a separate plane primitive. (A `mesh` discriminator is reserved for OBJ-import support landing in phase 3.) Materials are a named registry referenced by name from each primitive. Bump `version` whenever geometry changes meaningfully — it shows up in the output filename and PNG metadata, so renders stay traceable.
 
 The CLI rescans on every invocation; the GUI rescans on combo open. Use `--list-scenes` to see what the binary picks up.
 
