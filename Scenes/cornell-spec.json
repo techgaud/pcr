@@ -1,7 +1,7 @@
 {
   "schema": "1.0",
   "name": "cornell-spec",
-  "version": "1.0.0",
+  "version": "1.1.0",
 
   // Cornell Box, spec-faithful version. Reproduces the canonical 1984
   // Goral et al. setup (cf. http://www.graphics.cornell.edu/online/box/data.html)
