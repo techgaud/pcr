@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, gui, gpu]
+    branches: [main, gui, gpu, dev]
     tags: ['v*']
   pull_request:
     branches: [main]
