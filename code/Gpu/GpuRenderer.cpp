@@ -204,6 +204,8 @@ uniform int   uTriangleCount;
 uniform int   uBvhNodeCount;
 uniform int   uLightCount;
 uniform float uTotalLightArea;
+uniform int   uXOffset;
+uniform int   uXEnd;
 uniform int   uYOffset;
 uniform int   uYEnd;
 uniform int   uFrameSeed;
@@ -657,8 +659,12 @@ vec3 reinhard(vec3 c) {
 }
 
 void main() {
-    ivec2 pix = ivec2(gl_GlobalInvocationID.x, int(gl_GlobalInvocationID.y) + uYOffset);
-    if (pix.x >= uWidth || pix.y >= uYEnd || pix.y >= uHeight) return;
+    ivec2 pix = ivec2(int(gl_GlobalInvocationID.x) + uXOffset,
+                      int(gl_GlobalInvocationID.y) + uYOffset);
+    // 2D tile dispatch: bounds-check against the tile rectangle AND the
+    // image extent (the tile may end mid-image with extra invocations).
+    if (pix.x >= uXEnd || pix.x >= uWidth ||
+        pix.y >= uYEnd || pix.y >= uHeight) return;
 
     uint seed = uint(pix.x) * 1973u + uint(pix.y) * 9277u + uint(uFrameSeed) * 26699u;
 
@@ -1179,77 +1185,121 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
                             : 0);
 
-    // Dispatch in row strips so cancel + progress are responsive and we
-    // stay well under any GPU TDR (Timeout Detection and Recovery) window.
-    // Windows defaults to a 2-second TDR; a single dispatch that exceeds
-    // that is killed by the driver, taking the whole process with it (no
-    // exception, no GL error — the kernel just resets the GPU).
+    // Dispatch in 2D tiles so we stay well under any GPU TDR (Timeout
+    // Detection and Recovery) window. Windows defaults to a 2-second TDR;
+    // a single dispatch that exceeds that is killed by the driver, taking
+    // the whole process with it (no exception, no GL error — the kernel
+    // just resets the GPU).
     //
-    // Per-pixel cost grows roughly with samples * depth * shadow. Scale
-    // strip height inversely so a heavy preset gets smaller strips than
-    // a light one. Empirical baseline: workPerPixel ~512 is fine at 32
-    // rows on the dev hardware; double the work, halve the strip. Floor
-    // at 1 row (so Picture-class settings on a high-poly mesh dispatch
-    // pixel-row-by-row).
+    // 1D row-strip dispatch (the previous approach) hits a floor of 1 row
+    // per dispatch on heavy presets, and at high resolutions one row can
+    // still be too much work in a single submit. 2D tiles let us shrink
+    // both dimensions, so a Picture-class render on a 70k-tri mesh at 1080
+    // dispatches small enough chunks regardless of resolution.
+    //
+    // Tile size is computed from per-pixel work × BVH overhead, targeting
+    // ~0.5 sec per dispatch on a Threadripper-class GPU (calibrated from
+    // a measured cornell-spheres render of 245 sec / 4.59e11 ops ≈ 0.53
+    // ns per op). Sides clamped to [16, 256] and rounded down to a 16-px
+    // multiple (the work-group local size), so each tile aligns cleanly
+    // and the work-group bounds-check in the shader doesn't waste many
+    // invocations.
     int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples);
-    int STRIP_HEIGHT = std::clamp(32 * 512 / workPerPixel, 1, 32);
-    int totalStrips = (_height + STRIP_HEIGHT - 1) / STRIP_HEIGHT;
-    int doneRows = 0;
+    double bvhMult = 1.0;
+    if ((int)scene.triangles.size() > 4)
+    {
+        // Each ray traverses ~log2(N/leafSize) BVH nodes. AABB tests are
+        // cheap (~1/4 of a triangle test); the 4-tri leaves add a few
+        // full triangle tests per ray. Approximation calibrated against
+        // bunny-on-Picture observations.
+        double depth = std::log2((double)scene.triangles.size() / 4.0);
+        bvhMult = 1.0 + depth * 0.25;
+    }
+    double effectivePerPixel = (double)workPerPixel * bvhMult;
+    constexpr double kTargetOpsPerDispatch = 9.4e8; // ~0.5 sec on the dev GPU
+    int maxPixelsPerDispatch = (int)(kTargetOpsPerDispatch / effectivePerPixel);
+    if (maxPixelsPerDispatch < 256) maxPixelsPerDispatch = 256;
+    int tileSide = (int)std::sqrt((double)maxPixelsPerDispatch);
+    tileSide = std::clamp(tileSide, 16, 256);
+    tileSide = (tileSide / 16) * 16; // align to work-group multiples
+    if (tileSide < 16) tileSide = 16;
+
+    int tilesX = (_width  + tileSide - 1) / tileSide;
+    int tilesY = (_height + tileSide - 1) / tileSide;
+    int totalTiles = tilesX * tilesY;
+    int doneTiles = 0;
 
 #ifdef _WIN32
-    // Activity log: written before each dispatch so the post-mortem
-    // MessageBox on the next launch knows exactly which strip was running
-    // when the GPU died. The CPU GUI's runRender() also stamps a
-    // render-level activity message; this overwrites that with finer
+    // Activity log: overwritten before each dispatch so the post-mortem
+    // MessageBox on the next launch knows exactly which tile was running
+    // when the GPU died. The CPU GUI's runRender() stamps a render-level
+    // activity message at the start; this replaces it with finer
     // granularity once we're in the dispatch loop.
     fs::path activityPath = fs::current_path() /
                             (std::string(PCR_BINARY_NAME) + ".lastrun.txt");
 #endif
-    for (int yStart = 0; yStart < _height; yStart += STRIP_HEIGHT)
+
+    for (int yStart = 0; yStart < _height; yStart += tileSide)
     {
-        if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+        for (int xStart = 0; xStart < _width; xStart += tileSide)
         {
-            std::cout << "GPU render cancelled." << std::endl;
-            glfwMakeContextCurrent(nullptr);
-            return;
-        }
-        int yEnd = std::min(yStart + STRIP_HEIGHT, _height);
-        int stripH = yEnd - yStart;
-        setI("uYOffset", yStart);
-        setI("uYEnd", yEnd);
+            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+            {
+                std::cout << "GPU render cancelled." << std::endl;
+                glfwMakeContextCurrent(nullptr);
+                return;
+            }
+            int xEnd = std::min(xStart + tileSide, _width);
+            int yEnd = std::min(yStart + tileSide, _height);
+            int tileW = xEnd - xStart;
+            int tileH = yEnd - yStart;
+
+            setI("uXOffset", xStart);
+            setI("uXEnd", xEnd);
+            setI("uYOffset", yStart);
+            setI("uYEnd", yEnd);
 
 #ifdef _WIN32
-        {
-            char act[512];
-            std::snprintf(act, sizeof(act),
-                "Rendering '%s' v%s at d=%d s=%d S=%d w=%d h=%d (GPU)\n"
-                "Triangles: %d (BVH nodes: %d). Lights: %d.\n"
-                "About to dispatch strip %d/%d, rows %d..%d (strip-height %d).",
-                scene.name.c_str(), scene.version.c_str(),
-                _maxDepth, _samples, _shadowSamples, _width, _height,
-                (int)scene.triangles.size(), (int)scene.triangleBvh.size(),
-                (int)scene.areaLights.size(),
-                yStart / STRIP_HEIGHT + 1, totalStrips,
-                yStart, yEnd, STRIP_HEIGHT);
-            std::ofstream f(activityPath);
-            if (f) f << act;
-        }
+            {
+                char act[640];
+                std::snprintf(act, sizeof(act),
+                    "Rendering '%s' v%s at d=%d s=%d S=%d w=%d h=%d (GPU)\n"
+                    "Triangles: %d (BVH nodes: %d). Lights: %d.\n"
+                    "Tile size: %d. Tile %d/%d, "
+                    "pixels x=[%d..%d) y=[%d..%d).",
+                    scene.name.c_str(), scene.version.c_str(),
+                    _maxDepth, _samples, _shadowSamples, _width, _height,
+                    (int)scene.triangles.size(), (int)scene.triangleBvh.size(),
+                    (int)scene.areaLights.size(),
+                    tileSide, doneTiles + 1, totalTiles,
+                    xStart, xEnd, yStart, yEnd);
+                std::ofstream f(activityPath);
+                if (f) f << act;
+            }
 #endif
 
-        // 16x16 work group, one item per pixel. ceil division.
-        GLuint gx = (GLuint)((_width  + 15) / 16);
-        GLuint gy = (GLuint)((stripH + 15) / 16);
-        glDispatchCompute(gx, gy, 1);
-        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            // 16x16 work group, one item per pixel. ceil division.
+            GLuint gx = (GLuint)((tileW + 15) / 16);
+            GLuint gy = (GLuint)((tileH + 15) / 16);
+            glDispatchCompute(gx, gy, 1);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-        // Force completion of this strip before moving on. Without this the
-        // driver might queue many strips and wash out per-strip cancel
-        // responsiveness. glFinish is expensive but tolerable per-strip.
-        glFinish();
+            // glFinish per tile so cancel + progress are responsive and
+            // each dispatch exits the GPU before the next starts (else
+            // the driver might queue many at once and the TDR watchdog
+            // could see them as one long submission).
+            glFinish();
 
-        doneRows += stripH;
-        if (progressRows)
-            progressRows->store(doneRows, std::memory_order_relaxed);
+            doneTiles++;
+            if (progressRows)
+            {
+                // Map tiles-completed to rows-completed for the existing
+                // progress bar. Approximate but linear, which is what the
+                // user sees.
+                int approxRows = (int)((double)doneTiles / totalTiles * _height);
+                progressRows->store(approxRows, std::memory_order_relaxed);
+            }
+        }
     }
 
     // Read pixels back to CPU as 8-bit RGBA. Convert to RGB for lodepng.
