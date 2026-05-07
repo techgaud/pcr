@@ -90,10 +90,4 @@ private:
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,
                         Vec3f &hit, Vec3f &N, Material &material);
-    void reinhardToneMap(Vec3f &color);
-    // Per-channel Narkowicz ACES approximation. Filmic S-curve with a
-    // gentle toe and shoulder; preserves midtone contrast better than
-    // Reinhard's smooth-concave shape, at the cost of mild hue shifts
-    // in saturated highlights.
-    void acesToneMap(Vec3f &color);
 };

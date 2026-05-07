@@ -15,6 +15,7 @@
 #include "Includes/lodepng.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
+#include "Includes/ToneMap.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
 #ifndef PCR_BINARY_NAME
@@ -290,9 +291,9 @@ void Renderer::render(const Scenes::SceneData &scene,
     for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
         if (useACES)
-            acesToneMap(frameBuffer[i]);
+            ToneMap::aces(frameBuffer[i]);
         else
-            reinhardToneMap(frameBuffer[i]);
+            ToneMap::reinhard(frameBuffer[i]);
 
         // gamma correction:
         // const float gamma = 2.2f;
@@ -680,43 +681,3 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
     return closest_t < std::numeric_limits<float>::max();
 }
 
-void Renderer::acesToneMap(Vec3f &color)
-{
-    // Narkowicz 2015 ACES filmic approximation. Per-channel; cheaper than
-    // the full ACES RRT+ODT but produces an S-curve close enough for
-    // visual comparison. Some hue shift in saturated highlights — the
-    // full ACES would matrix-transform into ACES color space first to
-    // avoid that, but the per-channel form is the canonical "filmic" of
-    // realtime renderers and is what we need for a Reinhard alternative.
-    constexpr float A = 2.51f;
-    constexpr float B = 0.03f;
-    constexpr float C = 2.43f;
-    constexpr float D = 0.59f;
-    constexpr float E = 0.14f;
-    for (int i = 0; i < 3; i++)
-    {
-        float x = color[i];
-        float v = (x * (A * x + B)) / (x * (C * x + D) + E);
-        if (v < 0.f) v = 0.f;
-        if (v > 1.f) v = 1.f;
-        color[i] = v;
-    }
-}
-
-void Renderer::reinhardToneMap(Vec3f &color)
-{
-    // normal reinhard
-    color[0] = color[0] / (color[0] + 1);
-    color[1] = color[1] / (color[1] + 1);
-    color[2] = color[2] / (color[2] + 1);
-
-    // reinhard-jodie version
-    // const float exposure = 0.65f;
-    // color *= exposure;
-
-    // float luminance = 0.2126f * color[0] + 0.7152f * color[1] + 0.0722f * color[2];
-    // if(luminance <= 0.f)
-    //     return;
-    // float mappedLuminance = luminance / (1.f + luminance);
-    // color = color * (mappedLuminance / luminance);
-}

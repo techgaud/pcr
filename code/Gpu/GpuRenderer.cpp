@@ -38,6 +38,7 @@
 #include "Includes/lodepng.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
+#include "Includes/ToneMap.h"
 
 #include <cmath>
 
@@ -71,8 +72,10 @@ using GLintptr = ptrdiff_t;
 #define GL_DYNAMIC_DRAW 0x88E8
 #define GL_TEXTURE_2D 0x0DE1
 #define GL_RGBA8 0x8058
+#define GL_RGBA16F 0x881A
 #define GL_RGBA 0x1908
 #define GL_UNSIGNED_BYTE 0x1401
+#define GL_FLOAT 0x1406
 #define GL_TEXTURE_MIN_FILTER 0x2801
 #define GL_TEXTURE_MAG_FILTER 0x2800
 #define GL_LINEAR 0x2601
@@ -192,7 +195,18 @@ static const char *kComputeShaderSrc = R"GLSL(
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rgba8, binding = 0)   uniform writeonly image2D uOutput;
+// HDR pre-tone-map output. Float because path-trace radiance values
+// commonly exceed 1.0 (direct hits on emissive surfaces, bright indirect
+// bounces). CPU reads this back as float and tone-maps after OIDN
+// denoise so we get the full HDR signal into the neural net.
+layout(rgba16f, binding = 0) uniform writeonly image2D uOutput;
+// Aux outputs for OIDN. Float16 because albedo can exceed 1.0 (when
+// material albedo > 1.0, rare but legal) and normal components are
+// in [-1, 1]. Only written when uWriteAux != 0; the textures are
+// allocated unconditionally because reallocating per render would
+// stutter.
+layout(rgba16f, binding = 1) uniform writeonly image2D uAlbedoOut;
+layout(rgba16f, binding = 2) uniform writeonly image2D uNormalOut;
 
 uniform int   uWidth;
 uniform int   uHeight;
@@ -216,9 +230,9 @@ uniform int   uUseMIS;        // 0/1
 uniform int   uUseRussian;    // 0/1
 uniform int   uUseStratified; // 0/1
 uniform int   uStrata;        // round(sqrt(uSamples)) when stratified, else 0
-uniform int   uUseACES;       // 0 = Reinhard, 1 = ACES filmic (Narkowicz)
 uniform int   uAaSamples;     // 1 = no AA; >1 = jittered primary rays per pixel
 uniform int   uUseAdaptive;   // 0/1; meaningful only when uAaSamples > 1
+uniform int   uWriteAux;      // 0/1; populate uAlbedoOut + uNormalOut for OIDN
 
 const float PI = 3.14159265358979323846;
 
@@ -713,23 +727,10 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
     return radiance;
 }
 
-vec3 reinhard(vec3 c) {
-    return c / (c + vec3(1.0));
-}
-
-// Narkowicz 2015 ACES filmic approximation. Per-channel S-curve with a
-// gentle toe and shoulder; preserves midtone contrast better than the
-// Reinhard concave curve at the cost of mild hue shifts in saturated
-// highlights. Cheap (handful of muls/divs) and visually close to the
-// full ACES RRT+ODT pipeline.
-vec3 aces(vec3 x) {
-    const float A = 2.51;
-    const float B = 0.03;
-    const float C = 2.43;
-    const float D = 0.59;
-    const float E = 0.14;
-    return clamp((x * (A * x + B)) / (x * (C * x + D) + E), 0.0, 1.0);
-}
+// Tone mapping moved to CPU-side post-readback so the GPU can emit HDR
+// linear radiance into uOutput, which is what OIDN's HDR mode needs as
+// input. See ToneMap.h for the curves; both CPU and GPU paths now go
+// through the same code.
 
 void main() {
     ivec2 pix = ivec2(int(gl_GlobalInvocationID.x) + uXOffset,
@@ -738,6 +739,30 @@ void main() {
     // image extent (the tile may end mid-image with extra invocations).
     if (pix.x >= uXEnd || pix.x >= uWidth ||
         pix.y >= uYEnd || pix.y >= uHeight) return;
+
+    // Aux capture for OIDN. One deterministic primary ray through the
+    // pixel center, sceneIntersect, write albedo + shading normal. Done
+    // before the noisy AA loop so OIDN gets clean per-pixel features.
+    if (uWriteAux != 0) {
+        float aspect = float(uWidth) / float(uHeight);
+        float scale = tan(PI / 180.0 * 0.5 * uFov);
+        float ax = ((2.0 * (float(pix.x) + 0.5) / float(uWidth)) - 1.0) * scale * aspect;
+        float ay = -((2.0 * (float(pix.y) + 0.5) / float(uHeight)) - 1.0) * scale;
+        vec3 ard = normalize(vec3(ax, ay, -1.0));
+        vec3 aro = uOrigin;
+        vec3 ahit, aN;
+        int aMatIdx;
+        if (sceneIntersect(aro, ard, ahit, aN, aMatIdx)) {
+            if (dot(ard, aN) > 0.0) aN = -aN;
+            imageStore(uAlbedoOut, pix, vec4(materials[aMatIdx].albedo.rgb, 1.0));
+            imageStore(uNormalOut, pix, vec4(aN, 0.0));
+        } else {
+            // No intersect: zero both. Matches CPU's background-hit
+            // behavior so OIDN sees the same sentinel for sky pixels.
+            imageStore(uAlbedoOut, pix, vec4(0.0));
+            imageStore(uNormalOut, pix, vec4(0.0));
+        }
+    }
 
     uint seed = uint(pix.x) * 1973u + uint(pix.y) * 9277u + uint(uFrameSeed) * 26699u;
 
@@ -783,9 +808,9 @@ void main() {
             if (max(max(rel.r, rel.g), rel.b) < 0.05) break;
         }
     }
-    vec3 outColor = (uUseACES != 0) ? aces(mean) : reinhard(mean);
-
-    imageStore(uOutput, pix, vec4(outColor, 1.0));
+    // HDR linear radiance. Tone mapping happens on CPU after readback
+    // so OIDN gets the full pre-tone-map signal as input.
+    imageStore(uOutput, pix, vec4(mean, 1.0));
 }
 )GLSL";
 
@@ -1005,14 +1030,23 @@ bool GpuRenderer::initGL()
     _program = compileComputeShader(kComputeShaderSrc);
     if (!_program) return false;
 
-    glGenTextures(1, &_outputTex);
-    glBindTexture(GL_TEXTURE_2D, _outputTex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, _width, _height, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    // Three RGBA16F textures. uOutput holds HDR linear radiance (pre-tone-
+    // map, so OIDN HDR mode gets the right input). uAlbedo/uNormal are
+    // populated only when --oidn is on (writes gated by uWriteAux), but
+    // allocated unconditionally so we don't reallocate per render.
+    auto allocFloatTex = [&](unsigned &tex) {
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, _width, _height, 0,
+                     GL_RGBA, GL_FLOAT, nullptr);
+    };
+    allocFloatTex(_outputTex);
+    allocFloatTex(_albedoTex);
+    allocFloatTex(_normalTex);
     if (!checkGl("texture allocation")) return false;
 
     glGenBuffers(1, &_sphereSSBO);
@@ -1285,8 +1319,12 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
 
     glUseProgram(_program);
 
-    // Bind output image
-    glBindImageTexture(0, _outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    // Bind output + aux images. uOutput at binding 0 always; uAlbedoOut /
+    // uNormalOut at 1/2 always too (the shader gates writes via uWriteAux,
+    // but the binding has to be live or the write would be a GL error).
+    glBindImageTexture(0, _outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glBindImageTexture(1, _albedoTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glBindImageTexture(2, _normalTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
 
     // Bind SSBOs
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, _sphereSSBO);
@@ -1336,7 +1374,13 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uUseMIS",         useMIS ? 1 : 0);
     setI("uUseRussian",     useRussian ? 1 : 0);
     setI("uUseStratified",  useStratified ? 1 : 0);
-    setI("uUseACES",        useACES ? 1 : 0);
+    // Note: tone-map (ACES vs Reinhard) used to be a GLSL uniform but is
+    // now applied CPU-side after OIDN. useACES still drives the choice;
+    // the GPU just emits HDR linear regardless.
+    // Aux capture only when OIDN is on. The aux pass is one extra primary
+    // ray per pixel (~free compared to the main loop), but skip it when
+    // not needed so the GPU isn't doing useless writes.
+    setI("uWriteAux",       useOIDN ? 1 : 0);
     setI("uAaSamples",      std::max(1, aaSamples));
     setI("uUseAdaptive",    useAdaptive ? 1 : 0);
     setI("uStrata",         useStratified
@@ -1484,13 +1528,32 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         }
     }
 
-    // Read pixels back to CPU as 8-bit RGBA. Convert to RGB for lodepng.
-    std::vector<unsigned char> rgba((size_t)_width * _height * 4);
-    glBindTexture(GL_TEXTURE_2D, _outputTex);
-    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
-    if (!checkGl("readback")) {
+    // Readback. GPU now stores HDR linear radiance + (optionally) aux as
+    // RGBA16F, so we read GL_FLOAT into 4-component float buffers and then
+    // strip the alpha into Vec3f arrays for downstream processing.
+    auto readbackToVec3 = [&](unsigned tex) {
+        std::vector<float> tmp((size_t)_width * _height * 4);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, tmp.data());
+        std::vector<Vec3f> out((size_t)_width * _height);
+        for (size_t i = 0; i < out.size(); i++)
+            out[i] = Vec3f(tmp[i * 4 + 0], tmp[i * 4 + 1], tmp[i * 4 + 2]);
+        return out;
+    };
+    std::vector<Vec3f> hdr = readbackToVec3(_outputTex);
+    if (!checkGl("readback color")) {
         glfwMakeContextCurrent(nullptr);
         return;
+    }
+    std::vector<Vec3f> albedoBuf, normalBuf;
+    if (useOIDN)
+    {
+        albedoBuf = readbackToVec3(_albedoTex);
+        normalBuf = readbackToVec3(_normalTex);
+        if (!checkGl("readback aux")) {
+            glfwMakeContextCurrent(nullptr);
+            return;
+        }
     }
 
     glfwMakeContextCurrent(nullptr);
@@ -1499,21 +1562,14 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     std::cout << "GPU render took " << elapsedMs << " ms" << std::endl;
 
-    std::vector<unsigned char> rgb((size_t)_width * _height * 3);
-    for (size_t i = 0; i < (size_t)_width * _height; i++)
-    {
-        rgb[i * 3 + 0] = rgba[i * 4 + 0];
-        rgb[i * 3 + 1] = rgba[i * 4 + 1];
-        rgb[i * 3 + 2] = rgba[i * 4 + 2];
-    }
-
-    // OIDN on the GPU path: the shader has already tone-mapped to RGBA8,
-    // so we run OIDN in LDR mode (no "hdr" flag) on the 8-bit output. No
-    // aux buffers either — capturing albedo + normal in a separate pass
-    // would need RGBA16F output textures and a second readback, and the
-    // existing tile dispatch is already at the TDR cliff. So GPU OIDN is
-    // best-effort denoise on already-tone-mapped data; the CPU --oidn
-    // path is the high-quality choice (HDR pre-tone-map + aux).
+    // OIDN on the GPU path now mirrors the CPU path: HDR linear input + aux
+    // (albedo + shading normal at first hit) -> OIDN HDR-mode denoise -> CPU
+    // tone map. Earlier the GPU did in-shader tone-mapping and ran OIDN in
+    // LDR mode on the post-tone-map 8-bit signal, which threw away most of
+    // the input dynamic range and skipped the aux features that prevent
+    // OIDN from blurring out edges. Cost: one extra primary ray for aux,
+    // 3x the readback bandwidth (RGBA16F x 3 textures), and the OIDN
+    // invocation is on the CPU regardless.
     if (useOIDN)
     {
         if (!OidnDenoise::isAvailable())
@@ -1523,27 +1579,34 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         }
         else
         {
-            std::vector<Vec3f> floatBuf((size_t)_width * _height);
-            for (size_t i = 0; i < floatBuf.size(); i++)
-                floatBuf[i] = Vec3f(rgb[i * 3 + 0] / 255.f,
-                                    rgb[i * 3 + 1] / 255.f,
-                                    rgb[i * 3 + 2] / 255.f);
-            std::vector<Vec3f> empty;
-            OidnDenoise::denoise(floatBuf, empty, empty, _width, _height);
-            for (size_t i = 0; i < floatBuf.size(); i++)
-            {
-                auto cl = [](float v) {
-                    if (v < 0.f) v = 0.f;
-                    if (v > 1.f) v = 1.f;
-                    return (unsigned char)(v * 255.f + 0.5f);
-                };
-                rgb[i * 3 + 0] = cl(floatBuf[i][0]);
-                rgb[i * 3 + 1] = cl(floatBuf[i][1]);
-                rgb[i * 3 + 2] = cl(floatBuf[i][2]);
-            }
+            OidnDenoise::denoise(hdr, albedoBuf, normalBuf, _width, _height);
         }
     }
-    else if (useDenoise)
+
+    // Tone map on CPU using the same shared curves the CPU renderer uses.
+    // Done after OIDN so the denoiser sees full HDR; done before bilateral
+    // (in the legacy useDenoise branch) because the bilateral filter
+    // operates on 8-bit RGB.
+    for (auto &c : hdr)
+    {
+        if (useACES) ToneMap::aces(c);
+        else         ToneMap::reinhard(c);
+    }
+
+    std::vector<unsigned char> rgb((size_t)_width * _height * 3);
+    auto cl = [](float v) {
+        if (v < 0.f) v = 0.f;
+        if (v > 1.f) v = 1.f;
+        return (unsigned char)(v * 255.f + 0.5f);
+    };
+    for (size_t i = 0; i < (size_t)_width * _height; i++)
+    {
+        rgb[i * 3 + 0] = cl(hdr[i][0]);
+        rgb[i * 3 + 1] = cl(hdr[i][1]);
+        rgb[i * 3 + 2] = cl(hdr[i][2]);
+    }
+
+    if (!useOIDN && useDenoise)
     {
         Denoise::bilateralRGB(rgb, _width, _height);
     }
@@ -1624,6 +1687,8 @@ void GpuRenderer::destroyGL()
 {
     if (_program) { glDeleteProgram(_program); _program = 0; }
     if (_outputTex) { glDeleteTextures(1, &_outputTex); _outputTex = 0; }
+    if (_albedoTex) { glDeleteTextures(1, &_albedoTex); _albedoTex = 0; }
+    if (_normalTex) { glDeleteTextures(1, &_normalTex); _normalTex = 0; }
     if (_sphereSSBO)   { glDeleteBuffers(1, &_sphereSSBO);   _sphereSSBO = 0; }
     if (_planeSSBO)    { glDeleteBuffers(1, &_planeSSBO);    _planeSSBO = 0; }
     if (_materialSSBO) { glDeleteBuffers(1, &_materialSSBO); _materialSSBO = 0; }
