@@ -9,6 +9,7 @@
 #include <ctime>
 
 #include "Includes/CLI11.hpp"
+#include "Includes/DllSearch.h"
 #include "Includes/Renderer.h"
 #include "Scenes/Scene.h"
 #include "Scenes/SceneDiscovery.h"
@@ -51,6 +52,7 @@ namespace
 
 int main(int argc, char *argv[])
 {
+    pcrSetupLibSearch();
     auto start = std::chrono::steady_clock::now();
 
     int depth = 4;

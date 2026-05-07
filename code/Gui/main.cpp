@@ -70,6 +70,7 @@
 #include "lodepng.h"
 #include "portable-file-dialogs.h"
 
+#include "Includes/DllSearch.h"
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Scenes/Scene.h"
@@ -851,6 +852,7 @@ static bool openDebugConsole()
 
 int main(int, char **)
 {
+    pcrSetupLibSearch();
 #ifdef _WIN32
     // Default behavior is silent — no popup console, no log file. The GUI
     // is the GUI. Two diagnostic hooks layered on top:

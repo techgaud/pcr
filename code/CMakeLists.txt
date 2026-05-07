@@ -61,13 +61,21 @@ if(PCR_USE_OIDN)
     message(STATUS "OIDN: include=${OIDN_INCLUDE_DIR} lib=${OIDN_LIBRARY}")
 endif()
 
-# Helper: link OIDN to a target + deploy its runtime libraries next to
-# the binary so the loader resolves them at exec time. On Linux/macOS we
-# put the OIDN .so/.dylib files in a sibling `lib/` directory (matching
-# OIDN's internal RPATH of `$ORIGIN/../lib`, which is how it expects to
-# find its dlopen-ed device plugins like _device_cpu / _device_cuda /
-# _device_sycl). On Windows DLLs go flat next to the .exe. No-op when
-# PCR_USE_OIDN=OFF.
+# Helper: link OIDN to a target + deploy its runtime libraries into a
+# sibling `lib/` subdirectory of the binary, on every OS, so the binary
+# folder stays tidy and only the .exe is at the root.
+#
+# On Linux/macOS this also matches OIDN's hardcoded RPATH of
+# `$ORIGIN/../lib`, which is how OIDN resolves its dlopen-ed device
+# plugins (_device_cpu / _device_cuda / _device_sycl) at runtime. The
+# binary's own RPATH is set to `$ORIGIN/lib` so the dynamic loader finds
+# `libOpenImageDenoise.so` from there.
+#
+# On Windows there's no RPATH; DllSearch.h calls SetDllDirectory("lib")
+# at process startup to add the lib/ subdir to the loader search path.
+# OIDN's main DLL then dlopens its device plugins out of the same dir.
+#
+# No-op when PCR_USE_OIDN=OFF.
 function(pcr_link_oidn target)
     if(NOT PCR_USE_OIDN)
         return()
@@ -78,14 +86,14 @@ function(pcr_link_oidn target)
         foreach(_dll ${OIDN_RUNTIME_DLLS})
             get_filename_component(_dll_name ${_dll} NAME)
             add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E make_directory
+                        $<TARGET_FILE_DIR:${target}>/lib
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        ${_dll} $<TARGET_FILE_DIR:${target}>/${_dll_name}
+                        ${_dll} $<TARGET_FILE_DIR:${target}>/lib/${_dll_name}
                 VERBATIM
             )
         endforeach()
     else()
-        # Mirror OIDN's expected lib/ layout so its $ORIGIN/../lib resolve
-        # works for plugins that get dlopen-ed at runtime.
         set_property(TARGET ${target} APPEND PROPERTY
                      BUILD_RPATH "$ORIGIN/lib")
         set_property(TARGET ${target} APPEND PROPERTY
