@@ -71,6 +71,7 @@ int main(int argc, char *argv[])
     bool useAA = false;
     int aaSamples = 4;
     bool useAdaptive = false;
+    bool useOIDN = false;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -133,6 +134,12 @@ int main(int argc, char *argv[])
                  "once relative variance converges below threshold. Speeds up "
                  "well-converged regions at the cost of more samples in noisy "
                  "regions. Only meaningful with --aa.");
+    app.add_flag("--oidn", useOIDN,
+                 "Run Intel Open Image Denoise on the HDR framebuffer "
+                 "before tone mapping, with albedo and shading-normal aux "
+                 "buffers populated at primary-ray first hit. Replaces the "
+                 "5x5 bilateral (--denoise) when both are set. Requires the "
+                 "binary to be built with -DPCR_USE_OIDN=ON.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -198,6 +205,7 @@ int main(int argc, char *argv[])
     renderer.useACES      = useACES;
     renderer.aaSamples    = useAA ? std::max(1, aaSamples) : 1;
     renderer.useAdaptive  = useAdaptive;
+    renderer.useOIDN      = useOIDN;
     renderer.render(sceneData, start, outputDir);
 
     return 0;

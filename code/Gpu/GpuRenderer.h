@@ -44,6 +44,7 @@ public:
     bool useACES      = false;
     int  aaSamples    = 1;
     bool useAdaptive  = false;
+    bool useOIDN      = false;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
@@ -60,6 +61,8 @@ private:
     // render() is called (because GL calls require a current context).
     unsigned _program = 0;
     unsigned _outputTex = 0;
+    unsigned _albedoTex = 0;  // OIDN aux: per-pixel albedo at first hit
+    unsigned _normalTex = 0;  // OIDN aux: per-pixel shading normal at first hit
     unsigned _sphereSSBO = 0;
     unsigned _planeSSBO = 0;
     unsigned _triangleSSBO = 0;

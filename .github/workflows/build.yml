@@ -32,6 +32,8 @@ jobs:
           cp code/Build/Release/frank-based-rendering-cli.exe stage/
           cp code/Build/Release/frank-based-rendering.exe stage/
           cp code/Build/Release/physically-cringe-rendering.exe stage/
+          # OIDN runtime DLLs land next to the .exes (CMake post-build).
+          cp code/Build/Release/*.dll stage/ 2>/dev/null || true
           # Scenes/ rides along so each binary in the artifact zip resolves
           # JSON scenes via the executable-dir fallback out of the box.
           cp -r Scenes stage/
@@ -72,6 +74,8 @@ jobs:
           cp code/Build/frank-based-rendering-cli stage/
           cp code/Build/frank-based-rendering stage/
           cp code/Build/physically-cringe-rendering stage/
+          # OIDN libs live in code/Build/lib (matches OIDN's $ORIGIN/../lib).
+          [ -d code/Build/lib ] && cp -r code/Build/lib stage/ || true
           cp -r Scenes stage/
           cp -r models stage/
 
@@ -103,6 +107,7 @@ jobs:
           mkdir -p stage
           cp code/Build/frank-based-rendering-cli stage/
           cp code/Build/frank-based-rendering stage/
+          [ -d code/Build/lib ] && cp -r code/Build/lib stage/ || true
           cp -r Scenes stage/
           cp -r models stage/
 

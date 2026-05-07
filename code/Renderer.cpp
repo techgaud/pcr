@@ -14,6 +14,7 @@
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
 #include "Includes/Denoise.h"
+#include "Includes/OidnDenoise.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
 #ifndef PCR_BINARY_NAME
@@ -129,6 +130,15 @@ void Renderer::render(const Scenes::SceneData &scene,
         totalLightArea += L.totalArea;
 
     std::vector<Vec3f> frameBuffer(_width * _height);
+    // OIDN aux buffers: only allocated when --oidn is on. Albedo and
+    // shading normal at primary-ray first hit, captured below.
+    std::vector<Vec3f> albedoBuffer;
+    std::vector<Vec3f> normalBuffer;
+    if (useOIDN)
+    {
+        albedoBuffer.assign(_width * _height, Vec3f(0, 0, 0));
+        normalBuffer.assign(_width * _height, Vec3f(0, 0, 1));
+    }
     Vec3f origin = scene.camera.position;
     float aspect = _width / (float)_height;
     float scale = std::tan((float)std::numbers::pi / 180.f * 0.5f * scene.camera.fov);
@@ -173,7 +183,15 @@ void Renderer::render(const Scenes::SceneData &scene,
                         auto x = ((2 * (j + 0.5f + jx) / (float)_width) - 1) * scale * aspect;
                         auto y = -((2 * (i + 0.5f + jy) / (float)_height) - 1) * scale;
                         Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
-                        Vec3f c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0);
+                        // Capture aux only on the first AA sample. OIDN
+                        // doesn't need anti-aliased aux; the deterministic
+                        // per-pixel-center first hit is enough.
+                        Vec3f firstAlbedo, firstNormal;
+                        Vec3f *albOut = (useOIDN && s == 0) ? &firstAlbedo : nullptr;
+                        Vec3f *nrmOut = (useOIDN && s == 0) ? &firstNormal : nullptr;
+                        Vec3f c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
+                        if (albOut) albedoBuffer[i * _width + j] = firstAlbedo;
+                        if (nrmOut) normalBuffer[i * _width + j] = firstNormal;
 
                         taken++;
                         Vec3f delta{c[0] - mean[0], c[1] - mean[1], c[2] - mean[2]};
@@ -250,6 +268,24 @@ void Renderer::render(const Scenes::SceneData &scene,
         return;
     }
 
+    // OIDN denoise BEFORE tone mapping. OIDN expects HDR linear radiance
+    // values; running it post-Reinhard would clobber its training-data
+    // assumptions. The aux buffers (albedo, shading normal) populated
+    // during the per-pixel loop above feed the denoiser network.
+    if (useOIDN)
+    {
+        if (!OidnDenoise::isAvailable())
+        {
+            std::cerr << "warning: --oidn requested but binary was not built "
+                         "with PCR_USE_OIDN=ON; skipping denoise.\n";
+        }
+        else
+        {
+            OidnDenoise::denoise(frameBuffer, albedoBuffer, normalBuffer,
+                                 _width, _height);
+        }
+    }
+
     std::vector<unsigned char> rgb((size_t)_width * _height * 3);
     for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
@@ -295,6 +331,8 @@ void Renderer::render(const Scenes::SceneData &scene,
     }
     if (useACES)
         filename += "-aces";
+    if (useOIDN)
+        filename += "-oidn";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
@@ -330,6 +368,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Tonemap",    useACES       ? "ACES" : "Reinhard");
     addText("AASamples",  std::to_string(aaSamples));
     addText("Adaptive",   useAdaptive ? "1" : "0");
+    addText("OIDN",       useOIDN     ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -354,13 +393,21 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,
                         const std::vector<Scenes::AreaLight> &lights,
-                        float totalLightArea, int depth)
+                        float totalLightArea, int depth,
+                        Vec3f *outFirstAlbedo,
+                        Vec3f *outFirstNormal)
 {
     Material material;
     Vec3f hit, N;
 
     if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
-        return Vec3f(0.f, 0.f, 0.f); // background color
+    {
+        // Background hit: write sentinel aux so the OIDN buffer doesn't
+        // contain stack garbage for sky-pixels.
+        if (outFirstAlbedo) *outFirstAlbedo = Vec3f(0.f, 0.f, 0.f);
+        if (outFirstNormal) *outFirstNormal = Vec3f(0.f, 0.f, 1.f);
+        return Vec3f(0.f, 0.f, 0.f);
+    }
 
     // Capture which side of the surface we hit BEFORE flipping N — glass
     // refraction needs to know whether we're entering (n1=air, n2=glass)
@@ -369,6 +416,13 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
     bool entering = ray.dir.dot(N) < 0.f;
     if (!entering)
         N = N * -1;
+
+    // OIDN aux at first hit. For specular materials we'd ideally capture
+    // the underlying surface's albedo (mirror's tint, glass's color);
+    // material.albedo serves that role. Normal is the geometric one
+    // facing the ray, which is what OIDN expects.
+    if (outFirstAlbedo) *outFirstAlbedo = material.albedo;
+    if (outFirstNormal) *outFirstNormal = N;
 
     if (material.isEmissive())
         return material.emissive;

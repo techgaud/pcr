@@ -51,6 +51,14 @@ public:
     // when aaSamples > 1.
     bool useAdaptive = false;
 
+    // Intel Open Image Denoise. Replaces (not complements) the existing
+    // 5x5 bilateral filter when on. Runs on the HDR pre-tone-map
+    // framebuffer with optional albedo + normal aux buffers, which the
+    // renderer also outputs at primary-ray first hit. Build-time gated
+    // by PCR_USE_OIDN — when not built with it, OidnDenoise::denoise is
+    // a no-op and the flag prints a warning.
+    bool useOIDN = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
@@ -66,11 +74,18 @@ private:
     const int _samples;
     const int _shadowSamples;
 
+    // Optional out-params capture albedo + shading normal at the FIRST
+    // hit (depth==0). Used to populate aux buffers for OIDN; recursive
+    // calls inside castRay leave them null so deeper bounces don't
+    // overwrite. Background-hit (no intersect at depth 0) writes
+    // sentinel zeros so the aux buffer doesn't get random stack values.
     Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                   const std::vector<Triangle> &triangles,
                   const std::vector<Bvh::Node> &bvh,
                   const std::vector<Scenes::AreaLight> &lights,
-                  float totalLightArea, int depth);
+                  float totalLightArea, int depth,
+                  Vec3f *outFirstAlbedo = nullptr,
+                  Vec3f *outFirstNormal = nullptr);
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,

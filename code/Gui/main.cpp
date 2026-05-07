@@ -141,6 +141,7 @@ struct Settings
     bool useAA = false;
     int aaSamples = 4;
     bool useAdaptive = false;
+    bool useOIDN = false;
 
     // Pop a debug console + log file at startup. Toggled by the Debug
     // button in the GUI top-right (or the PCR_DEBUG env var). Persisted
@@ -199,6 +200,7 @@ static void loadSettings(Settings &s)
         s.useAA         = j.value("useAA",         s.useAA);
         s.aaSamples     = j.value("aaSamples",     s.aaSamples);
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
+        s.useOIDN       = j.value("useOIDN",       s.useOIDN);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
@@ -249,6 +251,7 @@ static json buildSettingsJson(const Settings &s)
     j["useAA"]         = s.useAA;
     j["aaSamples"]     = s.aaSamples;
     j["useAdaptive"]   = s.useAdaptive;
+    j["useOIDN"]       = s.useOIDN;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
     for (const auto &p : s.presets)
@@ -401,6 +404,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useACES       = settings.useACES;
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
+        renderer.useOIDN       = settings.useOIDN;
         if (live)
         {
             renderer.onPartialFrame = [live](const std::vector<Vec3f> &fb, int w, int h) {
@@ -1195,6 +1199,12 @@ int main(int, char **)
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Only meaningful when AA is on. Stops sampling a\n"
                               "pixel once its relative variance is below 5%%.");
+        ImGui::Checkbox("OIDN denoise (Intel Open Image Denoise)", &settings.useOIDN);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Replaces the 5x5 bilateral with Intel OIDN\n"
+                              "(neural-net denoiser). Uses albedo + shading\n"
+                              "normal aux buffers from first hit. Requires\n"
+                              "the binary to be built with PCR_USE_OIDN=ON.");
 
         ImGui::SeparatorText("Output");
         pcrSliderInt("Width", &settings.width, 64, 2160, 8, 64);

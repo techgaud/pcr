@@ -37,6 +37,7 @@
 #include "Gpu/GpuRenderer.h"
 #include "Includes/lodepng.h"
 #include "Includes/Denoise.h"
+#include "Includes/OidnDenoise.h"
 
 #include <cmath>
 
@@ -191,7 +192,7 @@ static const char *kComputeShaderSrc = R"GLSL(
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(rgba8, binding = 0) uniform writeonly image2D uOutput;
+layout(rgba8, binding = 0)   uniform writeonly image2D uOutput;
 
 uniform int   uWidth;
 uniform int   uHeight;
@@ -1506,8 +1507,46 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
         rgb[i * 3 + 2] = rgba[i * 4 + 2];
     }
 
-    if (useDenoise)
+    // OIDN on the GPU path: the shader has already tone-mapped to RGBA8,
+    // so we run OIDN in LDR mode (no "hdr" flag) on the 8-bit output. No
+    // aux buffers either — capturing albedo + normal in a separate pass
+    // would need RGBA16F output textures and a second readback, and the
+    // existing tile dispatch is already at the TDR cliff. So GPU OIDN is
+    // best-effort denoise on already-tone-mapped data; the CPU --oidn
+    // path is the high-quality choice (HDR pre-tone-map + aux).
+    if (useOIDN)
+    {
+        if (!OidnDenoise::isAvailable())
+        {
+            std::cerr << "warning: --oidn requested but binary was not "
+                         "built with PCR_USE_OIDN=ON; skipping.\n";
+        }
+        else
+        {
+            std::vector<Vec3f> floatBuf((size_t)_width * _height);
+            for (size_t i = 0; i < floatBuf.size(); i++)
+                floatBuf[i] = Vec3f(rgb[i * 3 + 0] / 255.f,
+                                    rgb[i * 3 + 1] / 255.f,
+                                    rgb[i * 3 + 2] / 255.f);
+            std::vector<Vec3f> empty;
+            OidnDenoise::denoise(floatBuf, empty, empty, _width, _height);
+            for (size_t i = 0; i < floatBuf.size(); i++)
+            {
+                auto cl = [](float v) {
+                    if (v < 0.f) v = 0.f;
+                    if (v > 1.f) v = 1.f;
+                    return (unsigned char)(v * 255.f + 0.5f);
+                };
+                rgb[i * 3 + 0] = cl(floatBuf[i][0]);
+                rgb[i * 3 + 1] = cl(floatBuf[i][1]);
+                rgb[i * 3 + 2] = cl(floatBuf[i][2]);
+            }
+        }
+    }
+    else if (useDenoise)
+    {
         Denoise::bilateralRGB(rgb, _width, _height);
+    }
 
     std::string timestamp = formatTimestamp(false);
     std::string filename = scene.name + "-" + scene.version + "-"
@@ -1525,6 +1564,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     }
     if (useACES)
         filename += "-aces";
+    if (useOIDN)
+        filename += "-oidn";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -1558,6 +1599,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     addText("Tonemap",       useACES       ? "ACES" : "Reinhard");
     addText("AASamples",     std::to_string(aaSamples));
     addText("Adaptive",      useAdaptive ? "1" : "0");
+    addText("OIDN",          useOIDN     ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
