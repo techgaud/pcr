@@ -79,6 +79,37 @@ namespace fs = std::filesystem;
 
 // --- Settings persistence -------------------------------------------------
 
+struct Preset
+{
+    std::string name;
+    int depth = 4;
+    int samples = 16;
+    int shadowSamples = 4;
+};
+
+// Per-binary defaults. The GPU is fast enough that "Picture" can sensibly
+// crank to 6 bounces / 2048 samples / 32 shadow rays — that takes ~4 min on
+// a Threadripper-class GPU. The CPU "Picture" stays at 4/256/8 because the
+// same settings on CPU would take many hours.
+static std::vector<Preset> defaultPresets()
+{
+#if PCR_USE_GPU
+    return {
+        {"Quick",      2, 4,    2},
+        {"Decent",     4, 16,   4},
+        {"Production", 4, 256,  8},
+        {"Picture",    6, 2048, 32},
+    };
+#else
+    return {
+        {"Quick",      2, 4,   2},
+        {"Decent",     4, 16,  4},
+        {"Production", 4, 64,  8},
+        {"Picture",    4, 256, 8},
+    };
+#endif
+}
+
 struct Settings
 {
     int depth = 4;
@@ -97,6 +128,11 @@ struct Settings
     bool useMIS = false;
     bool useRussian = false;
     bool useStratified = false;
+
+    // Editable from the Edit Presets popup; persisted in <binary>.json.
+    // Default to per-binary code constants when settings file is missing
+    // or doesn't carry presets yet.
+    std::vector<Preset> presets = defaultPresets();
 };
 
 static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
@@ -132,6 +168,23 @@ static void loadSettings(Settings &s)
         s.useMIS       = j.value("useMIS",       s.useMIS);
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
+        if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
+        {
+            std::vector<Preset> loaded;
+            for (const auto &pj : j["presets"])
+            {
+                if (!pj.is_object()) continue;
+                Preset p;
+                p.name = pj.value("name", std::string{});
+                p.depth = pj.value("depth", 4);
+                p.samples = pj.value("samples", 16);
+                p.shadowSamples = pj.value("shadow", 4);
+                if (p.name.empty()) continue;
+                loaded.push_back(std::move(p));
+            }
+            if (!loaded.empty())
+                s.presets = std::move(loaded);
+        }
     }
     catch (...)
     {
@@ -156,6 +209,17 @@ static void saveSettings(const Settings &s)
     j["useMIS"]       = s.useMIS;
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
+    json arr = json::array();
+    for (const auto &p : s.presets)
+    {
+        json pj;
+        pj["name"] = p.name;
+        pj["depth"] = p.depth;
+        pj["samples"] = p.samples;
+        pj["shadow"] = p.shadowSamples;
+        arr.push_back(std::move(pj));
+    }
+    j["presets"] = std::move(arr);
     std::ofstream out(settingsPath());
     out << j.dump(2);
 }
@@ -392,35 +456,65 @@ static void freeImage(LoadedImage &img)
 
 // --- Render-time estimator -----------------------------------------------
 //
-// Very rough. Calibrated from two measured points on the dev hardware:
-//   d=2 s=4 S=2 720    -> ~150 ms
-//   d=4 s=16 S=4 720   -> ~241 sec
-// Models cost as samples^(d-1) * shadow * pixels. Expect 2-5x error,
-// especially at high sample counts where path-termination dominates and
-// the worst-case fanout overestimates. Useful for "minutes or hours"
+// Very rough. Models per-pixel work as linear in samples * depth (NOT
+// samples^depth — branched paths terminate fast in practice via emissive
+// hits, scene exits, and Russian roulette, so the worst-case-fanout model
+// dramatically over-estimates at high sample counts). Per-target coefficient
+// is calibrated from one measured point on the dev hardware.
+//
+// CPU calibration: d=4 s=16 S=4 720x720 took 241 sec on the homelab CPU.
+//   cost = 4 * 16 * 4 * 720 * 720 = 1.33e8
+//   coef = 241000 / 1.33e8 ~= 1.8e-3
+//
+// GPU calibration: d=6 s=2048 S=32 1080x1080 took 245 sec on Nate's desktop.
+//   cost = 6 * 2048 * 32 * 1080 * 1080 = 4.59e11
+//   coef = 245000 / 4.59e11 ~= 5.3e-7
+//
+// Expect 2-5x error in either direction. Useful for "minutes or hours"
 // intuition, not for SLAs.
 static double estimateRenderMs(int d, int s, int S, int w, int h)
 {
-    const double kPerCostUnit = 3.6e-5;
-    double sampleDepth = std::pow((double)s, std::max(0.0, (double)d - 1));
-    double cost = sampleDepth * (double)S * (double)w * (double)h;
+#if PCR_USE_GPU
+    constexpr double kPerCostUnit = 5.3e-7;
+#else
+    constexpr double kPerCostUnit = 1.8e-3;
+#endif
+    double cost = (double)s * (double)d * (double)S * (double)w * (double)h;
     return kPerCostUnit * cost;
 }
 
+// Render-duration formatter that doesn't UB on huge values. The previous
+// version cast `ms / 3600000` straight to int, which on extreme estimates
+// (e.g. samples^depth bug producing 1e19 ms) overflowed signed-int and
+// printed nonsense like "3206175 hr 54 min" through saturated truncation.
+// Use 64-bit ints for hour-and-up arithmetic and add a ceiling tier so
+// estimates beyond a few months print "(very long)" instead of garbage.
 static std::string formatDurationMs(double ms)
 {
+    if (ms < 0) ms = 0;
     if (ms < 1000) return "< 1 sec";
-    char buf[64];
-    if (ms < 60000) {
-        std::snprintf(buf, sizeof(buf), "~%d sec", (int)(ms / 1000));
-    } else if (ms < 3600000) {
-        int m = (int)(ms / 60000);
-        int s = (int)((ms - m*60000) / 1000);
+
+    constexpr double kMin = 60000.0;
+    constexpr double kHour = 3600000.0;
+    constexpr double kDay = 24.0 * kHour;
+
+    char buf[96];
+    if (ms < kMin) {
+        std::snprintf(buf, sizeof(buf), "~%d sec", (int)(ms / 1000.0));
+    } else if (ms < kHour) {
+        int m = (int)(ms / kMin);
+        int s = (int)((ms - m * kMin) / 1000.0);
         std::snprintf(buf, sizeof(buf), "~%d min %d sec", m, s);
+    } else if (ms < kDay) {
+        long long h = (long long)(ms / kHour);
+        long long m = (long long)((ms - (double)h * kHour) / kMin);
+        std::snprintf(buf, sizeof(buf), "~%lld hr %lld min", h, m);
+    } else if (ms < 365.0 * kDay) {
+        long long d = (long long)(ms / kDay);
+        long long h = (long long)((ms - (double)d * kDay) / kHour);
+        std::snprintf(buf, sizeof(buf), "~%lld days %lld hr", d, h);
     } else {
-        int h = (int)(ms / 3600000);
-        int m = (int)((ms - h*3600000.0) / 60000);
-        std::snprintf(buf, sizeof(buf), "~%d hr %d min", h, m);
+        std::snprintf(buf, sizeof(buf), "(very long — try fewer samples)");
     }
     return buf;
 }
@@ -711,24 +805,89 @@ int main(int, char **)
 
         ImGui::SeparatorText("Quality");
 
-        // Preset buttons snap all three quality sliders. Width/height are
+        // Preset buttons snap depth/samples/shadow. Width/height are
         // intentionally not touched so resolution is independent of preset.
-        struct Preset { const char *name; int d, s, S; };
-        static const Preset kPresets[] = {
-            {"Quick",     2, 4,   2},
-            {"Decent",    4, 16,  4},
-            {"Production", 4, 64,  8},
-            {"Picture",   4, 256, 8},
-        };
-        for (size_t i = 0; i < sizeof(kPresets) / sizeof(kPresets[0]); i++)
+        // Presets are editable via the Edit button, persisted in settings.
+        for (size_t i = 0; i < settings.presets.size(); i++)
         {
             if (i > 0) ImGui::SameLine();
-            if (ImGui::Button(kPresets[i].name))
+            const auto &p = settings.presets[i];
+            if (ImGui::Button(p.name.c_str()))
             {
-                settings.depth = kPresets[i].d;
-                settings.samples = kPresets[i].s;
-                settings.shadowSamples = kPresets[i].S;
+                settings.depth = p.depth;
+                settings.samples = p.samples;
+                settings.shadowSamples = p.shadowSamples;
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("d=%d s=%d S=%d", p.depth, p.samples, p.shadowSamples);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Edit##presets"))
+            ImGui::OpenPopup("Edit Presets##popup");
+
+        if (ImGui::BeginPopupModal("Edit Presets##popup", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::TextUnformatted("Customize the quality preset buttons. Saved next to the binary.");
+            ImGui::Separator();
+            if (ImGui::BeginTable("presets-edit", 5,
+                                  ImGuiTableFlags_SizingStretchProp))
+            {
+                ImGui::TableSetupColumn("Name");
+                ImGui::TableSetupColumn("Depth");
+                ImGui::TableSetupColumn("Samples");
+                ImGui::TableSetupColumn("Shadow");
+                ImGui::TableSetupColumn("Reset");
+                ImGui::TableHeadersRow();
+
+                auto defaults = defaultPresets();
+                for (size_t i = 0; i < settings.presets.size(); i++)
+                {
+                    auto &p = settings.presets[i];
+                    ImGui::PushID((int)i);
+                    ImGui::TableNextRow();
+
+                    ImGui::TableNextColumn();
+                    char nameBuf[64];
+                    std::strncpy(nameBuf, p.name.c_str(), sizeof(nameBuf));
+                    nameBuf[sizeof(nameBuf) - 1] = 0;
+                    ImGui::SetNextItemWidth(140);
+                    if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
+                        p.name = nameBuf;
+
+                    ImGui::TableNextColumn();
+                    ImGui::SetNextItemWidth(100);
+                    ImGui::InputInt("##d", &p.depth);
+                    if (p.depth < 1) p.depth = 1;
+                    if (p.depth > 8) p.depth = 8;
+
+                    ImGui::TableNextColumn();
+                    ImGui::SetNextItemWidth(100);
+                    ImGui::InputInt("##s", &p.samples);
+                    if (p.samples < 1) p.samples = 1;
+                    if (p.samples > 4096) p.samples = 4096;
+
+                    ImGui::TableNextColumn();
+                    ImGui::SetNextItemWidth(100);
+                    ImGui::InputInt("##S", &p.shadowSamples);
+                    if (p.shadowSamples < 1) p.shadowSamples = 1;
+                    if (p.shadowSamples > 64) p.shadowSamples = 64;
+
+                    ImGui::TableNextColumn();
+                    if (i < defaults.size() && ImGui::SmallButton("Default"))
+                        p = defaults[i];
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("Reset all to defaults"))
+                settings.presets = defaultPresets();
+            ImGui::SameLine();
+            if (ImGui::Button("Close", ImVec2(120, 0)))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
         }
 
         pcrSliderInt("Depth",   &settings.depth,         1, 8,    1, 2);
