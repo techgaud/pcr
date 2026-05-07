@@ -146,6 +146,15 @@ struct Settings
 
 static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
 
+#ifdef _WIN32
+// Forward decls for the activity-log helpers below — runRender (further up
+// in the file than the helpers themselves) calls them inside #ifdef _WIN32
+// blocks. Linux/GCC builds skip those blocks entirely, but MSVC compiles
+// them and needs visible declarations before the call sites.
+static void setActivity(const std::string &what);
+static void clearActivity();
+#endif
+
 static fs::path settingsPath()
 {
     // Sit next to the executable, named after the binary so the CPU and GPU
