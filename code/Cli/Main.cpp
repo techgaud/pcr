@@ -12,6 +12,8 @@
 #include "Includes/Renderer.h"
 #include "Scenes/Scene.h"
 #include "Scenes/Cornell.h"
+#include "Scenes/CornellSpheres.h"
+#include "Scenes/CornellLargeLight.h"
 
 namespace
 {
@@ -52,7 +54,9 @@ namespace
     const std::unordered_map<std::string, SceneFactory> &sceneRegistry()
     {
         static const std::unordered_map<std::string, SceneFactory> map = {
-            {"cornell", &Scenes::makeCornell},
+            {"cornell",             &Scenes::makeCornell},
+            {"cornell-spheres",     &Scenes::makeCornellSpheres},
+            {"cornell-large-light", &Scenes::makeCornellLargeLight},
         };
         return map;
     }

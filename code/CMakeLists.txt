@@ -20,6 +20,8 @@ set(PCR_RENDERER_SOURCES
     lodepng.cpp
     Denoise.cpp
     Scenes/Cornell.cpp
+    Scenes/CornellSpheres.cpp
+    Scenes/CornellLargeLight.cpp
 )
 
 # --- CLI: frank-based-rendering-cli ---------------------------------------

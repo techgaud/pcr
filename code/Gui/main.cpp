@@ -65,6 +65,8 @@
 #include "Includes/Vec3f.h"
 #include "Scenes/Scene.h"
 #include "Scenes/Cornell.h"
+#include "Scenes/CornellSpheres.h"
+#include "Scenes/CornellLargeLight.h"
 
 #if PCR_USE_GPU
 #include "Gpu/GpuRenderer.h"
@@ -190,7 +192,9 @@ struct SceneEntry { const char *name; SceneFactory factory; };
 static const std::vector<SceneEntry> &sceneRegistry()
 {
     static const std::vector<SceneEntry> r = {
-        {"cornell", &Scenes::makeCornell},
+        {"cornell",             &Scenes::makeCornell},
+        {"cornell-spheres",     &Scenes::makeCornellSpheres},
+        {"cornell-large-light", &Scenes::makeCornellLargeLight},
     };
     return r;
 }
