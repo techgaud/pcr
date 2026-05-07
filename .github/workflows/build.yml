@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, gui]
+    branches: [main, gui, gpu]
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -30,7 +30,8 @@ jobs:
         run: |
           mkdir -p stage
           cp code/Build/Release/pcr-cornell.exe stage/
-          cp code/Build/Release/physically-cringe-renderer-v1.0.0.exe stage/
+          cp code/Build/Release/frank-based-rendering.exe stage/
+          cp code/Build/Release/physically-cringe-rendering.exe stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -65,7 +66,8 @@ jobs:
         run: |
           mkdir -p stage
           cp code/Build/pcr-cornell stage/
-          cp code/Build/physically-cringe-renderer-v1.0.0 stage/
+          cp code/Build/frank-based-rendering stage/
+          cp code/Build/physically-cringe-rendering stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -93,7 +95,8 @@ jobs:
         run: |
           mkdir -p stage
           cp code/Build/pcr-cornell stage/
-          cp code/Build/physically-cringe-renderer-v1.0.0 stage/
+          cp code/Build/frank-based-rendering stage/
+          cp code/Build/physically-cringe-rendering stage/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -117,28 +120,27 @@ jobs:
           mkdir -p release
 
           # Windows .exe binaries
-          cp pcr-windows-x64/pcr-cornell.exe \
-             release/pcr-cornell-windows-x64.exe
-          cp pcr-windows-x64/physically-cringe-renderer-v1.0.0.exe \
-             release/physically-cringe-renderer-windows-x64.exe
+          cp pcr-windows-x64/pcr-cornell.exe                  release/pcr-cornell-windows-x64.exe
+          cp pcr-windows-x64/frank-based-rendering.exe        release/frank-based-rendering-windows-x64.exe
+          cp pcr-windows-x64/physically-cringe-rendering.exe  release/physically-cringe-rendering-windows-x64.exe
 
           # Linux binaries
-          cp pcr-linux-x64/pcr-cornell \
-             release/pcr-cornell-linux-x64
-          cp pcr-linux-x64/physically-cringe-renderer-v1.0.0 \
-             release/physically-cringe-renderer-linux-x64
+          cp pcr-linux-x64/pcr-cornell                        release/pcr-cornell-linux-x64
+          cp pcr-linux-x64/frank-based-rendering              release/frank-based-rendering-linux-x64
+          cp pcr-linux-x64/physically-cringe-rendering        release/physically-cringe-rendering-linux-x64
 
           # macOS binaries
-          cp pcr-macos-arm64/pcr-cornell \
-             release/pcr-cornell-macos-arm64
-          cp pcr-macos-arm64/physically-cringe-renderer-v1.0.0 \
-             release/physically-cringe-renderer-macos-arm64
+          cp pcr-macos-arm64/pcr-cornell                      release/pcr-cornell-macos-arm64
+          cp pcr-macos-arm64/frank-based-rendering            release/frank-based-rendering-macos-arm64
+          cp pcr-macos-arm64/physically-cringe-rendering      release/physically-cringe-rendering-macos-arm64
 
-          # Make Unix binaries executable (download-artifact strips +x).
+          # download-artifact strips the executable bit on Unix.
           chmod +x release/pcr-cornell-linux-x64 \
-                   release/physically-cringe-renderer-linux-x64 \
+                   release/frank-based-rendering-linux-x64 \
+                   release/physically-cringe-rendering-linux-x64 \
                    release/pcr-cornell-macos-arm64 \
-                   release/physically-cringe-renderer-macos-arm64
+                   release/frank-based-rendering-macos-arm64 \
+                   release/physically-cringe-rendering-macos-arm64
 
           ls -la release/
 

@@ -1,8 +1,16 @@
 # pcr
 
-A small CPU path tracer in C++20. Ships with a Cornell Box scene; the architecture is designed for adding more scenes.
+A small path tracer in C++20. Ships with a Cornell Box scene; the architecture is designed for adding more scenes.
 
-Multi-threaded, cosine-weighted hemisphere sampling for indirect light, explicit area-light sampling with shadow rays for direct light, soft shadows, emissive surfaces, Reinhard tone mapping. Output is lossless PNG with embedded tEXt metadata describing scene name, version, and render parameters.
+Cosine-weighted hemisphere sampling for indirect light, explicit area-light sampling with shadow rays for direct light, soft shadows, emissive surfaces, Reinhard tone mapping. Output is lossless PNG with embedded tEXt metadata describing scene name, version, and render parameters.
+
+Three binaries ship from one codebase:
+
+| Binary | Backend | Use |
+|--------|---------|-----|
+| `pcr-cornell` | CPU | CLI for headless / scripting / homelab servers |
+| `frank-based-rendering` | CPU | Desktop GUI (sliders, render button, preview, history) |
+| `physically-cringe-rendering` | GPU (OpenGL 4.3 compute) | Same GUI, on the GPU. Fast. Needs OpenGL 4.3+. |
 
 ## Requirements
 
@@ -25,10 +33,11 @@ cmake -S code -B code/Build
 cmake --build code/Build --config Release
 ```
 
-This produces two executables:
+This produces three executables:
 
-- **`pcr-cornell`** — the CLI renderer (small, headless, scriptable)
-- **`physically-cringe-renderer-v1.0.0`** — the GUI app (sliders, render button, image preview)
+- **`pcr-cornell`** — CLI, CPU only (headless, scriptable)
+- **`frank-based-rendering`** — desktop GUI, CPU
+- **`physically-cringe-rendering`** — desktop GUI, GPU (OpenGL 4.3 compute)
 
 On Windows with Visual Studio they land at `code/Build/Release/<name>.exe`. On Linux and macOS they're at `code/Build/<name>`.
 
@@ -52,13 +61,16 @@ Or push a tag (`git tag v1.0.0 && git push origin v1.0.0`) and the workflow auto
 
 ## Run (GUI)
 
-Double-click the GUI binary, or from a shell:
+Double-click whichever GUI binary you want, or from a shell:
 
 ```bash
-./code/Build/physically-cringe-renderer-v1.0.0
+./code/Build/frank-based-rendering        # CPU
+./code/Build/physically-cringe-rendering  # GPU (OpenGL 4.3 compute)
 ```
 
-Sliders set every parameter the CLI exposes (depth, samples, shadow, width, square checkbox + height, scene, timezone, output dir). Click **Render** and the path tracer runs on a worker thread; progress is reported as rows-completed-of-total. **Cancel** mid-render works. When the render finishes the resulting PNG is loaded and shown in the same window. Settings persist to `physically-cringe-renderer.json` next to the executable.
+Both share the same UI; only the path-tracing backend differs. Settings persist to `<binary-name>.json` next to the executable, so the two GUIs keep separate state.
+
+Sliders set every parameter the CLI exposes (depth, samples, shadow, width, square checkbox + height, scene, timezone, output dir). Click **Render** and the path tracer runs on a worker thread; progress is reported as rows-completed-of-total. **Cancel** mid-render works (sub-second responsiveness). When the render finishes the resulting PNG is loaded and shown in the same window. Settings persist to `<binary-name>.json` next to the executable, so each binary keeps its own state.
 
 ## Run (CLI)
 
