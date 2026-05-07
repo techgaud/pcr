@@ -45,7 +45,6 @@ public:
 
 private:
     std::vector<Plane> _planes;
-    Plane _light;
     const int _width;
     const int _height;
     const int _maxDepth;
@@ -54,7 +53,9 @@ private:
 
     Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                   const std::vector<Triangle> &triangles,
-                  const std::vector<Bvh::Node> &bvh, int depth);
+                  const std::vector<Bvh::Node> &bvh,
+                  const std::vector<Scenes::AreaLight> &lights,
+                  float totalLightArea, int depth);
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,

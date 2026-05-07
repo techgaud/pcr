@@ -218,7 +218,11 @@ namespace Scenes
         // MeshLoader, and appends the resulting triangles to SceneData.
         // Resolves "file" relative to the JSON scene's directory so a JSON
         // can reference ../models/foo.obj predictably regardless of cwd.
-        void parseMesh(const json &p,
+        //
+        // Returns the (begin, count) range of newly-appended triangles in
+        // out.triangles so the caller can build a TriangleSet AreaLight
+        // from them when the mesh is flagged as a light.
+        std::pair<int, int> parseMesh(const json &p,
                        std::unordered_map<std::string, Material> &mats,
                        SceneData &out,
                        const std::string &fieldPath,
@@ -259,13 +263,27 @@ namespace Scenes
             }
 
             auto tris = loadMesh(objPath.string(), opts, mats);
+            int begin = (int)out.triangles.size();
+            int count = (int)tris.size();
             out.triangles.insert(out.triangles.end(),
                                  std::make_move_iterator(tris.begin()),
                                  std::make_move_iterator(tris.end()));
+            return {begin, count};
         }
 
-        // Walk the primitives array. Builds spheres + walls + identifies the
-        // single light-flagged primitive (must be a plane).
+        // Walk the primitives array. Each primitive contributes geometry
+        // (spheres / walls / triangles) and may additionally contribute an
+        // AreaLight when flagged "light": true. The "exactly one light" rule
+        // changed to "at least one light" in phase 3b — multiple plane,
+        // triangle, and mesh lights can coexist now, and the renderer picks
+        // among them proportional to area.
+        //
+        // Light primitives also contribute to scene geometry for ray
+        // intersection: a plane light is added to walls (so it's hittable
+        // and can occlude other lights), a triangle light is added to
+        // triangles, mesh lights' triangles are already in triangles. The
+        // AreaLight stores a copy of the geometry for sampling, decoupled
+        // from the BVH builder's triangle permutation.
         void parsePrimitives(const json &j, std::unordered_map<std::string, Material> &mats,
                              SceneData &out, const std::string &path)
         {
@@ -273,7 +291,6 @@ namespace Scenes
             if (it == j.end() || !it->is_array())
                 throw SceneLoaderError(path + ": missing or non-array \"primitives\"");
 
-            int lightCount = 0;
             for (std::size_t i = 0; i < it->size(); i++)
             {
                 const json &p = (*it)[i];
@@ -284,44 +301,54 @@ namespace Scenes
                 std::string type = requireString(p, "type", fieldPath, path);
                 bool isLight = p.value("light", false);
 
-                if (type == "mesh")
-                {
-                    if (isLight)
-                        throw SceneLoaderError(path + ": " + fieldPath +
-                                               ": light flag on mesh not yet supported "
-                                               "(triangle area-light sampling lands in phase 3b); "
-                                               "use a plane light for now");
-                    parseMesh(p, mats, out, fieldPath, path);
-                    continue;
-                }
                 if (type == "sphere")
                 {
                     if (isLight)
                         throw SceneLoaderError(path + ": " + fieldPath +
-                                               ": light flag is only valid on plane primitives "
-                                               "(sphere area-light sampling not implemented)");
+                                               ": light flag is only valid on plane, triangle, "
+                                               "or mesh primitives (sphere area-light sampling "
+                                               "not implemented)");
                     out.spheres.push_back(parseSphere(p, mats, fieldPath, path));
                 }
                 else if (type == "triangle")
                 {
+                    Triangle tri = parseTriangle(p, mats, fieldPath, path);
                     if (isLight)
-                        throw SceneLoaderError(path + ": " + fieldPath +
-                                               ": triangle area-light sampling not yet supported "
-                                               "(planned for phase 3 with mesh import); "
-                                               "use a plane light for now");
-                    out.triangles.push_back(parseTriangle(p, mats, fieldPath, path));
+                    {
+                        std::vector<Triangle> setTris;
+                        setTris.push_back(tri);
+                        out.areaLights.push_back(makeTriangleSetLight(std::move(setTris)));
+                    }
+                    out.triangles.push_back(std::move(tri));
                 }
                 else if (type == "plane")
                 {
                     Plane pl = parsePlane(p, mats, fieldPath, path);
                     if (isLight)
                     {
-                        out.lightSource = pl;
-                        lightCount++;
+                        // Light planes go ONLY to areaLights — the renderer
+                        // promotes them to _planes ahead of walls so coplanar
+                        // ties (e.g. a ceiling-cutout light) are won by the
+                        // light. Adding them to walls too would lose the tie
+                        // to whichever wall is iterated first.
+                        out.areaLights.push_back(makePlaneLight(pl));
                     }
                     else
                     {
                         out.walls.push_back(std::move(pl));
+                    }
+                }
+                else if (type == "mesh")
+                {
+                    auto [begin, count] = parseMesh(p, mats, out, fieldPath, path);
+                    if (isLight)
+                    {
+                        // Copy this mesh's triangle range out into the light.
+                        // The BVH builder is allowed to permute out.triangles
+                        // afterward without disturbing the light's copy.
+                        std::vector<Triangle> setTris(out.triangles.begin() + begin,
+                                                       out.triangles.begin() + begin + count);
+                        out.areaLights.push_back(makeTriangleSetLight(std::move(setTris)));
                     }
                 }
                 else
@@ -331,13 +358,9 @@ namespace Scenes
                                            "\" (expected sphere, plane, triangle, or mesh)");
                 }
             }
-            // Note: mesh handling above uses 'continue' to skip the if-else
-            // chain above. The light-count check below still needs to fire.
-            if (lightCount == 0)
-                throw SceneLoaderError(path + ": exactly one primitive must have \"light\": true; found none");
-            if (lightCount > 1)
-                throw SceneLoaderError(path + ": exactly one primitive must have \"light\": true; found " +
-                                       std::to_string(lightCount));
+            if (out.areaLights.empty())
+                throw SceneLoaderError(path +
+                    ": at least one primitive must have \"light\": true; found none");
         }
     } // namespace
 

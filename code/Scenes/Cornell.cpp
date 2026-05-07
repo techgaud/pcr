@@ -12,11 +12,11 @@ namespace Scenes
         Material emissive{Vec3f(0.f, 0.f, 0.f), Vec3f{1.0f, 0.85f, 0.6f}};
         emissive.emissive *= 80.f;
 
-        s.lightSource = Plane(
+        s.areaLights.push_back(makePlaneLight(Plane(
             Vec3f{-0.375f, 2.f, -4.25f},
             Vec3f{0.75f, 0, 0},
             Vec3f{0, 0, 0.4f},
-            emissive);
+            emissive)));
 
         // Cornell-box walls.
         Material cream{Vec3f(0.74f, 0.74f, 0.64f), Vec3f(0, 0, 0)};

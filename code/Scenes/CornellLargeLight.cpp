@@ -19,11 +19,11 @@ namespace Scenes
         emissive.emissive *= 80.f;
 
         // Larger ceiling light: 2.0 wide x 0.4 deep instead of 0.75 x 0.4.
-        s.lightSource = Plane(
+        s.areaLights.push_back(makePlaneLight(Plane(
             Vec3f{-1.f, 2.f, -4.25f},
             Vec3f{2.f, 0, 0},
             Vec3f{0, 0, 0.4f},
-            emissive);
+            emissive)));
 
         // Cornell-box walls (same as base cornell scene).
         Material cream{Vec3f(0.74f, 0.74f, 0.64f), Vec3f(0, 0, 0)};

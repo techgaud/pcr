@@ -246,7 +246,9 @@ Drop a `*.json` file in `Scenes/` at the repo root (or anywhere `--scenes-dir` p
 }
 ```
 
-Primitive types: `sphere`, `plane`, `triangle`, `mesh`. Triangles take `v0`/`v1`/`v2` plus optional `n0`/`n1`/`n2` per-vertex normals for smooth shading (omit for flat shading from the geometric normal). Meshes load OBJ files — see the "Mesh import" subsection below. Triangle and mesh lights are not yet supported — keep the area light as a separate plane primitive. Materials are a named registry referenced by name from each primitive.
+Primitive types: `sphere`, `plane`, `triangle`, `mesh`. Triangles take `v0`/`v1`/`v2` plus optional `n0`/`n1`/`n2` per-vertex normals for smooth shading (omit for flat shading from the geometric normal). Meshes load OBJ files — see the "Mesh import" subsection below.
+
+`light: true` is allowed on planes, triangles, and meshes. Multiple lights coexist; the renderer picks one per shadow sample proportional to surface area. The CPU binaries support all three light kinds. The GPU binary still requires exactly one plane light — it refuses scenes with triangle/mesh lights or multiple lights with a clear error pointing at the CPU binary (full GPU multi-light support is planned). Materials are a named registry referenced by name from each primitive.
 
 ### Mesh import
 

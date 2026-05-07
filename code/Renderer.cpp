@@ -52,13 +52,26 @@ void Renderer::render(const Scenes::SceneData &scene,
                       std::chrono::steady_clock::time_point start,
                       const std::string &outputDir)
 {
-    // Scene geometry: light first, then walls. Spheres are passed through
-    // separately to castRay/sceneIntersect since they use a different intersect.
-    _light = scene.lightSource;
+    // Scene geometry: light planes first, then walls. The order matters —
+    // when a light plane is coplanar with a wall (a ceiling-cutout light is
+    // the obvious case), the iteration-order tie has to go to the light or
+    // shadow rays bound for the light get falsely occluded by the wall.
+    // Hardcoded and JSON paths both keep light planes ONLY in areaLights;
+    // walls is light-free.
     _planes.clear();
-    _planes.push_back(_light);
+    for (const auto &L : scene.areaLights)
+    {
+        if (L.kind == Scenes::AreaLightKind::Plane)
+            _planes.push_back(L.plane);
+    }
     for (const auto &w : scene.walls)
         _planes.push_back(w);
+
+    // Total area across all area lights, cached so the shadow loop doesn't
+    // re-sum on every sample.
+    float totalLightArea = 0.f;
+    for (const auto &L : scene.areaLights)
+        totalLightArea += L.totalArea;
 
     std::vector<Vec3f> frameBuffer(_width * _height);
     Vec3f origin = scene.camera.position;
@@ -89,7 +102,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                     auto x = ((2 * (j + 0.5f) / (float)_width) - 1) * scale * aspect;
                     auto y = -((2 * (i + 0.5f) / (float)_height) - 1) * scale;
                     Ray ray(Vec3f(x, y, -1.f).normalize(), origin);
-                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, 0);
+                    frameBuffer[i * _width + j] = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0);
                 }
                 if (progressRows)
                     progressRows->fetch_add(1, std::memory_order_relaxed);
@@ -223,7 +236,9 @@ void Renderer::render(const Scenes::SceneData &scene,
 
 Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
-                        const std::vector<Bvh::Node> &bvh, int depth)
+                        const std::vector<Bvh::Node> &bvh,
+                        const std::vector<Scenes::AreaLight> &lights,
+                        float totalLightArea, int depth)
 {
     Material material;
     Vec3f hit, N;
@@ -271,50 +286,97 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
             float maxAlbedo = std::max({material.albedo[0], material.albedo[1], material.albedo[2]});
             float p = std::min(0.95f, std::max(0.05f, maxAlbedo));
             if (NumGen::Epsilon() > p) continue;
-            indirectLo += castRay(randomRay, spheres, triangles, bvh, depth + 1) * material.albedo / p;
+            indirectLo += castRay(randomRay, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo / p;
         }
         else
         {
-            indirectLo += castRay(randomRay, spheres, triangles, bvh, depth + 1) * material.albedo;
+            indirectLo += castRay(randomRay, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo;
         }
     }
     indirectLo /= _samples;
 
     Vec3f directLo;
-    for (size_t i = 0; i < (size_t)_shadowSamples; i++)
+    if (totalLightArea > 0.f)
     {
-        auto Li = _light.getVecToPlaneFromHit(hit);
-        auto wi = Li.normalize();
-        auto cosTheta = std::max(0.f, wi.dot(N));
-        auto lightDist2 = Li.dot(Li);
-
-        // handle shadows
-        auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
-        Vec3f shadowHit, shadowN;
-        Material tmpMat;
-        bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
-
-        if (!inShadow){
-            float cosLight = std::max(0.f, _light.N.dot(Li * -1));
-            float G = (cosTheta * cosLight) / lightDist2;
-            Vec3f directContrib = (material.albedo / std::numbers::pi) * _light.material.emissive * G * _light.getArea();
-
-            // Partial MIS: down-weight the direct contribution by the
-            // balance heuristic between light and BRDF sampling pdfs. Note
-            // this is the "light-side" half of MIS; the symmetric BRDF-side
-            // weighting on emissive returns from indirect bounces would
-            // require a refactor of the recursion, so we ship the simpler
-            // half. For diffuse-only Cornell the visible difference is small.
-            if (useMIS && cosLight > 1e-6f)
+        for (size_t i = 0; i < (size_t)_shadowSamples; i++)
+        {
+            // Pick one light proportional to its surface area.
+            const Scenes::AreaLight *picked = &lights.front();
             {
-                float lightArea = _light.getArea();
-                float pdfLight = lightDist2 / (cosLight * lightArea);
-                float pdfBrdf  = cosTheta / (float)std::numbers::pi;
-                float w = (pdfLight * pdfLight) /
-                          (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
-                directContrib *= w;
+                float pickTarget = NumGen::Epsilon() * totalLightArea;
+                float cumul = 0.f;
+                for (const auto &L : lights)
+                {
+                    cumul += L.totalArea;
+                    if (pickTarget <= cumul) { picked = &L; break; }
+                }
             }
-            directLo += directContrib;
+
+            // Sample uniformly within picked. PDF over total light surface
+            // area = 1/totalLightArea regardless of which light was picked
+            // (pick_i * within_i = (area_i/totalArea) * (1/area_i) = 1/totalArea).
+            Vec3f sampleP, sampleN, sampleEmissive;
+            if (picked->kind == Scenes::AreaLightKind::Plane)
+            {
+                const Plane &p = picked->plane;
+                float ru = NumGen::Epsilon();
+                float rv = NumGen::Epsilon();
+                sampleP = p.origin + p.getU() * ru + p.getV() * rv;
+                sampleN = p.N;
+                sampleEmissive = p.material.emissive;
+            }
+            else
+            {
+                float rtri = NumGen::Epsilon() * picked->totalArea;
+                auto it = std::lower_bound(picked->cumulativeArea.begin(),
+                                           picked->cumulativeArea.end(), rtri);
+                int triIdx = std::min((int)(it - picked->cumulativeArea.begin()),
+                                      (int)picked->triangles.size() - 1);
+                const Triangle &tri = picked->triangles[triIdx];
+
+                // Uniform sample within a triangle: the standard r1+r2 fold.
+                float r1 = NumGen::Epsilon();
+                float r2 = NumGen::Epsilon();
+                if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
+                sampleP = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
+                sampleN = tri.flatN;
+                sampleEmissive = tri.material.emissive;
+            }
+
+            Vec3f Li = sampleP - hit;
+            auto wi = Li.normalize();
+            auto cosTheta = std::max(0.f, wi.dot(N));
+            auto lightDist2 = Li.dot(Li);
+
+            // handle shadows
+            auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
+            Vec3f shadowHit, shadowN;
+            Material tmpMat;
+            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
+
+            if (!inShadow)
+            {
+                float cosLight = std::max(0.f, sampleN.dot(Li * -1));
+                float G = (cosTheta * cosLight) / lightDist2;
+                // pdf = 1/totalLightArea, so divide-by-pdf = totalLightArea.
+                Vec3f directContrib = (material.albedo / std::numbers::pi) * sampleEmissive * G * totalLightArea;
+
+                // Partial MIS: down-weight the direct contribution by the
+                // balance heuristic between light and BRDF sampling pdfs.
+                // Light-side half only; the symmetric BRDF-side weighting on
+                // emissive returns from indirect bounces would require a
+                // recursion refactor. For diffuse-only scenes the visible
+                // effect is small.
+                if (useMIS && cosLight > 1e-6f)
+                {
+                    float pdfLight = lightDist2 / (cosLight * totalLightArea);
+                    float pdfBrdf  = cosTheta / (float)std::numbers::pi;
+                    float w = (pdfLight * pdfLight) /
+                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                    directContrib *= w;
+                }
+                directLo += directContrib;
+            }
         }
     }
 

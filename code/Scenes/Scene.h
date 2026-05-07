@@ -24,6 +24,36 @@ namespace Scenes
         float fov = 65.f;
     };
 
+    // An area light. Either a single Plane (parallelogram) or a set of
+    // emissive Triangles (for mesh / hand-rolled triangle lights). Sampling
+    // is uniform over surface area; the renderer picks one light from the
+    // scene's list proportional to totalArea, then samples within it.
+    //
+    // The triangles in a TriangleSet light are *copies* of the underlying
+    // mesh triangles, not indices into SceneData::triangles. This avoids
+    // the BVH builder (which permutes SceneData::triangles in place)
+    // invalidating any references the lights held — ~6 MB of duplication
+    // for the bunny is a fair trade for not having to thread the BVH
+    // permutation through the lights.
+    enum class AreaLightKind { Plane, TriangleSet };
+
+    struct AreaLight
+    {
+        AreaLightKind kind = AreaLightKind::Plane;
+
+        // kind == Plane:
+        Plane plane;
+
+        // kind == TriangleSet:
+        std::vector<Triangle> triangles;
+        // Cumulative area of triangles[0..i], inclusive. cumulativeArea.back()
+        // equals totalArea. Used for binary-search picking by area.
+        std::vector<float> cumulativeArea;
+
+        // Cached. For Plane: plane.getArea(). For TriangleSet: sum.
+        float totalArea = 0.f;
+    };
+
     struct SceneData
     {
         std::string name;
@@ -36,6 +66,46 @@ namespace Scenes
         // populated. Empty when triangles is empty (the BVH builder permutes
         // `triangles` in place, so `triangles` is in BVH-leaf order after build).
         std::vector<Bvh::Node> triangleBvh;
-        Plane lightSource;
+
+        // At least one area light. Hardcoded scenes ship one Plane light to
+        // match historical behavior; JSON scenes can mark planes, triangles,
+        // and meshes with light:true and end up with multiple lights here.
+        std::vector<AreaLight> areaLights;
     };
+}
+
+namespace Scenes
+{
+    // Build an AreaLight from a single Plane primitive. Caches totalArea.
+    inline AreaLight makePlaneLight(const Plane &p)
+    {
+        AreaLight L;
+        L.kind = AreaLightKind::Plane;
+        L.plane = p;
+        L.totalArea = p.getArea();
+        return L;
+    }
+
+    // Build an AreaLight from a contiguous list of triangles. Caches per-tri
+    // cumulative area for binary-search sampling.
+    inline AreaLight makeTriangleSetLight(std::vector<Triangle> tris)
+    {
+        AreaLight L;
+        L.kind = AreaLightKind::TriangleSet;
+        L.triangles = std::move(tris);
+        L.cumulativeArea.reserve(L.triangles.size());
+        float acc = 0.f;
+        for (const auto &t : L.triangles)
+        {
+            // Triangle area = 0.5 * |e1 x e2|.
+            Vec3f e1 = t.v1 - t.v0;
+            Vec3f e2 = t.v2 - t.v0;
+            Vec3f cross = e1.cross(e2);
+            float area = 0.5f * cross.length();
+            acc += area;
+            L.cumulativeArea.push_back(acc);
+        }
+        L.totalArea = acc;
+        return L;
+    }
 }

@@ -720,9 +720,11 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, int &outLightIdx)
         gpuPlanes.push_back(gp);
     };
 
-    // Add light as planes[0] so we can refer to it by index.
-    int lightMatIdx = addMaterial(scene.lightSource.material);
-    addPlane(scene.lightSource, lightMatIdx);
+    // Add light as planes[0] so we can refer to it by index. Render() above
+    // has already enforced "exactly one plane light" for this code path.
+    const Plane &lightPlane = scene.areaLights.front().plane;
+    int lightMatIdx = addMaterial(lightPlane.material);
+    addPlane(lightPlane, lightMatIdx);
     outLightIdx = 0;
 
     for (const auto &w : scene.walls)
@@ -794,6 +796,24 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     if (!_sharedContext)
     {
         std::cerr << "GpuRenderer: no shared OpenGL context" << std::endl;
+        return;
+    }
+
+    // GPU support is plane-light-only for now. Multi-light + triangle area
+    // lights land in phase 4 alongside GPU BVH; until then the GPU binary
+    // refuses scenes that need them with a clear pointer to the CPU binary.
+    if (scene.areaLights.size() != 1 ||
+        scene.areaLights.front().kind != Scenes::AreaLightKind::Plane)
+    {
+        std::cerr << "physically-cringe-rendering: this scene uses "
+                  << scene.areaLights.size() << " light(s)";
+        if (!scene.areaLights.empty() &&
+            scene.areaLights.front().kind == Scenes::AreaLightKind::TriangleSet)
+            std::cerr << " (including a triangle/mesh light)";
+        std::cerr << ". The GPU path tracer currently supports a single "
+                  << "plane area light; multi-light + triangle-area-light "
+                  << "sampling on GPU lands in phase 4. Render this scene "
+                  << "with frank-based-rendering (CPU) instead." << std::endl;
         return;
     }
 
