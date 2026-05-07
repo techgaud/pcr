@@ -1,0 +1,46 @@
+{
+  "schema": "1.0",
+  "name": "cornell-glass",
+  "version": "1.0.0",
+
+  // Whitted-style classic: a mirror sphere on the left, a glass sphere
+  // on the right. Demonstrates the specular materials added in phase
+  // 5/6 (post-tonemap-and-aa work).
+  //
+  // Mirror = perfect specular reflection; tint via albedo.
+  // Glass  = Fresnel-weighted reflection + refraction (Snell's law).
+  //          ior 1.5 is window-glass; bump to 1.33 for water, 2.4 for
+  //          diamond-ish dispersion would need wavelength-dependent
+  //          ior which we don't model.
+
+  "camera": { "position": [0, 0, 0], "fov": 65 },
+
+  "materials": {
+    "cream":     { "albedo": [0.74, 0.74, 0.64] },
+    "red":       { "albedo": [0.63, 0.06, 0.05] },
+    "green":     { "albedo": [0.13, 0.45, 0.10] },
+    "warmlight": { "emissive": [80.0, 68.0, 48.0] },
+    "mirror":    { "albedo": [0.95, 0.95, 0.95], "metallic": true },
+    "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5 }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7], "material": "cream" },
+    { "type": "plane", "name": "back-wall",
+      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0], "material": "cream" },
+    { "type": "plane", "name": "floor",
+      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0], "material": "cream" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6], "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
+
+    { "type": "sphere", "center": [-0.7, -1.2, -4.0], "radius": 0.8, "material": "mirror" },
+    { "type": "sphere", "center": [0.8, -1.3, -3.0], "radius": 0.7, "material": "glass" },
+
+    { "type": "plane", "name": "area-light", "light": true,
+      "origin": [-0.375, 2, -4.25], "u": [0.75, 0, 0], "v": [0, 0, 0.4],
+      "material": "warmlight" }
+  ]
+}

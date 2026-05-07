@@ -102,6 +102,30 @@ namespace Scenes
                     mat.albedo = vec3FromJson(*ait, "materials." + name + ".albedo");
                 if (auto eit = m.find("emissive"); eit != m.end())
                     mat.emissive = vec3FromJson(*eit, "materials." + name + ".emissive");
+                // Specular extensions: metallic = perfect mirror,
+                // transparent = glass dielectric with Fresnel + Snell.
+                // ior is the index of refraction; only matters when
+                // transparent is true.
+                if (auto it = m.find("metallic"); it != m.end())
+                {
+                    if (!it->is_boolean())
+                        throw SceneLoaderError(path + ": materials." + name + ".metallic must be a boolean");
+                    mat.metallic = it->get<bool>();
+                }
+                if (auto it = m.find("transparent"); it != m.end())
+                {
+                    if (!it->is_boolean())
+                        throw SceneLoaderError(path + ": materials." + name + ".transparent must be a boolean");
+                    mat.transparent = it->get<bool>();
+                }
+                if (auto it = m.find("ior"); it != m.end())
+                {
+                    if (!it->is_number())
+                        throw SceneLoaderError(path + ": materials." + name + ".ior must be a number");
+                    mat.ior = it->get<float>();
+                }
+                if (mat.metallic && mat.transparent)
+                    throw SceneLoaderError(path + ": materials." + name + " cannot be both metallic and transparent");
                 out.emplace(name, mat);
             }
             if (out.empty())

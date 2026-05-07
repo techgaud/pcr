@@ -362,11 +362,73 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
     if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
         return Vec3f(0.f, 0.f, 0.f); // background color
 
-    if (ray.dir.dot(N) > 0)
+    // Capture which side of the surface we hit BEFORE flipping N — glass
+    // refraction needs to know whether we're entering (n1=air, n2=glass)
+    // or exiting (n1=glass, n2=air). Diffuse + mirror only need N facing
+    // the ray, so the flip below preserves their behavior.
+    bool entering = ray.dir.dot(N) < 0.f;
+    if (!entering)
         N = N * -1;
 
     if (material.isEmissive())
         return material.emissive;
+
+    // Perfect mirror: deterministic reflection, no diffuse contribution
+    // and no shadow rays. Albedo tints the recursive radiance.
+    if (material.metallic)
+    {
+        float cosI = -ray.dir.dot(N);
+        Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
+        Vec3f reflOrigin = hit + N * 1e-3f;
+        Vec3f recurse = castRay(Ray(reflectedDir, reflOrigin),
+                                spheres, triangles, bvh, lights, totalLightArea, depth + 1);
+        return Vec3f(recurse[0] * material.albedo[0],
+                     recurse[1] * material.albedo[1],
+                     recurse[2] * material.albedo[2]);
+    }
+
+    // Glass: Fresnel-weighted reflection vs refraction. Schlick's
+    // approximation for the Fresnel coefficient. Total internal
+    // reflection when refraction is impossible.
+    if (material.transparent)
+    {
+        float n1 = entering ? 1.0f : material.ior;
+        float n2 = entering ? material.ior : 1.0f;
+        float cosI = -ray.dir.dot(N); // positive since N faces ray
+        float eta = n1 / n2;
+        float sinT2 = eta * eta * (1.f - cosI * cosI);
+
+        Vec3f outDir;
+        Vec3f outOrigin;
+        if (sinT2 >= 1.f)
+        {
+            // Total internal reflection — only reflection survives.
+            outDir = ray.dir + N * (2.f * cosI);
+            outOrigin = hit + N * 1e-3f;
+        }
+        else
+        {
+            float cosT = std::sqrt(1.f - sinT2);
+            // Schlick's Fresnel approximation
+            float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
+            float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
+            if (NumGen::Epsilon() < F)
+            {
+                outDir = ray.dir + N * (2.f * cosI);
+                outOrigin = hit + N * 1e-3f;
+            }
+            else
+            {
+                outDir = ray.dir * eta + N * (eta * cosI - cosT);
+                outOrigin = hit - N * 1e-3f;
+            }
+        }
+        Vec3f recurse = castRay(Ray(outDir, outOrigin),
+                                spheres, triangles, bvh, lights, totalLightArea, depth + 1);
+        return Vec3f(recurse[0] * material.albedo[0],
+                     recurse[1] * material.albedo[1],
+                     recurse[2] * material.albedo[2]);
+    }
 
     Vec3f indirectLo;
 

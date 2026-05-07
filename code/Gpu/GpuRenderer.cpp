@@ -239,6 +239,10 @@ struct GpuPlane {
 struct GpuMaterial {
     vec4 albedo;          // rgb
     vec4 emissive;        // rgb
+    int  metallic;        // 0 = diffuse/glass; 1 = perfect mirror
+    int  transparent;     // 0 = opaque; 1 = glass dielectric
+    float ior;            // index of refraction (transparent only)
+    int  _pad;
 };
 
 struct GpuTriangle {
@@ -578,13 +582,62 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         int matIdx;
         if (!sceneIntersect(ro, rd, hit, N, matIdx)) break;
 
-        if (dot(rd, N) > 0.0) N = -N;
+        // Capture entering before flipping N — glass refraction needs to
+        // know whether we're going air->glass or glass->air, which the
+        // post-flip orientation alone can't tell us.
+        bool entering = dot(rd, N) < 0.0;
+        if (!entering) N = -N;
 
         GpuMaterial mat = materials[matIdx];
 
         if (any(greaterThan(mat.emissive.rgb, vec3(0.0)))) {
             radiance += throughput * mat.emissive.rgb;
             break;
+        }
+
+        // Specular: mirror = perfect reflection along the geometric normal.
+        // No diffuse contribution, no shadow rays — albedo just tints the
+        // recursive path. Continue to the next bounce.
+        if (mat.metallic != 0) {
+            rd = reflect(rd, N);
+            ro = hit + N * 1e-3;
+            throughput *= mat.albedo.rgb;
+            firstBounce = false;
+            continue;
+        }
+
+        // Specular: glass = Fresnel-weighted reflection vs refraction
+        // (Schlick's approximation), Snell's law for refraction direction.
+        // Total internal reflection when refraction is impossible.
+        if (mat.transparent != 0) {
+            float n1 = entering ? 1.0 : mat.ior;
+            float n2 = entering ? mat.ior : 1.0;
+            float eta = n1 / n2;
+            float cosI = -dot(rd, N);
+            float sinT2 = eta * eta * (1.0 - cosI * cosI);
+            vec3 newDir;
+            vec3 newOrigin;
+            if (sinT2 >= 1.0) {
+                newDir = reflect(rd, N);
+                newOrigin = hit + N * 1e-3;
+            } else {
+                float cosT = sqrt(1.0 - sinT2);
+                float F0 = (n1 - n2) / (n1 + n2);
+                F0 = F0 * F0;
+                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+                if (rand(seed) < F) {
+                    newDir = reflect(rd, N);
+                    newOrigin = hit + N * 1e-3;
+                } else {
+                    newDir = rd * eta + N * (eta * cosI - cosT);
+                    newOrigin = hit - N * 1e-3;
+                }
+            }
+            rd = newDir;
+            ro = newOrigin;
+            throughput *= mat.albedo.rgb;
+            firstBounce = false;
+            continue;
         }
 
         // Direct lighting (multi-light: pick by area, sample within).
@@ -804,6 +857,10 @@ namespace
     {
         float albedo[4];
         float emissive[4];
+        int   metallic;
+        int   transparent;
+        float ior;
+        int   _pad;
     };
     struct GpuTriangle
     {
@@ -984,6 +1041,9 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gm.emissive[0] = m.emissive[0];
         gm.emissive[1] = m.emissive[1];
         gm.emissive[2] = m.emissive[2];
+        gm.metallic = m.metallic ? 1 : 0;
+        gm.transparent = m.transparent ? 1 : 0;
+        gm.ior = m.ior;
         mats.push_back(gm);
         return (int)mats.size() - 1;
     };
