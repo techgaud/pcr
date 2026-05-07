@@ -91,9 +91,14 @@ target_link_libraries(physically-cringe-renderer-v1.0.0 PRIVATE
 
 # Static MSVC runtime so the .exe ships without VC++ Redistributable.
 # Use /SUBSYSTEM:WINDOWS so a console window doesn't pop up alongside the GUI.
+# NOMINMAX prevents <windows.h> (pulled in by portable-file-dialogs.h) from
+# defining min/max as macros that break std::min, std::numeric_limits::max,
+# etc. WIN32_LEAN_AND_MEAN trims unused Windows headers for faster compile.
 if(MSVC)
     set_property(TARGET physically-cringe-renderer-v1.0.0 PROPERTY
                  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    target_compile_definitions(physically-cringe-renderer-v1.0.0 PRIVATE
+                               NOMINMAX WIN32_LEAN_AND_MEAN)
     target_link_options(physically-cringe-renderer-v1.0.0 PRIVATE
                         "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
 endif()
