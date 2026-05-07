@@ -67,6 +67,7 @@ int main(int argc, char *argv[])
     bool useMIS = false;
     bool useRussian = false;
     bool useStratified = false;
+    bool useACES = false;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -110,6 +111,10 @@ int main(int argc, char *argv[])
     app.add_flag("--stratified", useStratified,
                  "Jittered stratified samples for the first indirect bounce. Lower "
                  "variance per sample at no extra cost.");
+    app.add_flag("--aces", useACES,
+                 "ACES filmic tone mapping (Narkowicz approximation) instead of "
+                 "the default Reinhard. Better midtone contrast; slight hue shift "
+                 "in saturated highlights. Output filename gets -aces appended.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -172,6 +177,7 @@ int main(int argc, char *argv[])
     renderer.useMIS       = useMIS;
     renderer.useRussian   = useRussian;
     renderer.useStratified = useStratified;
+    renderer.useACES      = useACES;
     renderer.render(sceneData, start, outputDir);
 
     return 0;

@@ -41,6 +41,7 @@ public:
     bool useMIS       = false;
     bool useRussian   = false;
     bool useStratified = false;
+    bool useACES      = false;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

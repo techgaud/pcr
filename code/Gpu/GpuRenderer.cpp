@@ -19,6 +19,7 @@
 // glfwGetProcAddress. ~80 lines of typedefs + loaders is cheaper than another
 // vendored library.
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -27,6 +28,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define GLFW_INCLUDE_NONE
@@ -213,6 +215,7 @@ uniform int   uUseMIS;        // 0/1
 uniform int   uUseRussian;    // 0/1
 uniform int   uUseStratified; // 0/1
 uniform int   uStrata;        // round(sqrt(uSamples)) when stratified, else 0
+uniform int   uUseACES;       // 0 = Reinhard, 1 = ACES filmic (Narkowicz)
 
 const float PI = 3.14159265358979323846;
 
@@ -658,6 +661,20 @@ vec3 reinhard(vec3 c) {
     return c / (c + vec3(1.0));
 }
 
+// Narkowicz 2015 ACES filmic approximation. Per-channel S-curve with a
+// gentle toe and shoulder; preserves midtone contrast better than the
+// Reinhard concave curve at the cost of mild hue shifts in saturated
+// highlights. Cheap (handful of muls/divs) and visually close to the
+// full ACES RRT+ODT pipeline.
+vec3 aces(vec3 x) {
+    const float A = 2.51;
+    const float B = 0.03;
+    const float C = 2.43;
+    const float D = 0.59;
+    const float E = 0.14;
+    return clamp((x * (A * x + B)) / (x * (C * x + D) + E), 0.0, 1.0);
+}
+
 void main() {
     ivec2 pix = ivec2(int(gl_GlobalInvocationID.x) + uXOffset,
                       int(gl_GlobalInvocationID.y) + uYOffset);
@@ -685,7 +702,7 @@ void main() {
         accum += tracePath(vec2(pix), r1, r2, seed);
     }
     accum /= float(uSamples);
-    accum = reinhard(accum);
+    accum = (uUseACES != 0) ? aces(accum) : reinhard(accum);
 
     imageStore(uOutput, pix, vec4(accum, 1.0));
 }
@@ -804,6 +821,45 @@ namespace
         float emissive[4];
     };
 
+    // Mirrors Renderer.cpp's compressZone — strftime("%Z") on Windows
+    // returns long Windows-registry names like "Eastern Daylight Time"
+    // instead of POSIX abbreviations. Compress to "EDT" etc. so the
+    // filename slug is the same shape across platforms.
+    std::string compressZone(const std::string &z)
+    {
+        static const std::unordered_map<std::string, std::string> map = {
+            {"Eastern Standard Time",       "EST"},
+            {"Eastern Daylight Time",       "EDT"},
+            {"Central Standard Time",       "CST"},
+            {"Central Daylight Time",       "CDT"},
+            {"Mountain Standard Time",      "MST"},
+            {"Mountain Daylight Time",      "MDT"},
+            {"Pacific Standard Time",       "PST"},
+            {"Pacific Daylight Time",       "PDT"},
+            {"Alaskan Standard Time",       "AKST"},
+            {"Alaskan Daylight Time",       "AKDT"},
+            {"Hawaiian Standard Time",      "HST"},
+            {"GMT Standard Time",           "GMT"},
+            {"GMT Daylight Time",           "BST"},
+            {"Coordinated Universal Time",  "UTC"},
+        };
+        auto it = map.find(z);
+        if (it != map.end()) return it->second;
+        // POSIX returns short forms already ("EDT", "UTC", "PST"); only
+        // multi-word inputs (Windows long names) need the fallback below.
+        if (z.find(' ') == std::string::npos) return z;
+        std::string abbrev;
+        bool atWordStart = true;
+        for (char c : z)
+        {
+            if (c == ' ') { atWordStart = true; continue; }
+            if (atWordStart && std::isalpha((unsigned char)c))
+                abbrev += (char)std::toupper((unsigned char)c);
+            atWordStart = false;
+        }
+        return abbrev.empty() ? z : abbrev;
+    }
+
     std::string formatTimestamp(bool utc)
     {
         std::time_t now = std::time(nullptr);
@@ -816,9 +872,20 @@ namespace
         else     localtime_r(&now, &tm);
 #endif
         char buf[64];
-        if (utc) std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-UTC", &tm);
-        else     std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-%Z", &tm);
-        return buf;
+        std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+        std::string out(buf);
+        if (utc)
+        {
+            out += "-UTC";
+        }
+        else
+        {
+            char zone[64];
+            std::strftime(zone, sizeof(zone), "%Z", &tm);
+            out += "-";
+            out += compressZone(zone);
+        }
+        return out;
     }
 }
 
@@ -1181,6 +1248,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     setI("uUseMIS",         useMIS ? 1 : 0);
     setI("uUseRussian",     useRussian ? 1 : 0);
     setI("uUseStratified",  useStratified ? 1 : 0);
+    setI("uUseACES",        useACES ? 1 : 0);
     setI("uStrata",         useStratified
                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
                             : 0);
@@ -1358,6 +1426,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
+    if (useACES)
+        filename += "-aces";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -1388,6 +1458,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     addText("MIS",           useMIS        ? "1" : "0");
     addText("Russian",       useRussian    ? "1" : "0");
     addText("Stratified",    useStratified ? "1" : "0");
+    addText("Tonemap",       useACES       ? "ACES" : "Reinhard");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

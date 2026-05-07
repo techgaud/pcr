@@ -35,6 +35,7 @@ public:
     bool useMIS       = false; // multiple importance sampling for direct lighting
     bool useRussian   = false; // Russian roulette path termination at depth >= 1
     bool useStratified = false; // jittered stratified samples instead of pure random
+    bool useACES      = false; // ACES filmic tone-map (default: Reinhard)
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
@@ -61,4 +62,9 @@ private:
                         const std::vector<Bvh::Node> &bvh,
                         Vec3f &hit, Vec3f &N, Material &material);
     void reinhardToneMap(Vec3f &color);
+    // Per-channel Narkowicz ACES approximation. Filmic S-curve with a
+    // gentle toe and shoulder; preserves midtone contrast better than
+    // Reinhard's smooth-concave shape, at the cost of mild hue shifts
+    // in saturated highlights.
+    void acesToneMap(Vec3f &color);
 };

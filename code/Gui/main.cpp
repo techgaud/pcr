@@ -137,6 +137,7 @@ struct Settings
     bool useMIS = false;
     bool useRussian = false;
     bool useStratified = false;
+    bool useACES = false;
 
     // Pop a debug console + log file at startup. Toggled by the Debug
     // button in the GUI top-right (or the PCR_DEBUG env var). Persisted
@@ -191,6 +192,7 @@ static void loadSettings(Settings &s)
         s.useMIS       = j.value("useMIS",       s.useMIS);
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
+        s.useACES       = j.value("useACES",       s.useACES);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
@@ -237,6 +239,7 @@ static json buildSettingsJson(const Settings &s)
     j["useMIS"]       = s.useMIS;
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
+    j["useACES"]       = s.useACES;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
     for (const auto &p : s.presets)
@@ -386,6 +389,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useMIS       = settings.useMIS;
         renderer.useRussian   = settings.useRussian;
         renderer.useStratified = settings.useStratified;
+        renderer.useACES       = settings.useACES;
         if (live)
         {
             renderer.onPartialFrame = [live](const std::vector<Vec3f> &fb, int w, int h) {
@@ -1166,6 +1170,7 @@ int main(int, char **)
         ImGui::Checkbox("MIS (light-side balance heuristic, partial)", &settings.useMIS);
         ImGui::Checkbox("Russian roulette (terminate paths at depth >= 1)", &settings.useRussian);
         ImGui::Checkbox("Stratified samples (jittered grid first bounce)", &settings.useStratified);
+        ImGui::Checkbox("ACES filmic tone-map (off = Reinhard)", &settings.useACES);
 
         ImGui::SeparatorText("Output");
         pcrSliderInt("Width", &settings.width, 64, 2160, 8, 64);

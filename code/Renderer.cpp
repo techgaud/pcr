@@ -1,3 +1,4 @@
+#include <cctype>
 #include <vector>
 #include <numbers>
 #include <iostream>
@@ -6,6 +7,7 @@
 #include <chrono>
 #include <ctime>
 #include <string>
+#include <unordered_map>
 
 #include "Bvh/Bvh.h"
 #include "Includes/Renderer.h"
@@ -20,8 +22,52 @@
 
 namespace
 {
+    // strftime("%Z") returns short abbreviations on POSIX ("EDT", "PST")
+    // but on Windows it returns the long Windows-registry name ("Eastern
+    // Daylight Time", "Pacific Standard Time"). Compress those long names
+    // into the same short form POSIX uses, so output filenames look the
+    // same across platforms.
+    std::string compressZone(const std::string &z)
+    {
+        static const std::unordered_map<std::string, std::string> map = {
+            {"Eastern Standard Time",       "EST"},
+            {"Eastern Daylight Time",       "EDT"},
+            {"Central Standard Time",       "CST"},
+            {"Central Daylight Time",       "CDT"},
+            {"Mountain Standard Time",      "MST"},
+            {"Mountain Daylight Time",      "MDT"},
+            {"Pacific Standard Time",       "PST"},
+            {"Pacific Daylight Time",       "PDT"},
+            {"Alaskan Standard Time",       "AKST"},
+            {"Alaskan Daylight Time",       "AKDT"},
+            {"Hawaiian Standard Time",      "HST"},
+            {"GMT Standard Time",           "GMT"},
+            {"GMT Daylight Time",           "BST"},
+            {"Coordinated Universal Time",  "UTC"},
+        };
+        auto it = map.find(z);
+        if (it != map.end()) return it->second;
+        // If the input has no spaces it's already an abbreviation
+        // (POSIX returns short forms like "EDT", "PST", "UTC"). Pass
+        // through.
+        if (z.find(' ') == std::string::npos) return z;
+        // Fallback: compose from the first letter of each whitespace-
+        // separated word. "Some Other Zone" -> "SOZ". Ad-hoc but better
+        // than spaces in a filename.
+        std::string abbrev;
+        bool atWordStart = true;
+        for (char c : z)
+        {
+            if (c == ' ') { atWordStart = true; continue; }
+            if (atWordStart && std::isalpha((unsigned char)c))
+                abbrev += (char)std::toupper((unsigned char)c);
+            atWordStart = false;
+        }
+        return abbrev.empty() ? z : abbrev;
+    }
+
     // Format current time as "YYYYMMDD-HHMMSS-<ZONE>". When utc=false, uses
-    // system local time and the active zone abbreviation (e.g. EDT, EST, PST).
+    // system local time and a short zone abbreviation (EDT, EST, PST, ...).
     // When utc=true, uses UTC and a literal "UTC" suffix.
     std::string formatTimestamp(bool utc)
     {
@@ -35,11 +81,20 @@ namespace
         else localtime_r(&now, &tm);
 #endif
         char buf[64];
+        std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S", &tm);
+        std::string out(buf);
         if (utc)
-            std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-UTC", &tm);
+        {
+            out += "-UTC";
+        }
         else
-            std::strftime(buf, sizeof(buf), "%Y%m%d-%H%M%S-%Z", &tm);
-        return std::string(buf);
+        {
+            char zone[64];
+            std::strftime(zone, sizeof(zone), "%Z", &tm);
+            out += "-";
+            out += compressZone(zone);
+        }
+        return out;
     }
 }
 
@@ -150,7 +205,10 @@ void Renderer::render(const Scenes::SceneData &scene,
     std::vector<unsigned char> rgb((size_t)_width * _height * 3);
     for (size_t i = 0; i < (size_t)_width * _height; i++)
     {
-        reinhardToneMap(frameBuffer[i]);
+        if (useACES)
+            acesToneMap(frameBuffer[i]);
+        else
+            reinhardToneMap(frameBuffer[i]);
 
         // gamma correction:
         // const float gamma = 2.2f;
@@ -182,6 +240,8 @@ void Renderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
+    if (useACES)
+        filename += "-aces";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
@@ -214,6 +274,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("MIS",        useMIS        ? "1" : "0");
     addText("Russian",    useRussian    ? "1" : "0");
     addText("Stratified", useStratified ? "1" : "0");
+    addText("Tonemap",    useACES       ? "ACES" : "Reinhard");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -446,6 +507,29 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
     }
 
     return closest_t < std::numeric_limits<float>::max();
+}
+
+void Renderer::acesToneMap(Vec3f &color)
+{
+    // Narkowicz 2015 ACES filmic approximation. Per-channel; cheaper than
+    // the full ACES RRT+ODT but produces an S-curve close enough for
+    // visual comparison. Some hue shift in saturated highlights — the
+    // full ACES would matrix-transform into ACES color space first to
+    // avoid that, but the per-channel form is the canonical "filmic" of
+    // realtime renderers and is what we need for a Reinhard alternative.
+    constexpr float A = 2.51f;
+    constexpr float B = 0.03f;
+    constexpr float C = 2.43f;
+    constexpr float D = 0.59f;
+    constexpr float E = 0.14f;
+    for (int i = 0; i < 3; i++)
+    {
+        float x = color[i];
+        float v = (x * (A * x + B)) / (x * (C * x + D) + E);
+        if (v < 0.f) v = 0.f;
+        if (v > 1.f) v = 1.f;
+        color[i] = v;
+    }
 }
 
 void Renderer::reinhardToneMap(Vec3f &color)
