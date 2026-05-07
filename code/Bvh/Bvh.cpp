@@ -93,7 +93,7 @@ namespace Bvh
                              });
 
             // Degenerate split (everything has the same centroid component
-            // on this axis). Bail to a leaf — the traversal cost is fine
+            // on this axis). Bail to a leaf. the traversal cost is fine
             // because rayAabb will still cull the range when possible.
             if (mid == begin || mid == end)
             {

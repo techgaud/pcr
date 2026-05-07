@@ -11,14 +11,14 @@
   //   - Camera 800 Cornell-units in front of the room's open face,
   //     scaled to 5.77 in our units. Camera at origin, room recedes
   //     from z = -5.77 (front opening) to z = -9.80 (back wall).
-  //   - 38° vertical FOV (Cornell's published value).
-  //   - Tall box: 165³ wide and deep, 330 high, rotated +17.5° around Y
+  //   - 38 deg vertical FOV (Cornell's published value).
+  //   - Tall box: 165^3 wide and deep, 330 high, rotated +17.5 deg around Y
   //     in our frame (matching cornell.json's same convention), back-left.
-  //   - Short box: 165³ cube, rotated -17.5° around Y, front-right.
+  //   - Short box: 165^3 cube, rotated -17.5 deg around Y, front-right.
   //   - Light: 130 x 105 ceiling rectangle, centered.
   //
   // Differences from cornell.json:
-  //   - cornell.json uses a wider 65° FOV with the room at z = 0 .. -6
+  //   - cornell.json uses a wider 65 deg FOV with the room at z = 0 .. -6
   //     to fill the frame at our typical camera-at-doorway framing.
   //   - cornell-spec sacrifices that for fidelity to the published data.
   //
@@ -33,7 +33,7 @@
   // reflectance data for the box. The cream "white" is genuinely
   // neutral (slightly cooler than our usual 0.74,0.74,0.64) and the
   // light is closer to D65 daylight than our usual warm-tungsten
-  // (1.0,0.85,0.6) — both choices match what canonical reference
+  // (1.0,0.85,0.6). both choices match what canonical reference
   // images of the Cornell Box look like.
   "materials": {
     "white":      { "albedo": [0.725, 0.71, 0.68] },
@@ -94,7 +94,7 @@
 
     // Coplanar with the ceiling (y=2.0). Earlier versions floated the
     // light 0.05 below the ceiling out of misplaced concern about
-    // coplanar intersection ties — but the renderer already wins those
+    // coplanar intersection ties. but the renderer already wins those
     // ties in the light's favor (Renderer pushes plane-kind area lights
     // into _planes ahead of walls). The 0.05 gap let the light's
     // double-sided emission bounce off the ceiling and create a visible

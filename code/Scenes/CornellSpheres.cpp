@@ -37,7 +37,7 @@ namespace Scenes
         s.walls.emplace_back(Vec3f{-2.f, -2.f, -6.f}, Vec3f{0, 4, 0}, Vec3f{0, 0, 6}, red);     // left wall
 
         // Center big sphere (same as base cornell), then four smaller spheres
-        // scattered around it on the floor — recovered from the original
+        // scattered around it on the floor. recovered from the original
         // commented-out vector in the pre-refactor Main.cpp.
         s.spheres.push_back(Sphere(Vec3f(0.f, -1.f, -4.5f),     0.75f, nonemissive));
         s.spheres.push_back(Sphere(Vec3f(-0.75f, -1.5f, -3.75f), 0.25f, nonemissive));

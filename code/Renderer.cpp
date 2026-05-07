@@ -109,7 +109,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                       std::chrono::steady_clock::time_point start,
                       const std::string &outputDir)
 {
-    // Scene geometry: light planes first, then walls. The order matters —
+    // Scene geometry: light planes first, then walls. The order matters.
     // when a light plane is coplanar with a wall (a ceiling-cutout light is
     // the obvious case), the iteration-order tie has to go to the light or
     // shadow rays bound for the light get falsely occluded by the wall.
@@ -166,7 +166,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                         cancelRequested->load(std::memory_order_relaxed))
                         return;
                     // Per-pixel primary-ray loop. aaSamples=1 (default) keeps
-                    // legacy behavior — one ray dead through pixel center,
+                    // legacy behavior. one ray dead through pixel center,
                     // no jitter. aaSamples>1 fires jittered primary rays
                     // across the pixel area and averages, integrating edge
                     // coverage. Welford's algorithm tracks running mean and
@@ -207,7 +207,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                         // Adaptive convergence check. After at least 4
                         // samples, stop if every channel's relative
                         // variance is below threshold. Relative form
-                        // (variance/(mean²+eps)) handles HDR scenes where
+                        // (variance/(mean^2+eps)) handles HDR scenes where
                         // a fixed absolute threshold would mis-fire on
                         // bright pixels.
                         if (useAdaptive && taken >= 4)
@@ -408,7 +408,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
         return Vec3f(0.f, 0.f, 0.f);
     }
 
-    // Capture which side of the surface we hit BEFORE flipping N — glass
+    // Capture which side of the surface we hit BEFORE flipping N. glass
     // refraction needs to know whether we're entering (n1=air, n2=glass)
     // or exiting (n1=glass, n2=air). Diffuse + mirror only need N facing
     // the ray, so the flip below preserves their behavior.
@@ -455,7 +455,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
         Vec3f outOrigin;
         if (sinT2 >= 1.f)
         {
-            // Total internal reflection — only reflection survives.
+            // Total internal reflection. only reflection survives.
             outDir = ray.dir + N * (2.f * cosI);
             outOrigin = hit + N * 1e-3f;
         }

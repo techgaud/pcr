@@ -187,7 +187,7 @@ namespace Scenes
         }
 
         // Triangle parser. v0/v1/v2 required. Optional smooth-shading normals
-        // n0/n1/n2 (all three together or none — partial smooth normals are
+        // n0/n1/n2 (all three together or none. partial smooth normals are
         // an authoring mistake we'd rather flag than silently zero out).
         Triangle parseTriangle(const json &p,
                                const std::unordered_map<std::string, Material> &mats,
@@ -298,7 +298,7 @@ namespace Scenes
         // Walk the primitives array. Each primitive contributes geometry
         // (spheres / walls / triangles) and may additionally contribute an
         // AreaLight when flagged "light": true. The "exactly one light" rule
-        // changed to "at least one light" in phase 3b — multiple plane,
+        // changed to "at least one light" in phase 3b. multiple plane,
         // triangle, and mesh lights can coexist now, and the renderer picks
         // among them proportional to area.
         //
@@ -350,7 +350,7 @@ namespace Scenes
                     Plane pl = parsePlane(p, mats, fieldPath, path);
                     if (isLight)
                     {
-                        // Light planes go ONLY to areaLights — the renderer
+                        // Light planes go ONLY to areaLights. the renderer
                         // promotes them to _planes ahead of walls so coplanar
                         // ties (e.g. a ceiling-cutout light) are won by the
                         // light. Adding them to walls too would lose the tie
@@ -416,7 +416,7 @@ namespace Scenes
         auto materials = parseMaterials(j, path);
         parsePrimitives(j, materials, out, path);
         // parsePrimitives may have grown `materials` from MTL files that
-        // OBJ meshes pull in, but we don't surface those to the caller —
+        // OBJ meshes pull in, but we don't surface those to the caller.
         // primitives reference them only via the registry above.
 
         // Build the BVH now so renders don't pay the cost (and so the GPU

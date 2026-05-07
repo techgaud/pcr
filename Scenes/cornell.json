@@ -5,13 +5,13 @@
 
   // Classic Cornell Box, proportions matched to the canonical Goral-1984
   // reference (cf. http://www.graphics.cornell.edu/online/box/data.html):
-  //   tall box  = 0.3W x 0.6H x 0.3D of room (165 x 330 x 165 of 555³),
-  //               rotated +18° around Y, back-left.
-  //   short box = 0.3W x 0.3H x 0.3D of room (165³ cube),
-  //               rotated -18° around Y, front-right.
+  //   tall box  = 0.3W x 0.6H x 0.3D of room (165 x 330 x 165 of 555^3),
+  //               rotated +18 deg around Y, back-left.
+  //   short box = 0.3W x 0.3H x 0.3D of room (165^3 cube),
+  //               rotated -18 deg around Y, front-right.
   //
   // Our room is 4 wide x 4 tall x 6 deep, so: tall = 1.2 x 2.4 x 1.2,
-  // short = 1.2³. Scaled-up from v1.0.0's half-sized boxes that didn't
+  // short = 1.2^3. Scaled-up from v1.0.0's half-sized boxes that didn't
   // match the canonical reference image.
 
   "camera": { "position": [0, 0, 0], "fov": 65 },
@@ -35,7 +35,7 @@
     { "type": "plane", "name": "left-wall",
       "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
 
-    // Tall box. Center (-0.7, -0.8, -4.0), size 1.2 x 2.4 x 1.2, +18°.
+    // Tall box. Center (-0.7, -0.8, -4.0), size 1.2 x 2.4 x 1.2, +18 deg.
     // Plane params generated via the regenerate-boxes Python helper in
     // the commit that introduced this; if you change size/center/angle,
     // regenerate rather than hand-edit.
@@ -58,7 +58,7 @@
       "origin": [-0.3148, -2.0, -4.756], "u": [0.3708, 0, 1.1413], "v": [0, 2.4, 0],
       "material": "cream" },
 
-    // Short box. Center (0.7, -1.4, -2.7), size 1.2 x 1.2 x 1.2, -18°.
+    // Short box. Center (0.7, -1.4, -2.7), size 1.2 x 1.2 x 1.2, -18 deg.
     { "type": "plane", "name": "short-bottom",
       "origin": [0.3148, -2.0, -3.456], "u": [1.1413, 0, 0.3708], "v": [-0.3708, 0, 1.1413],
       "material": "cream" },

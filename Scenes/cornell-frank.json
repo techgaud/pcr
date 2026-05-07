@@ -3,7 +3,7 @@
   // so a 2.x file would not be parsed by a 1.x binary.
   "schema": "1.0",
 
-  // Cornell box with a single sphere on the floor — the in-house variant
+  // Cornell box with a single sphere on the floor. the in-house variant
   // that shipped as the original "cornell" scene through phase 4. Renamed
   // to cornell-frank when the canonical two-boxes scene took over the
   // "cornell" name. Same geometry, fresh name → version reset to 1.0.0.

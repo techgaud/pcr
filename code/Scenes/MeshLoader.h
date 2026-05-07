@@ -33,7 +33,7 @@ namespace Scenes
     // Loads the OBJ at `objPath`, applies transform from `opts`, returns the
     // resulting triangles. Triangle materials reference names in `materials`;
     // any MTL materials referenced by the OBJ are added to `materials` under
-    // their MTL-given names (overwriting any existing entry with that name —
+    // their MTL-given names (overwriting any existing entry with that name.
     // JSON authors who care about the resolution rule should override per-
     // mesh via opts.materialOverride or pre-define materials in JSON to
     // shadow MTL-side names).

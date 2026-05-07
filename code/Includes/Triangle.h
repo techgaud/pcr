@@ -6,13 +6,13 @@
 #include "Ray.h"
 #include "Material.h"
 
-// Triangle primitive with Möller-Trumbore ray intersect. Optional per-vertex
+// Triangle primitive with Moller-Trumbore ray intersect. Optional per-vertex
 // normals enable smooth (interpolated) shading; without them the triangle uses
 // the flat geometric normal (cross product of two edges, computed once at
 // construction).
 //
 // The renderer treats triangles like spheres for scene intersection (linear
-// search, no spatial acceleration yet — phase 2 lands a BVH). Direct-light
+// search, no spatial acceleration yet. phase 2 lands a BVH). Direct-light
 // sampling on triangles is not yet implemented; emissive triangles still emit
 // when hit by indirect paths but won't be sampled explicitly via shadow rays.
 class Triangle
@@ -51,9 +51,9 @@ public:
     bool smooth;
     Material material;
 
-    // Möller-Trumbore. Returns true if the ray hits the triangle within
+    // Moller-Trumbore. Returns true if the ray hits the triangle within
     // (EPS, closest_t). On hit, fills t0 (param distance), hit (world-space
-    // hit position), and N (shading normal — interpolated when smooth, flat
+    // hit position), and N (shading normal. interpolated when smooth, flat
     // otherwise; the renderer flips it to face the ray afterward).
     bool intersect(const Ray &ray, Vec3f &hit, Vec3f &N,
                    float &t0, const float &closest_t) const

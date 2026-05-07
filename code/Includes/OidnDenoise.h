@@ -10,7 +10,7 @@
 // existing 5x5 bilateral or print a "not available" error.
 //
 // Operates on HDR float radiance values (pre-tone-mapping). Aux buffers
-// (albedo, normal) are optional — pass empty vectors and OIDN runs in
+// (albedo, normal) are optional. pass empty vectors and OIDN runs in
 // plain-RGB mode (lower quality, but still better than no denoise).
 namespace OidnDenoise
 {

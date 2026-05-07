@@ -1,4 +1,4 @@
-// GpuRenderer — OpenGL 4.3 compute shader path tracer.
+// GpuRenderer. OpenGL 4.3 compute shader path tracer.
 //
 // Architecture:
 //   - Scene -> SSBOs (one each for spheres, planes, materials)
@@ -359,7 +359,7 @@ bool intersectSphere(vec3 ro, vec3 rd, vec3 center, float radius, out float t) {
     return true;
 }
 
-// Möller-Trumbore. Mirrors CPU code in Includes/Triangle.h. Returns the
+// Moller-Trumbore. Mirrors CPU code in Includes/Triangle.h. Returns the
 // shading normal (smooth-interpolated when t.smooth_ != 0, flat otherwise);
 // the renderer flips it to face the ray after the call, like every other
 // primitive in this scene.
@@ -572,7 +572,7 @@ void sampleAreaLight(inout uint seed,
 )GLSL"
 // MSVC has a 16380-byte limit on a single string literal. The GLSL source
 // crosses that around phase 4 once BVH traversal + multi-light sampling
-// land, so split into two adjacent literals — C++ concatenates them at
+// land, so split into two adjacent literals. C++ concatenates them at
 // compile time. Pick a clean function boundary so the source still reads
 // linearly.
 R"GLSL(
@@ -597,7 +597,7 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         int matIdx;
         if (!sceneIntersect(ro, rd, hit, N, matIdx)) break;
 
-        // Capture entering before flipping N — glass refraction needs to
+        // Capture entering before flipping N. glass refraction needs to
         // know whether we're going air->glass or glass->air, which the
         // post-flip orientation alone can't tell us.
         bool entering = dot(rd, N) < 0.0;
@@ -611,7 +611,7 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         }
 
         // Specular: mirror = perfect reflection along the geometric normal.
-        // No diffuse contribution, no shadow rays — albedo just tints the
+        // No diffuse contribution, no shadow rays. albedo just tints the
         // recursive path. Continue to the next bounce.
         if (mat.metallic != 0) {
             rd = reflect(rd, N);
@@ -931,7 +931,7 @@ namespace
         float emissive[4];
     };
 
-    // Mirrors Renderer.cpp's compressZone — strftime("%Z") on Windows
+    // Mirrors Renderer.cpp's compressZone. strftime("%Z") on Windows
     // returns long Windows-registry names like "Eastern Daylight Time"
     // instead of POSIX abbreviations. Compress to "EDT" etc. so the
     // filename slug is the same shape across platforms.
@@ -1390,7 +1390,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // Dispatch in 2D tiles so we stay well under any GPU TDR (Timeout
     // Detection and Recovery) window. Windows defaults to a 2-second TDR;
     // a single dispatch that exceeds that is killed by the driver, taking
-    // the whole process with it (no exception, no GL error — the kernel
+    // the whole process with it (no exception, no GL error. the kernel
     // just resets the GPU).
     //
     // 1D row-strip dispatch (the previous approach) hits a floor of 1 row
@@ -1399,7 +1399,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // both dimensions, so a Picture-class render on a 70k-tri mesh at 1080
     // dispatches small enough chunks regardless of resolution.
     //
-    // Tile size is computed from per-pixel work × BVH overhead. The
+    // Tile size is computed from per-pixel work x BVH overhead. The
     // target below sets the per-dispatch budget. Lower = shorter tile
     // times = more cold-start margin against the 2-sec Windows TDR
     // cliff. The previous 0.5-sec target hit TDR in practice because
@@ -1409,8 +1409,8 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // variance across the image means some tiles do more work than
     // the average.
     //
-    // Calibration source: cornell-spheres at 1080² × 393216 work units
-    // took 245 sec ≈ 1.87e9 work-units-per-second.
+    // Calibration source: cornell-spheres at 1080^2 x 393216 work units
+    // took 245 sec ~ 1.87e9 work-units-per-second.
     //
     // aaSamples multiplies primary-ray count; folds into per-pixel work
     // for tile sizing so AA-enabled renders shrink tiles to compensate.
@@ -1421,7 +1421,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // Spheres + planes are linear in count; triangles go through the BVH
     // at log(N/leafSize) cost. Without this multiplier, tile sizing
     // assumes a baseline-cornell scene (~7 primitives) and over-sizes
-    // tiles for plane-heavy scenes — cornell-spec with 18 primitives
+    // tiles for plane-heavy scenes. cornell-spec with 18 primitives
     // hits TDR at the same tile size that cornell handles fine.
     constexpr double kBaselinePrimitives = 7.0; // cornell baseline
     int primCount = (int)scene.spheres.size() + (int)scene.walls.size();

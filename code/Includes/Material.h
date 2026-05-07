@@ -12,7 +12,7 @@ struct Material
     Vec3f emissive{0, 0, 0};
 
     // Perfect mirror (specular reflection only, no diffuse). albedo tints
-    // the reflected radiance — set to (1,1,1) for a neutral mirror, or
+    // the reflected radiance. set to (1,1,1) for a neutral mirror, or
     // (0.95, 0.65, 0.3) for a tinted gold-ish mirror.
     bool metallic = false;
 

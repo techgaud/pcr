@@ -40,7 +40,7 @@ public:
     // Per-pixel primary-ray count for anti-aliasing. 1 = no AA (one ray
     // dead through pixel center, current behavior). >1 = jittered primary
     // rays sampled across the pixel area, results averaged. Linear cost
-    // multiplier (aaSamples=4 → 4× total render time).
+    // multiplier (aaSamples=4 -> 4x total render time).
     int aaSamples = 1;
 
     // Adaptive sampling: within the per-pixel AA loop, track running
@@ -55,7 +55,7 @@ public:
     // 5x5 bilateral filter when on. Runs on the HDR pre-tone-map
     // framebuffer with optional albedo + normal aux buffers, which the
     // renderer also outputs at primary-ray first hit. Build-time gated
-    // by PCR_USE_OIDN — when not built with it, OidnDenoise::denoise is
+    // by PCR_USE_OIDN. when not built with it, OidnDenoise::denoise is
     // a no-op and the flag prints a warning.
     bool useOIDN = false;
 

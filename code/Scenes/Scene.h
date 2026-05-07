@@ -15,7 +15,7 @@ namespace Scenes
     // where the camera sits and what FOV it sees, so a single binary can
     // render scenes with different framings without recompiling.
     //
-    // The viewing direction is fixed (-Z forward, +Y up) — the renderer
+    // The viewing direction is fixed (-Z forward, +Y up). the renderer
     // hasn't grown a lookAt/up basis yet. Adding those fields here later
     // is non-breaking; renderers can default them when absent.
     struct Camera
@@ -32,7 +32,7 @@ namespace Scenes
     // The triangles in a TriangleSet light are *copies* of the underlying
     // mesh triangles, not indices into SceneData::triangles. This avoids
     // the BVH builder (which permutes SceneData::triangles in place)
-    // invalidating any references the lights held — ~6 MB of duplication
+    // invalidating any references the lights held. ~6 MB of duplication
     // for the bunny is a fair trade for not having to thread the BVH
     // permutation through the lights.
     enum class AreaLightKind { Plane, TriangleSet };

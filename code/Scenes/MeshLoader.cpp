@@ -11,7 +11,7 @@
 //   - light:true on a mesh primitive is rejected upstream in SceneLoader;
 //     phase 3b adds triangle area-light sampling so meshes can be lights.
 //   - Non-uniform scale is supported but normals get only rotated (not
-//     inverse-transposed scaled) — sheared meshes will have subtly wrong
+//     inverse-transposed scaled). sheared meshes will have subtly wrong
 //     shading. Uniform scale is correct.
 
 #include "MeshLoader.h"
@@ -136,7 +136,7 @@ namespace Scenes
                 !m.specular_texname.empty())
             {
                 std::fprintf(stderr,
-                             "warning: %s material '%s' references textures (map_Kd/etc) — "
+                             "warning: %s material '%s' references textures (map_Kd/etc). "
                              "ignored; texture support lands in phase 5\n",
                              objPath.c_str(), m.name.c_str());
             }
@@ -210,7 +210,7 @@ namespace Scenes
                     }
                     // If no MTL material at all and no override, the JSON
                     // author hasn't told us what color the mesh is. Fall
-                    // back to mid-grey rather than aborting — they'll see
+                    // back to mid-grey rather than aborting. they'll see
                     // it and add an override. Loud silence.
                     if (mtls.empty() && !opts.hasMaterialOverride)
                     {

@@ -1,4 +1,4 @@
-// pcr GUI — shared source for both binaries.
+// pcr GUI. shared source for both binaries.
 //
 // Same source is built twice with different compile-time defines:
 //   frank-based-rendering         PCR_USE_GPU=0   (CPU path tracer)
@@ -98,7 +98,7 @@ struct Preset
 };
 
 // Per-binary defaults. The GPU is fast enough that "Picture" can sensibly
-// crank to 6 bounces / 2048 samples / 32 shadow rays — that takes ~4 min on
+// crank to 6 bounces / 2048 samples / 32 shadow rays. that takes ~4 min on
 // a Threadripper-class GPU. The CPU "Picture" stays at 4/256/8 because the
 // same settings on CPU would take many hours.
 static std::vector<Preset> defaultPresets()
@@ -158,7 +158,7 @@ struct Settings
 static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
 
 #ifdef _WIN32
-// Forward decls for the activity-log helpers below — runRender (further up
+// Forward decls for the activity-log helpers below. runRender (further up
 // in the file than the helpers themselves) calls them inside #ifdef _WIN32
 // blocks. Linux/GCC builds skip those blocks entirely, but MSVC compiles
 // them and needs visible declarations before the call sites.
@@ -229,7 +229,7 @@ static void loadSettings(Settings &s)
 
 // Build the JSON representation of the current Settings. Pulled out of
 // saveSettings so we can capture a snapshot at startup, compare to the
-// snapshot at exit, and skip writing the file if nothing changed —
+// snapshot at exit, and skip writing the file if nothing changed.
 // avoids creating a settings file for users who never customize anything.
 static json buildSettingsJson(const Settings &s)
 {
@@ -452,7 +452,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.render(sceneData, start, outDir);
         job->finishedPath = renderer.lastOutputPath;
 #ifdef _WIN32
-        // Render returned without crashing — the activity log can go.
+        // Render returned without crashing. the activity log can go.
         clearActivity();
 #endif
     }
@@ -473,7 +473,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 // --- PNG tEXt chunk reader ----------------------------------------------
 //
 // Returns the (key, value) pairs from any tEXt chunks in the PNG. Skips
-// zTXt (compressed) and iTXt (international) — we only write tEXt from the
+// zTXt (compressed) and iTXt (international). we only write tEXt from the
 // renderer, so this is enough.
 static std::vector<std::pair<std::string, std::string>>
 readPngTextChunks(const std::string &path)
@@ -563,7 +563,7 @@ static void freeImage(LoadedImage &img)
 // --- Render-time estimator -----------------------------------------------
 //
 // Very rough. Models per-pixel work as linear in samples * depth (NOT
-// samples^depth — branched paths terminate fast in practice via emissive
+// samples^depth. branched paths terminate fast in practice via emissive
 // hits, scene exits, and Russian roulette, so the worst-case-fanout model
 // dramatically over-estimates at high sample counts). Per-target coefficient
 // is calibrated from one measured point on the dev hardware.
@@ -620,7 +620,7 @@ static std::string formatDurationMs(double ms)
         long long h = (long long)((ms - (double)d * kDay) / kHour);
         std::snprintf(buf, sizeof(buf), "~%lld days %lld hr", d, h);
     } else {
-        std::snprintf(buf, sizeof(buf), "(very long — try fewer samples)");
+        std::snprintf(buf, sizeof(buf), "(very long, try fewer samples)");
     }
     return buf;
 }
@@ -628,7 +628,7 @@ static std::string formatDurationMs(double ms)
 // --- Open path in OS file manager / image viewer ------------------------
 //
 // Best-effort. Uses xdg-open on Linux, open on macOS, ShellExecute on
-// Windows. Failures are silent — the buttons are conveniences, not core.
+// Windows. Failures are silent. the buttons are conveniences, not core.
 static void openWithSystem(const std::string &path)
 {
     if (path.empty()) return;
@@ -672,7 +672,7 @@ static bool pcrSliderInt(const char *label, int *v, int min, int max,
         changed = true;
 
     // Arrow-key handling fires only while the slider is hovered, not the
-    // input — when typing in the input field, arrows should move the cursor.
+    // input. when typing in the input field, arrows should move the cursor.
     if (sliderHovered)
     {
         int delta = 0;
@@ -709,7 +709,7 @@ static void glfwErrorCallback(int err, const char *desc)
 #ifdef _WIN32
 // Activity log: a tiny "what was the renderer doing" file that we write
 // at render start and delete on clean exit. If the process dies before
-// the delete runs (the canonical TDR case — Windows kernel hard-resets
+// the delete runs (the canonical TDR case. Windows kernel hard-resets
 // the GPU and terminates us, no exception filter ever fires), the file
 // survives. The next launch finds it and shows a MessageBox so the user
 // gets some signal that the previous run died and what it was rendering.
@@ -744,7 +744,7 @@ static void reportPreviousCrash()
     std::string body =
         "The previous run was forcibly terminated.\n\n"
         "Last activity:\n" + content + "\n\n"
-        "We can't capture the actual error from inside the process — when "
+        "We can't capture the actual error from inside the process. When "
         "this happens it's almost always a Windows kernel-level GPU reset "
         "(TDR), and the kernel kills the process before any of our error-"
         "reporting code runs. There's no exception to catch, no GL error "
@@ -754,19 +754,19 @@ static void reportPreviousCrash()
         "  2. Windows Logs -> System.\n"
         "  3. Look for an Error/Warning in the last few minutes from\n"
         "     source nvlddmkm / amdkmdag / Display.\n\n"
-        "If those events appear, it's TDR — the GPU watchdog killed a "
+        "If those events appear, it's TDR. The GPU watchdog killed a "
         "single dispatch that took longer than ~2 seconds. Common fixes: "
         "lower preset, smaller samples, smaller resolution.\n\n"
         "If those events DON'T appear, the failure was something else "
         "(driver bug, memory pressure, our code). Click the Debug button "
-        "in the top-right before the next render — that pops a console "
+        "in the top-right before the next render. That pops a console "
         "with renderer error output.";
     MessageBoxA(nullptr, body.c_str(),
-                PCR_BINARY_NAME " — previous run crashed",
+                PCR_BINARY_NAME ": previous run crashed",
                 MB_OK | MB_ICONWARNING);
 }
 
-// In-process unhandled exception (segfault, divide-by-zero, etc. — NOT
+// In-process unhandled exception (segfault, divide-by-zero, etc.. NOT
 // TDR; TDR doesn't go through SEH). Show a MessageBox with what we know
 // before unwinding. The activity-log path also fires for these because
 // we don't get to clearActivity().
@@ -783,7 +783,7 @@ static LONG WINAPI unhandledExceptionFilter(EXCEPTION_POINTERS *ep)
                   ep->ExceptionRecord->ExceptionCode,
                   ep->ExceptionRecord->ExceptionAddress,
                   PCR_BINARY_NAME);
-    MessageBoxA(nullptr, buf, PCR_BINARY_NAME " — crashed",
+    MessageBoxA(nullptr, buf, PCR_BINARY_NAME ": crashed",
                 MB_OK | MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -795,7 +795,7 @@ static bool openDebugConsole()
 {
     if (GetConsoleWindow() != nullptr) return false; // already attached
     if (!AllocConsole()) return false;
-    SetConsoleTitleA(PCR_BINARY_NAME " — debug log");
+    SetConsoleTitleA(PCR_BINARY_NAME ": debug log");
     SetConsoleCtrlHandler([](DWORD ev) -> BOOL {
         return ev == CTRL_CLOSE_EVENT;
     }, TRUE);
@@ -854,7 +854,7 @@ int main(int, char **)
 {
     pcrSetupLibSearch();
 #ifdef _WIN32
-    // Default behavior is silent — no popup console, no log file. The GUI
+    // Default behavior is silent. no popup console, no log file. The GUI
     // is the GUI. Two diagnostic hooks layered on top:
     //
     //  - reportPreviousCrash() shows a MessageBox if the previous launch
@@ -865,12 +865,12 @@ int main(int, char **)
     //
     // PCR_DEBUG=1 in the environment opts back into the always-on
     // console + tee'd log file for cases where the crash output isn't
-    // enough — typically when developing rather than just rendering.
+    // enough. typically when developing rather than just rendering.
     SetUnhandledExceptionFilter(unhandledExceptionFilter);
     reportPreviousCrash();
 #endif
 
-    // Load settings early — debug-mode opt-in lives in there, and we want
+    // Load settings early. debug-mode opt-in lives in there, and we want
     // the console to pop before any renderer activity starts. Snapshot
     // the loaded JSON so we can skip writing the file on exit if the user
     // never customized anything (avoids creating <binary>.json by default
@@ -1025,7 +1025,7 @@ int main(int, char **)
             // Debug button: toggles persistent debugMode. On Windows,
             // turning ON immediately allocates a console + log file
             // (handy when you want output for the render you're about
-            // to start). Turning OFF only persists for next launch —
+            // to start). Turning OFF only persists for next launch.
             // closing an already-allocated console mid-session would
             // leave stderr pointed at a dead handle.
             if (settings.debugMode)
@@ -1103,9 +1103,9 @@ int main(int, char **)
                 if (ImGui::IsItemHovered())
                 {
                     if (s.source == Scenes::DiscoveredScene::Source::Hardcoded)
-                        ImGui::SetTooltip("v%s — built into binary", s.version.c_str());
+                        ImGui::SetTooltip("v%s, built into binary", s.version.c_str());
                     else
-                        ImGui::SetTooltip("v%s — %s", s.version.c_str(), s.filePath.c_str());
+                        ImGui::SetTooltip("v%s: %s", s.version.c_str(), s.filePath.c_str());
                 }
             }
             ImGui::EndCombo();

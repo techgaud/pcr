@@ -40,7 +40,7 @@ namespace Bvh
     std::vector<Node> build(std::vector<Triangle> &triangles);
 
     // Closest-hit traversal. Iterative with a fixed-size stack (64 covers
-    // any practical BVH depth — even an adversarially-skewed object-median
+    // any practical BVH depth. even an adversarially-skewed object-median
     // tree over 2^64 triangles fits).
     //
     // Returns true if any triangle in [0, closest_t) is hit; sets hit/N/

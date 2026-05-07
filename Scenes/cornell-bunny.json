@@ -33,7 +33,7 @@
     // Stanford bunny: 69k triangles. bbox is roughly x in [-0.095, 0.061],
     // y in [0.033, 0.187], z in [-0.062, 0.059] (units arbitrary, treat as
     // meters). Scaled 8x and positioned so feet land on the cornell floor
-    // (y=-2), centered laterally and rotated 180° around Y so the bunny
+    // (y=-2), centered laterally and rotated 180 deg around Y so the bunny
     // faces the camera instead of the back wall.
     { "type": "mesh",
       "file": "../models/stanford-bunny.obj",
