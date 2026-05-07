@@ -73,7 +73,13 @@ endif()
 #
 # On Windows there's no RPATH; DllSearch.h calls SetDllDirectory("lib")
 # at process startup to add the lib/ subdir to the loader search path.
-# OIDN's main DLL then dlopens its device plugins out of the same dir.
+# That call runs in main(), AFTER the Windows image loader has already
+# resolved the .exe's import table, so it can't be used for normally-
+# imported DLLs. To work around: /DELAYLOAD OpenImageDenoise.dll on
+# MSVC, which makes the DLL lazy-loaded on first OIDN call. By that
+# time main() has run and the search path includes lib/. OIDN's main
+# DLL then dlopens its device plugins out of the same dir, also via
+# the SetDllDirectory path.
 #
 # No-op when PCR_USE_OIDN=OFF.
 function(pcr_link_oidn target)
@@ -83,6 +89,12 @@ function(pcr_link_oidn target)
     target_link_libraries(${target} PRIVATE oidn::oidn)
     target_compile_definitions(${target} PRIVATE PCR_HAVE_OIDN)
     if(WIN32)
+        if(MSVC)
+            target_link_options(${target} PRIVATE
+                /DELAYLOAD:OpenImageDenoise.dll
+            )
+            target_link_libraries(${target} PRIVATE delayimp)
+        endif()
         foreach(_dll ${OIDN_RUNTIME_DLLS})
             get_filename_component(_dll_name ${_dll} NAME)
             add_custom_command(TARGET ${target} POST_BUILD
