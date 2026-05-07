@@ -1,13 +1,18 @@
 {
   "schema": "1.0",
   "name": "cornell",
-  "version": "1.0.0",
+  "version": "1.1.0",
 
-  // Classic Cornell Box: two cream cubes on the floor, the tall one back-
-  // left rotated +18° around Y, the short one front-right rotated -18°.
-  // Matches the canonical 1985 reference image (Goral, Torrance, Greenberg,
-  // Battaile) modulo coordinate-system fitting to our 4x4x6 room. No sphere
-  // — for the sphere variant see cornell-frank.json.
+  // Classic Cornell Box, proportions matched to the canonical Goral-1984
+  // reference (cf. http://www.graphics.cornell.edu/online/box/data.html):
+  //   tall box  = 0.3W x 0.6H x 0.3D of room (165 x 330 x 165 of 555³),
+  //               rotated +18° around Y, back-left.
+  //   short box = 0.3W x 0.3H x 0.3D of room (165³ cube),
+  //               rotated -18° around Y, front-right.
+  //
+  // Our room is 4 wide x 4 tall x 6 deep, so: tall = 1.2 x 2.4 x 1.2,
+  // short = 1.2³. Scaled-up from v1.0.0's half-sized boxes that didn't
+  // match the canonical reference image.
 
   "camera": { "position": [0, 0, 0], "fov": 65 },
 
@@ -30,50 +35,47 @@
     { "type": "plane", "name": "left-wall",
       "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
 
-    // Tall box. Center (-0.6, -1.4, -3.7), size 0.6x1.2x0.6, rotated +18°
-    // around Y. Plane params computed offline; see comment in the next
-    // box block for what the rotation produces.
+    // Tall box. Center (-0.7, -0.8, -4.0), size 1.2 x 2.4 x 1.2, +18°.
+    // Plane params generated via the regenerate-boxes Python helper in
+    // the commit that introduced this; if you change size/center/angle,
+    // regenerate rather than hand-edit.
     { "type": "plane", "name": "tall-bottom",
-      "origin": [-0.978, -2.0, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0.1854, 0, 0.5706],
+      "origin": [-1.456, -2.0, -4.3852], "u": [1.1413, 0, -0.3708], "v": [0.3708, 0, 1.1413],
       "material": "cream" },
     { "type": "plane", "name": "tall-top",
-      "origin": [-0.978, -0.8, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0.1854, 0, 0.5706],
+      "origin": [-1.456, 0.4, -4.3852], "u": [1.1413, 0, -0.3708], "v": [0.3708, 0, 1.1413],
       "material": "cream" },
     { "type": "plane", "name": "tall-back",
-      "origin": [-0.978, -2.0, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0, 1.2, 0],
+      "origin": [-1.456, -2.0, -4.3852], "u": [1.1413, 0, -0.3708], "v": [0, 2.4, 0],
       "material": "cream" },
     { "type": "plane", "name": "tall-front",
-      "origin": [-0.7926, -2.0, -3.322], "u": [0.5706, 0, -0.1854], "v": [0, 1.2, 0],
+      "origin": [-1.0852, -2.0, -3.244], "u": [1.1413, 0, -0.3708], "v": [0, 2.4, 0],
       "material": "cream" },
     { "type": "plane", "name": "tall-left",
-      "origin": [-0.978, -2.0, -3.8926], "u": [0.1854, 0, 0.5706], "v": [0, 1.2, 0],
+      "origin": [-1.456, -2.0, -4.3852], "u": [0.3708, 0, 1.1413], "v": [0, 2.4, 0],
       "material": "cream" },
     { "type": "plane", "name": "tall-right",
-      "origin": [-0.4074, -2.0, -4.078], "u": [0.1854, 0, 0.5706], "v": [0, 1.2, 0],
+      "origin": [-0.3148, -2.0, -4.756], "u": [0.3708, 0, 1.1413], "v": [0, 2.4, 0],
       "material": "cream" },
 
-    // Short box. Center (0.6, -1.7, -2.7), size 0.6x0.6x0.6, rotated -18°.
-    // u/v vectors are the box's local edges after rotation; the constants
-    // are cos(18°)*0.6 = 0.5706 and sin(18°)*0.6 = 0.1854. JSON edits-by-
-    // hand are a pain — if you tweak the size or angle, regenerate via
-    // the Python helper in the commit message rather than redo the math.
+    // Short box. Center (0.7, -1.4, -2.7), size 1.2 x 1.2 x 1.2, -18°.
     { "type": "plane", "name": "short-bottom",
-      "origin": [0.4074, -2.0, -3.078], "u": [0.5706, 0, 0.1854], "v": [-0.1854, 0, 0.5706],
+      "origin": [0.3148, -2.0, -3.456], "u": [1.1413, 0, 0.3708], "v": [-0.3708, 0, 1.1413],
       "material": "cream" },
     { "type": "plane", "name": "short-top",
-      "origin": [0.4074, -1.4, -3.078], "u": [0.5706, 0, 0.1854], "v": [-0.1854, 0, 0.5706],
+      "origin": [0.3148, -0.8, -3.456], "u": [1.1413, 0, 0.3708], "v": [-0.3708, 0, 1.1413],
       "material": "cream" },
     { "type": "plane", "name": "short-back",
-      "origin": [0.4074, -2.0, -3.078], "u": [0.5706, 0, 0.1854], "v": [0, 0.6, 0],
+      "origin": [0.3148, -2.0, -3.456], "u": [1.1413, 0, 0.3708], "v": [0, 1.2, 0],
       "material": "cream" },
     { "type": "plane", "name": "short-front",
-      "origin": [0.222, -2.0, -2.5074], "u": [0.5706, 0, 0.1854], "v": [0, 0.6, 0],
+      "origin": [-0.056, -2.0, -2.3148], "u": [1.1413, 0, 0.3708], "v": [0, 1.2, 0],
       "material": "cream" },
     { "type": "plane", "name": "short-left",
-      "origin": [0.4074, -2.0, -3.078], "u": [-0.1854, 0, 0.5706], "v": [0, 0.6, 0],
+      "origin": [0.3148, -2.0, -3.456], "u": [-0.3708, 0, 1.1413], "v": [0, 1.2, 0],
       "material": "cream" },
     { "type": "plane", "name": "short-right",
-      "origin": [0.978, -2.0, -2.8926], "u": [-0.1854, 0, 0.5706], "v": [0, 0.6, 0],
+      "origin": [1.456, -2.0, -3.0852], "u": [-0.3708, 0, 1.1413], "v": [0, 1.2, 0],
       "material": "cream" },
 
     { "type": "plane", "name": "area-light", "light": true,
