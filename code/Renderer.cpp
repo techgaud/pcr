@@ -87,8 +87,30 @@ void Renderer::render(const Scenes::SceneData &scene,
             } });
     }
 
+    // Snapshot thread for live preview. Wakes ~2 Hz while workers run, calls
+    // user callback with the current (still-mutating) framebuffer. Tearing on
+    // a few pixels per frame is acceptable for preview. Inactive when no
+    // callback is registered (the common CLI path).
+    std::atomic<bool> rendering{true};
+    std::thread snapshotThread;
+    if (onPartialFrame)
+    {
+        snapshotThread = std::thread([&]() {
+            while (rendering.load(std::memory_order_relaxed))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (!rendering.load(std::memory_order_relaxed)) break;
+                onPartialFrame(frameBuffer, _width, _height);
+            }
+        });
+    }
+
     for (auto &t : threads)
         t.join();
+
+    rendering.store(false, std::memory_order_relaxed);
+    if (snapshotThread.joinable())
+        snapshotThread.join();
 
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
     {
