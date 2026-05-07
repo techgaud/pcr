@@ -1,57 +1,81 @@
 {
-  // Schema version of this file format. The loader rejects mismatched majors,
-  // so a 2.x file would not be parsed by a 1.x binary.
   "schema": "1.0",
-
-  // Scene name + version. The version bakes into output filenames and PNG
-  // metadata, so bump it when geometry changes meaningfully.
-  //
-  // 1.1.0: first JSON-authored cornell. Geometry identical to the 1.0.0
-  //        C++-baked fallback; the version bump signals that this came from
-  //        the JSON path, so PNG provenance is unambiguous.
   "name": "cornell",
-  "version": "1.1.0",
+  "version": "1.0.0",
 
-  "camera": {
-    "position": [0, 0, 0],
-    "fov": 65
-  },
+  // Classic Cornell Box: two cream cubes on the floor, the tall one back-
+  // left rotated +18° around Y, the short one front-right rotated -18°.
+  // Matches the canonical 1985 reference image (Goral, Torrance, Greenberg,
+  // Battaile) modulo coordinate-system fitting to our 4x4x6 room. No sphere
+  // — for the sphere variant see cornell-frank.json.
+
+  "camera": { "position": [0, 0, 0], "fov": 65 },
 
   "materials": {
-    "cream":      { "albedo": [0.74, 0.74, 0.64] },
-    "red":        { "albedo": [0.63, 0.06, 0.05] },
-    "green":      { "albedo": [0.13, 0.45, 0.10] },
-    "nonemissive":{ "albedo": [0.40, 0.40, 0.30] },
-    // Pre-multiplied warm light (1.0, 0.85, 0.6 * 80).
-    "warmlight":  { "emissive": [80.0, 68.0, 48.0] }
+    "cream":     { "albedo": [0.74, 0.74, 0.64] },
+    "red":       { "albedo": [0.63, 0.06, 0.05] },
+    "green":     { "albedo": [0.13, 0.45, 0.10] },
+    "warmlight": { "emissive": [80.0, 68.0, 48.0] }
   },
 
   "primitives": [
     { "type": "plane", "name": "ceiling",
-      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7],
-      "material": "cream" },
-
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7], "material": "cream" },
     { "type": "plane", "name": "back-wall",
-      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0],
-      "material": "cream" },
-
+      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0], "material": "cream" },
     { "type": "plane", "name": "floor",
-      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0],
+      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0], "material": "cream" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6], "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
+
+    // Tall box. Center (-0.6, -1.4, -3.7), size 0.6x1.2x0.6, rotated +18°
+    // around Y. Plane params computed offline; see comment in the next
+    // box block for what the rotation produces.
+    { "type": "plane", "name": "tall-bottom",
+      "origin": [-0.978, -2.0, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0.1854, 0, 0.5706],
+      "material": "cream" },
+    { "type": "plane", "name": "tall-top",
+      "origin": [-0.978, -0.8, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0.1854, 0, 0.5706],
+      "material": "cream" },
+    { "type": "plane", "name": "tall-back",
+      "origin": [-0.978, -2.0, -3.8926], "u": [0.5706, 0, -0.1854], "v": [0, 1.2, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "tall-front",
+      "origin": [-0.7926, -2.0, -3.322], "u": [0.5706, 0, -0.1854], "v": [0, 1.2, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "tall-left",
+      "origin": [-0.978, -2.0, -3.8926], "u": [0.1854, 0, 0.5706], "v": [0, 1.2, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "tall-right",
+      "origin": [-0.4074, -2.0, -4.078], "u": [0.1854, 0, 0.5706], "v": [0, 1.2, 0],
       "material": "cream" },
 
-    { "type": "plane", "name": "right-wall",
-      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6],
-      "material": "green" },
+    // Short box. Center (0.6, -1.7, -2.7), size 0.6x0.6x0.6, rotated -18°.
+    // u/v vectors are the box's local edges after rotation; the constants
+    // are cos(18°)*0.6 = 0.5706 and sin(18°)*0.6 = 0.1854. JSON edits-by-
+    // hand are a pain — if you tweak the size or angle, regenerate via
+    // the Python helper in the commit message rather than redo the math.
+    { "type": "plane", "name": "short-bottom",
+      "origin": [0.4074, -2.0, -3.078], "u": [0.5706, 0, 0.1854], "v": [-0.1854, 0, 0.5706],
+      "material": "cream" },
+    { "type": "plane", "name": "short-top",
+      "origin": [0.4074, -1.4, -3.078], "u": [0.5706, 0, 0.1854], "v": [-0.1854, 0, 0.5706],
+      "material": "cream" },
+    { "type": "plane", "name": "short-back",
+      "origin": [0.4074, -2.0, -3.078], "u": [0.5706, 0, 0.1854], "v": [0, 0.6, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "short-front",
+      "origin": [0.222, -2.0, -2.5074], "u": [0.5706, 0, 0.1854], "v": [0, 0.6, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "short-left",
+      "origin": [0.4074, -2.0, -3.078], "u": [-0.1854, 0, 0.5706], "v": [0, 0.6, 0],
+      "material": "cream" },
+    { "type": "plane", "name": "short-right",
+      "origin": [0.978, -2.0, -2.8926], "u": [-0.1854, 0, 0.5706], "v": [0, 0.6, 0],
+      "material": "cream" },
 
-    { "type": "plane", "name": "left-wall",
-      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6],
-      "material": "red" },
-
-    { "type": "sphere", "name": "center-sphere",
-      "center": [0, -1, -4.5], "radius": 0.75,
-      "material": "nonemissive" },
-
-    // Single area light, must be exactly one. Ceiling rectangle.
     { "type": "plane", "name": "area-light", "light": true,
       "origin": [-0.375, 2, -4.25], "u": [0.75, 0, 0], "v": [0, 0, 0.4],
       "material": "warmlight" }
