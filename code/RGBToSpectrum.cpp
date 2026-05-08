@@ -47,15 +47,17 @@ namespace RGBToSpectrum
         return true;
     }
 
-    void fitCoefficients(const Vec3f &targetXYZ,
-                         float &outC0, float &outC1, float &outC2)
+    // Newton-Raphson core. Refines a starting (cIn[0], cIn[1], cIn[2]) toward
+    // sigmoid-polynomial coefficients whose integrated XYZ matches targetXYZ.
+    // Writes the converged coefficients to cOut.
+    static void newtonFit(const Vec3f &targetXYZ, const float cIn[3], float cOut[3])
     {
         constexpr float kLambdaMid  = 0.5f * (Spectrum::kLambdaMin + Spectrum::kLambdaMax);
         constexpr float kLambdaHalf = 0.5f * (Spectrum::kLambdaMax - Spectrum::kLambdaMin);
         constexpr int   kMaxIter    = 15;
         constexpr float kTolerance  = 1e-6f;
 
-        float c[3] = {0.f, 0.f, 0.f};
+        float c[3] = {cIn[0], cIn[1], cIn[2]};
 
         for (int iter = 0; iter < kMaxIter; iter++)
         {
@@ -144,7 +146,101 @@ namespace RGBToSpectrum
             }
         }
 
-        outC0 = c[0]; outC1 = c[1]; outC2 = c[2];
+        cOut[0] = c[0]; cOut[1] = c[1]; cOut[2] = c[2];
+    }
+
+    // Spike detector: max sample value over median sample value across the
+    // 61-sample reflectance. A smooth physical reflectance has max/median in
+    // the 1-10x range. The pathological spike-of-near-zero spectra Newton
+    // can converge to for gamut-edge sRGB colors have max/median in the
+    // hundreds or thousands, which is what kills Monte Carlo convergence in
+    // the path tracer (most rays sample wavelengths off the spike, return
+    // ~zero throughput, walls render black even after many samples).
+    static float spikiness(const float c[3])
+    {
+        Spectrum s = Spectrum::fromSigmoidCoefficients(c[0], c[1], c[2]);
+        float samples[Spectrum::kSamples];
+        float maxV = 0.f;
+        for (int i = 0; i < Spectrum::kSamples; i++)
+        {
+            samples[i] = s[i];
+            if (samples[i] > maxV) maxV = samples[i];
+        }
+        std::nth_element(samples, samples + Spectrum::kSamples / 2,
+                         samples + Spectrum::kSamples);
+        float median = samples[Spectrum::kSamples / 2];
+        if (median < 1e-8f) return (maxV < 1e-8f) ? 1.f : 1e30f;
+        return maxV / median;
+    }
+
+    void fitCoefficients(const Vec3f &targetXYZ,
+                         float &outC0, float &outC1, float &outC2)
+    {
+        // Cold-start Newton-Raphson on the Jakob 2019 sigmoid-polynomial
+        // objective has multiple local minima for saturated chromatic
+        // targets: a smooth physically-plausible reflectance and a tall
+        // narrow spike-of-zero that integrates to the same XYZ but
+        // renders as black under Monte Carlo path tracing. From any cold
+        // initial guess, Newton's quickest descent path is into the
+        // spike basin.
+        //
+        // The fix Jakob's reference implementation (mitsuba-renderer/
+        // rgb2spec) uses is HOMOTOPY/CONTINUATION: solve an easy
+        // desaturated problem first (where only the smooth basin
+        // exists), then walk the target along a chromaticity ramp toward
+        // the real RGB, warm-starting Newton from the previous solution
+        // each step. The smooth basin tracks continuously; Newton can't
+        // jump into the spike basin because each tiny step keeps it
+        // close to where it already was.
+        //
+        // Easy starting target: gray with the same Y as the real target.
+        // The sRGB->XYZ matrix row sums are exactly the D65 white point
+        // (Xn = 0.95046, Yn = 1.0, Zn = 1.08906), so for RGB = (Y, Y, Y)
+        // the corresponding XYZ is (Y*Xn, Y, Y*Zn).
+        constexpr float kXn = 0.95046f;
+        constexpr float kZn = 1.08906f;
+        Vec3f xyzGray(targetXYZ[1] * kXn, targetXYZ[1], targetXYZ[1] * kZn);
+
+        // Initial guess: flat spectrum integrating to target luminance.
+        // For gray targets that's already the answer; the homotopy loop
+        // below converges in one Newton step. For chromatic targets the
+        // flat fit gets refined in many small steps as we walk the
+        // target toward its real chromaticity.
+        static const float kYBarIntegral = []() {
+            float sum = 0.f;
+            for (int i = 0; i < Spectrum::kSamples; i++)
+                sum += CIE::yBar(Spectrum::lambdaAt(i));
+            return sum * Spectrum::kStep;
+        }();
+        float c[3] = {sigmoidInverse(targetXYZ[1] / kYBarIntegral), 0.f, 0.f};
+
+        // Walk the chromaticity ramp from gray to the real target. Save the
+        // last "good" (smooth) coefficients along the way; if the homotopy
+        // path eventually crosses into the spike basin (which it does for
+        // sRGB gamut-edge colors that have no smooth representation in the
+        // sigmoid-of-quadratic family), we return the last smooth fit
+        // rather than the spiky exact-XYZ fit. The visual cost is mild
+        // desaturation on highly chromatic surfaces; the alternative is
+        // those surfaces rendering black under Monte Carlo path tracing.
+        constexpr int kHomotopySteps = 32;
+        constexpr float kSpikeThreshold = 200.f;
+        float lastGoodC[3] = {c[0], c[1], c[2]};
+        for (int step = 1; step <= kHomotopySteps; step++)
+        {
+            float t = (float)step / (float)kHomotopySteps;
+            Vec3f xyzCurr(
+                (1.f - t) * xyzGray[0] + t * targetXYZ[0],
+                (1.f - t) * xyzGray[1] + t * targetXYZ[1],
+                (1.f - t) * xyzGray[2] + t * targetXYZ[2]
+            );
+            float cNext[3];
+            newtonFit(xyzCurr, c, cNext);
+            if (spikiness(cNext) > kSpikeThreshold) break;
+            c[0] = cNext[0]; c[1] = cNext[1]; c[2] = cNext[2];
+            lastGoodC[0] = c[0]; lastGoodC[1] = c[1]; lastGoodC[2] = c[2];
+        }
+
+        outC0 = lastGoodC[0]; outC1 = lastGoodC[1]; outC2 = lastGoodC[2];
     }
 
     Spectrum fitSpectrum(const Vec3f &rgbLinear)

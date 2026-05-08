@@ -48,6 +48,18 @@ namespace RGBToSpectrum
         return 0.5f / (t * std::sqrt(t));
     }
 
+    // Inverse of sigmoid above: given a target output y in (0, 1),
+    // return x with sigmoid(x) = y. Solving 2(y - 0.5) = x/sqrt(1+x^2)
+    // gives x = u/sqrt(1-u^2) where u = 2y - 1. Used by fitCoefficients
+    // to seed Newton-Raphson at a flat spectrum near the target's
+    // luminance, which keeps the solver in the smooth-solution basin.
+    inline float sigmoidInverse(float y)
+    {
+        y = std::clamp(y, 1e-4f, 1.f - 1e-4f);
+        float u = 2.f * y - 1.f;
+        return u / std::sqrt(1.f - u * u);
+    }
+
     // Solve the 3x3 system Jx = b in-place (Cramer's rule). Returns
     // false if J is numerically singular. Defined in RGBToSpectrum.cpp.
     bool solve3x3(const float J[3][3], const float b[3], float x[3]);
