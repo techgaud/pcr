@@ -839,11 +839,16 @@ R"GLSL(
 // come from the caller after Snell's-law refraction at glass).
 //
 // remainingDepth bounds how many more bounces this sub-path can
-// take. The caller passes uDepth - alreadyTakenBounces - 1 so the
-// total path length (counting the glass bounce itself) stays at
-// uDepth.
+// take. parentBounce is the global path-depth count from the parent
+// at the point of the glass split, so Russian roulette in the sub-
+// path fires at the same global depth as the CPU recursion-based
+// castRaySpectral does. Without it, sub-paths effectively reset RR
+// depth and run with lower termination probability than a non-glass
+// path of the same length, biasing variance asymmetrically across
+// glass surfaces.
 float tracePathSpectralSingle(vec3 ro, vec3 rd, float lambda,
-                              int remainingDepth, inout uint seed) {
+                              int remainingDepth, int parentBounce,
+                              inout uint seed) {
     float throughput = 1.0;
     float radiance = 0.0;
     bool firstBounce = true;
@@ -957,7 +962,7 @@ float tracePathSpectralSingle(vec3 ro, vec3 rd, float lambda,
         }
         radiance += throughput * directLo;
 
-        if (uUseRussian != 0 && bounce >= 1) {
+        if (uUseRussian != 0 && (bounce + parentBounce) >= 1) {
             float p = clamp(albedoLam, 0.05, 0.95);
             if (rand(seed) > p) break;
             throughput /= p;
@@ -1082,7 +1087,8 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
                     }
                 }
                 float subRad = tracePathSpectralSingle(newOrigin, newDir, lam,
-                                                       remainingDepth, seed);
+                                                       remainingDepth, bounce + 1,
+                                                       seed);
                 splitRad[k] = subRad * albedoAt(matIdx, lam);
             }
             radiance += throughput * splitRad;
