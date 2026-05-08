@@ -26,6 +26,11 @@ endif()
 # MSVC even with /GL re-enabled.
 if(MSVC)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+    # Force MSBuild to invoke cl.exe per-file rather than batched
+    # across multiple .cpp files. The batched codegen ("Generating
+    # Code...") was crashing on the spectral codebase; per-file
+    # compile sidesteps it.
+    add_compile_options(/MP)
 endif()
 
 find_package(Threads REQUIRED)
@@ -156,6 +161,8 @@ set(PCR_RENDERER_SOURCES
     Scenes/MeshLoader.cpp
     Bvh/Bvh.cpp
     OidnDenoise.cpp
+    CIE.cpp
+    RGBToSpectrum.cpp
 )
 
 # --- Scene file deployment ----------------------------------------------

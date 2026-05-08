@@ -53,26 +53,8 @@ namespace CIE
     }
 
     // Integrate a sampled spectrum against the CIE 1931 observer to
-    // produce CIE XYZ tristimulus values. Riemann-sum on the
-    // Spectrum's discretization (5 nm steps from 400-700 nm).
-    //
-    // The kSampleStep multiplier is the dlambda factor that turns
-    // a sum of samples into an integral approximation. It's a
-    // global scale that ultimately gets folded into the final
-    // exposure constant; we keep it here for dimensional honesty.
-    inline Vec3f spectrumToXYZ(const Spectrum &s)
-    {
-        float X = 0.f, Y = 0.f, Z = 0.f;
-        for (int i = 0; i < Spectrum::kSamples; i++)
-        {
-            float lambda = Spectrum::lambdaAt(i);
-            float v = s[i];
-            X += v * xBar(lambda);
-            Y += v * yBar(lambda);
-            Z += v * zBar(lambda);
-        }
-        return Vec3f(X * Spectrum::kStep, Y * Spectrum::kStep, Z * Spectrum::kStep);
-    }
+    // produce CIE XYZ tristimulus values. Defined in CIE.cpp.
+    Vec3f spectrumToXYZ(const Spectrum &s);
 
     // Linear sRGB to CIE XYZ (D65 white point). Inverse of the
     // matrix below; used by RGBToSpectrum to convert a target RGB
@@ -106,11 +88,9 @@ namespace CIE
     }
 
     // Convenience: end-to-end Spectrum -> linear sRGB. The path
-    // tracer's accumulator goes here before tone-map.
-    inline Vec3f spectrumToLinearSRGB(const Spectrum &s)
-    {
-        return xyzToLinearSRGB(spectrumToXYZ(s));
-    }
+    // tracer's accumulator goes here before tone-map. Defined in
+    // CIE.cpp.
+    Vec3f spectrumToLinearSRGB(const Spectrum &s);
 
     // Single-wavelength variant: when a path tracer is in single-
     // lambda mode, each ray contributes scalar radiance(lambda) to a
