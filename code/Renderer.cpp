@@ -194,20 +194,39 @@ void Renderer::render(const Scenes::SceneData &scene,
                         Vec3f c;
                         if (useSpectral)
                         {
-                            // Single-wavelength path. Pick lambda
-                            // uniformly in [400, 700] nm; scale of
-                            // the XYZ contribution carries the lambda
-                            // sampling pdf so the absolute brightness
-                            // matches the full-spectrum integral.
-                            float lambda = Spectrum::kLambdaMin
-                                         + NumGen::Epsilon() * (Spectrum::kLambdaMax - Spectrum::kLambdaMin);
-                            float radL = castRaySpectral(ray, scene.spheres, scene.triangles, scene.triangleBvh,
-                                                         scene.areaLights, totalLightArea, 0, lambda,
-                                                         albOut, nrmOut);
-                            // Mean accumulator runs in XYZ for spectral mode;
-                            // we convert mean -> linear sRGB once after the
-                            // AA loop, when frameBuffer gets written below.
-                            c = CIE::singleLambdaXYZ(lambda, radL);
+                            // Hero wavelength sampling. Pick a hero
+                            // lambda uniformly in [400, 700] nm; the
+                            // other 3 lambdas are stratified offsets
+                            // wrapped around the visible range, so
+                            // the 4 channels collectively cover the
+                            // whole spectrum on every ray. Path
+                            // geometry is shared; per-channel scalar
+                            // multiplies happen inside castRaySpectral.
+                            constexpr float kSpan = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
+                            constexpr float kStride = kSpan / (float)kHeroLambdaCount;
+                            SpectralSample lambdas;
+                            lambdas[0] = Spectrum::kLambdaMin + NumGen::Epsilon() * kSpan;
+                            for (int k = 1; k < kHeroLambdaCount; k++)
+                            {
+                                float l = lambdas[0] + kStride * k;
+                                if (l > Spectrum::kLambdaMax) l -= kSpan;
+                                lambdas[k] = l;
+                            }
+                            SpectralSample rad = castRaySpectral(ray, scene.spheres, scene.triangles, scene.triangleBvh,
+                                                                 scene.areaLights, totalLightArea, 0, lambdas,
+                                                                 albOut, nrmOut);
+                            // Convert each (lambda, radiance) to a
+                            // CIE XYZ contribution, average across
+                            // the N channels (1/N is the lambda-
+                            // sampling weight for the hero scheme).
+                            // Mean accumulator runs in XYZ; we
+                            // convert mean -> linear sRGB once after
+                            // the AA loop, when frameBuffer gets
+                            // written below.
+                            Vec3f xyz(0.f, 0.f, 0.f);
+                            for (int k = 0; k < kHeroLambdaCount; k++)
+                                xyz = xyz + CIE::singleLambdaXYZ(lambdas[k], rad[k]);
+                            c = xyz / (float)kHeroLambdaCount;
                         }
                         else
                         {
@@ -645,54 +664,61 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
     return directLo / _shadowSamples + indirectLo;
 }
 
-float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
-                                const std::vector<Triangle> &triangles,
-                                const std::vector<Bvh::Node> &bvh,
-                                const std::vector<Scenes::AreaLight> &lights,
-                                float totalLightArea, int depth, float lambda,
-                                Vec3f *outFirstAlbedo,
-                                Vec3f *outFirstNormal)
+SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+                                         const std::vector<Triangle> &triangles,
+                                         const std::vector<Bvh::Node> &bvh,
+                                         const std::vector<Scenes::AreaLight> &lights,
+                                         float totalLightArea, int depth,
+                                         const SpectralSample &lambdas,
+                                         Vec3f *outFirstAlbedo,
+                                         Vec3f *outFirstNormal)
 {
     Material material;
     Vec3f hit, N;
 
+    SpectralSample zero{};
     if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
     {
         if (outFirstAlbedo) *outFirstAlbedo = Vec3f(0.f, 0.f, 0.f);
         if (outFirstNormal) *outFirstNormal = Vec3f(0.f, 0.f, 1.f);
-        return 0.f;
+        return zero;
     }
 
     bool entering = ray.dir.dot(N) < 0.f;
     if (!entering)
         N = N * -1;
 
-    // OIDN aux uses RGB albedo + normal regardless of render mode;
-    // OIDN itself is RGB-only, so we capture from material.albedo.
     if (outFirstAlbedo) *outFirstAlbedo = material.albedo;
     if (outFirstNormal) *outFirstNormal = N;
 
     if (material.isEmissive())
-        return material.emissiveSpectrum(lambda);
+    {
+        SpectralSample emitted;
+        for (int k = 0; k < kHeroLambdaCount; k++)
+            emitted[k] = material.emissiveSpectrum(lambdas[k]);
+        return emitted;
+    }
 
-    // Mirror: deterministic reflection. Albedo at lambda tints the
-    // recursive scalar radiance.
+    // Mirror: same path geometry across all 4 channels; per-channel
+    // multiply by albedoSpectrum at each lambda.
     if (material.metallic)
     {
         float cosI = -ray.dir.dot(N);
         Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
         Vec3f reflOrigin = hit + N * 1e-3f;
-        float recurse = castRaySpectral(Ray(reflectedDir, reflOrigin),
-                                        spheres, triangles, bvh, lights, totalLightArea,
-                                        depth + 1, lambda);
-        return recurse * material.albedoSpectrum(lambda);
+        SpectralSample recurse = castRaySpectral(Ray(reflectedDir, reflOrigin),
+                                                 spheres, triangles, bvh, lights, totalLightArea,
+                                                 depth + 1, lambdas);
+        SpectralSample out;
+        for (int k = 0; k < kHeroLambdaCount; k++)
+            out[k] = recurse[k] * material.albedoSpectrum(lambdas[k]);
+        return out;
     }
 
-    // Glass: same Fresnel-Snell logic as the RGB castRay. The
-    // refractive index ior is wavelength-independent in our model
-    // (no chromatic dispersion yet), so the branch decision at each
-    // bounce is identical to the RGB path. Albedo at lambda still
-    // tints both branches.
+    // Glass: Fresnel + Snell. ior is wavelength-independent (no
+    // dispersion yet), so all 4 channels take the same branch
+    // (reflect or refract) on the same RNG draw. Albedo at each
+    // lambda still tints per-channel.
     if (material.transparent)
     {
         float n1 = entering ? 1.0f : material.ior;
@@ -724,18 +750,21 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
                 outOrigin = hit - N * 1e-3f;
             }
         }
-        float recurse = castRaySpectral(Ray(outDir, outOrigin),
-                                        spheres, triangles, bvh, lights, totalLightArea,
-                                        depth + 1, lambda);
-        return recurse * material.albedoSpectrum(lambda);
+        SpectralSample recurse = castRaySpectral(Ray(outDir, outOrigin),
+                                                 spheres, triangles, bvh, lights, totalLightArea,
+                                                 depth + 1, lambdas);
+        SpectralSample out;
+        for (int k = 0; k < kHeroLambdaCount; k++)
+            out[k] = recurse[k] * material.albedoSpectrum(lambdas[k]);
+        return out;
     }
 
-    // Diffuse path: indirect hemisphere sampling + direct light
-    // shadow rays. Both legs multiply by the per-lambda reflectance
-    // instead of the RGB albedo vector.
-    float albedoLambda = material.albedoSpectrum(lambda);
+    // Diffuse: cache albedo at all 4 lambdas once per surface hit.
+    SpectralSample albedoLambdas;
+    for (int k = 0; k < kHeroLambdaCount; k++)
+        albedoLambdas[k] = material.albedoSpectrum(lambdas[k]);
 
-    float indirectLo = 0.f;
+    SpectralSample indirectLo{};
 
     const int strata = useStratified
                        ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
@@ -758,28 +787,30 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
         }
         auto randomRay = Ray::genRayFromIntersection(N, hit + N * 1e-3, r1, r2);
 
-        // Russian roulette uses the per-lambda reflectance for the
-        // termination probability, which is correct for the single-
-        // wavelength estimator: dimmer wavelengths terminate sooner,
-        // brighter ones survive more bounces.
+        // Russian roulette uses the hero (channel 0) reflectance so
+        // all 4 channels make the same termination decision; this
+        // keeps the path single-distribution sampled. Non-hero
+        // channels carry their own scaled throughput along.
         if (useRussian && depth >= 1)
         {
-            float p = std::min(0.95f, std::max(0.05f, albedoLambda));
+            float p = std::min(0.95f, std::max(0.05f, albedoLambdas[0]));
             if (NumGen::Epsilon() > p) continue;
-            indirectLo += castRaySpectral(randomRay, spheres, triangles, bvh, lights,
-                                          totalLightArea, depth + 1, lambda)
-                          * albedoLambda / p;
+            SpectralSample r = castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+                                               totalLightArea, depth + 1, lambdas);
+            for (int k = 0; k < kHeroLambdaCount; k++)
+                indirectLo[k] += r[k] * albedoLambdas[k] / p;
         }
         else
         {
-            indirectLo += castRaySpectral(randomRay, spheres, triangles, bvh, lights,
-                                          totalLightArea, depth + 1, lambda)
-                          * albedoLambda;
+            SpectralSample r = castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+                                               totalLightArea, depth + 1, lambdas);
+            for (int k = 0; k < kHeroLambdaCount; k++)
+                indirectLo[k] += r[k] * albedoLambdas[k];
         }
     }
-    indirectLo /= _samples;
+    for (int k = 0; k < kHeroLambdaCount; k++) indirectLo[k] /= (float)_samples;
 
-    float directLo = 0.f;
+    SpectralSample directLo{};
     if (totalLightArea > 0.f)
     {
         for (size_t i = 0; i < (size_t)_shadowSamples; i++)
@@ -796,7 +827,7 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
             }
 
             Vec3f sampleP, sampleN;
-            float sampleEmissiveLambda;
+            const Material *lightMat;
             if (picked->kind == Scenes::AreaLightKind::Plane)
             {
                 const Plane &p = picked->plane;
@@ -804,7 +835,7 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
                 float rv = NumGen::Epsilon();
                 sampleP = p.origin + p.getU() * ru + p.getV() * rv;
                 sampleN = p.N;
-                sampleEmissiveLambda = p.material.emissiveSpectrum(lambda);
+                lightMat = &p.material;
             }
             else
             {
@@ -820,7 +851,7 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
                 if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
                 sampleP = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
                 sampleN = tri.flatN;
-                sampleEmissiveLambda = tri.material.emissiveSpectrum(lambda);
+                lightMat = &tri.material;
             }
 
             Vec3f Li = sampleP - hit;
@@ -837,23 +868,29 @@ float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spher
             {
                 float cosLight = std::max(0.f, sampleN.dot(Li * -1));
                 float G = (cosTheta * cosLight) / lightDist2;
-                float directContrib = (albedoLambda / (float)std::numbers::pi)
-                                      * sampleEmissiveLambda * G * totalLightArea;
-
+                float misWeight = 1.f;
                 if (useMIS && cosLight > 1e-6f)
                 {
                     float pdfLight = lightDist2 / (cosLight * totalLightArea);
                     float pdfBrdf  = cosTheta / (float)std::numbers::pi;
-                    float w = (pdfLight * pdfLight) /
-                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
-                    directContrib *= w;
+                    misWeight = (pdfLight * pdfLight) /
+                                (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
                 }
-                directLo += directContrib;
+                for (int k = 0; k < kHeroLambdaCount; k++)
+                {
+                    float emitL = lightMat->emissiveSpectrum(lambdas[k]);
+                    float contrib = (albedoLambdas[k] / (float)std::numbers::pi)
+                                    * emitL * G * totalLightArea * misWeight;
+                    directLo[k] += contrib;
+                }
             }
         }
     }
 
-    return directLo / _shadowSamples + indirectLo;
+    SpectralSample out;
+    for (int k = 0; k < kHeroLambdaCount; k++)
+        out[k] = directLo[k] / (float)_shadowSamples + indirectLo[k];
+    return out;
 }
 
 bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -11,6 +12,18 @@
 #include "Triangle.h"
 #include "../Bvh/Bvh.h"
 #include "../Scenes/Scene.h"
+
+// Hero wavelength sampling (Wilkie et al. 2014). Each spectral ray
+// carries N wavelengths through the same path geometry, so the
+// expensive part (intersection + light sampling) is paid once per
+// path while the cheap part (per-lambda spectrum lookups + scalar
+// multiplies) is paid N times. Convergence on color noise improves
+// roughly N-fold over single-wavelength for the same wall-clock
+// cost. N=4 matches the paper's recommendation; the additional
+// lambdas are stratified offsets of the hero, wrapped around the
+// visible range so all 4 cover [400, 700] together.
+static constexpr int kHeroLambdaCount = 4;
+using SpectralSample = std::array<float, kHeroLambdaCount>;
 
 class Renderer
 {
@@ -101,21 +114,22 @@ private:
                   Vec3f *outFirstAlbedo = nullptr,
                   Vec3f *outFirstNormal = nullptr);
 
-    // Single-wavelength variant for spectral mode. Tracks scalar
-    // radiance at the given lambda through the same bounces castRay
-    // would take, sampling materials' albedoSpectrum and
-    // emissiveSpectrum at lambda instead of multiplying by the RGB
-    // albedo / emissive vectors. Aux buffers (for OIDN) capture the
-    // RGB albedo and normal at first hit, same as castRay; OIDN runs
-    // on the post-XYZ-conversion linear sRGB framebuffer regardless
-    // of mode.
-    float castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
-                          const std::vector<Triangle> &triangles,
-                          const std::vector<Bvh::Node> &bvh,
-                          const std::vector<Scenes::AreaLight> &lights,
-                          float totalLightArea, int depth, float lambda,
-                          Vec3f *outFirstAlbedo = nullptr,
-                          Vec3f *outFirstNormal = nullptr);
+    // Hero wavelength variant for spectral mode. Tracks N=4 scalar
+    // radiances at correlated wavelengths through the same path
+    // geometry, sampling materials' albedoSpectrum and
+    // emissiveSpectrum at each lambda. Russian roulette decisions
+    // and direct-light sampling use the hero (lambdas[0]) channel
+    // so the path itself is sampled from a single distribution; the
+    // other 3 channels ride along. OIDN aux captures RGB albedo +
+    // normal at first hit regardless of mode.
+    SpectralSample castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+                                   const std::vector<Triangle> &triangles,
+                                   const std::vector<Bvh::Node> &bvh,
+                                   const std::vector<Scenes::AreaLight> &lights,
+                                   float totalLightArea, int depth,
+                                   const SpectralSample &lambdas,
+                                   Vec3f *outFirstAlbedo = nullptr,
+                                   Vec3f *outFirstNormal = nullptr);
 
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
