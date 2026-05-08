@@ -74,6 +74,19 @@ namespace CIE
         return Vec3f(X * Spectrum::kStep, Y * Spectrum::kStep, Z * Spectrum::kStep);
     }
 
+    // Linear sRGB to CIE XYZ (D65 white point). Inverse of the
+    // matrix below; used by RGBToSpectrum to convert a target RGB
+    // albedo into the XYZ space the Newton-Raphson solver fits.
+    inline Vec3f linearSRGBToXYZ(const Vec3f &rgb)
+    {
+        float R = rgb[0], G = rgb[1], B = rgb[2];
+        return Vec3f(
+            0.4124564f * R + 0.3575761f * G + 0.1804375f * B,
+            0.2126729f * R + 0.7151522f * G + 0.0721750f * B,
+            0.0193339f * R + 0.1191920f * G + 0.9503041f * B
+        );
+    }
+
     // CIE XYZ to linear sRGB (D65 white point). Standard 3x3 matrix
     // from IEC 61966-2-1; reproduced in every color-management spec.
     // Output is linear-light sRGB, so the existing tone-map +

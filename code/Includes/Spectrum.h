@@ -39,6 +39,33 @@ public:
 
     explicit Spectrum(const std::array<float, kSamples> &s) : _samples{s} {}
 
+    // Build a spectrum from Jakob 2019 sigmoid-polynomial coefficients.
+    // S(lambda) = sigmoid(c0 + c1*lambda' + c2*lambda'^2) where
+    // lambda' is the wavelength normalized to [-1, 1] across the
+    // visible range. Sigmoid is the smooth saturator
+    // S(x) = 0.5 + x / (2 sqrt(1 + x^2)) which guarantees output in
+    // [0, 1] for any coefficient triple, automatically enforcing
+    // physical reflectance bounds.
+    //
+    // Used by RGBToSpectrum::fitSpectrum at scene-load time to
+    // upsample RGB albedos and emissions into spectra. The
+    // coefficients are computed once per material; the resulting
+    // Spectrum is what materials store and what the path tracer
+    // samples at runtime.
+    static Spectrum fromSigmoidCoefficients(float c0, float c1, float c2)
+    {
+        constexpr float kLambdaMid   = 0.5f * (kLambdaMin + kLambdaMax);
+        constexpr float kLambdaHalf  = 0.5f * (kLambdaMax - kLambdaMin);
+        Spectrum s;
+        for (int i = 0; i < kSamples; i++)
+        {
+            float lambdaNorm = (lambdaAt(i) - kLambdaMid) / kLambdaHalf;
+            float p = c0 + lambdaNorm * (c1 + lambdaNorm * c2);
+            s._samples[i] = 0.5f + p / (2.f * std::sqrt(1.f + p * p));
+        }
+        return s;
+    }
+
     // Wavelength of the i-th sample. Convenience for table lookups
     // when building an SPD by hand or comparing against published
     // spectral data.
