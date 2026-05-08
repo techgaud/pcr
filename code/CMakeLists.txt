@@ -26,11 +26,21 @@ endif()
 # MSVC even with /GL re-enabled.
 if(MSVC)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
-    # Force MSBuild to invoke cl.exe per-file rather than batched
-    # across multiple .cpp files. The batched codegen ("Generating
-    # Code...") was crashing on the spectral codebase; per-file
-    # compile sidesteps it.
-    add_compile_options(/MP)
+
+    # MSBuild's default Release flags include /Zi (separate PDB
+    # debug info). MSVC's PDB type-server (CL!CloseTypeServerPDB
+    # in the crash stack we kept seeing) chokes on this codebase.
+    # Strip /Zi out of Release so no type-server PDB gets opened
+    # at all. We don't ship Release-config debug info anyway, so
+    # losing /Zi here costs nothing visible.
+    string(REGEX REPLACE "/Zi" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+    string(REGEX REPLACE "/ZI" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")
+
+    # /bigobj raises the per-object-file section limit. Modern
+    # template-heavy C++ routinely exceeds the default; the
+    # spectral code with std::array<float, 61> arithmetic and
+    # Material's two-spectrum payload is a textbook trigger.
+    add_compile_options(/bigobj)
 endif()
 
 find_package(Threads REQUIRED)
