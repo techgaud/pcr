@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "CIE.h"
 #include "Spectrum.h"
@@ -69,6 +70,14 @@ namespace RGBToSpectrum
     void fitCoefficients(const Vec3f &targetXYZ,
                          float &outC0, float &outC1, float &outC2);
 
+    // Lower-level Newton-Raphson core: takes a warm-start (cIn) and
+    // produces the converged coefficients (cOut) for the given XYZ.
+    // No homotopy; the warm-start has to already be in (or near) the
+    // smooth basin. Used by the LUT builder, which warm-starts each
+    // cell from the previous brightness step. Defined in
+    // RGBToSpectrum.cpp.
+    void newtonFit(const Vec3f &targetXYZ, const float cIn[3], float cOut[3]);
+
     // Compact form for runtime spectrum evaluation: the four floats the
     // GPU needs to reconstruct a Spectrum sample at any wavelength
     // without storing the 61-sample table. evalSigmoidFit below is the
@@ -121,4 +130,67 @@ namespace RGBToSpectrum
     // Linear-sRGB albedo to a 61-sample Spectrum, suitable for
     // direct storage on a Material. Defined in RGBToSpectrum.cpp.
     Spectrum fitSpectrum(const Vec3f &rgbLinear);
+
+    // Optional precomputed lookup table (Jakob & Hanika 2019 LUT, in the
+    // shape of mitsuba-renderer/rgb2spec). Built in memory at process
+    // startup when the user passes --lut, replacing the runtime homotopy
+    // continuation in fitSigmoidCoefficients with trilinear interpolation
+    // out of a 3-axis grid covering the full sRGB gamut.
+    //
+    // The build runs fitCoefficients (homotopy) per cell. Mitsuba does
+    // something cleverer: warm-start a Gauss-Newton solver through a
+    // brightness sweep so most cells take 2-3 iterations instead of the
+    // full homotopy. Our analytical Newton-Raphson goes rank-deficient
+    // mid-sweep on saturated chromaticities (the sigmoid floors and the
+    // Jacobian collapses), so per-cell homotopy is the reliable path
+    // without porting Gauss-Newton + finite-difference Jacobian.
+    //
+    // Lookup is nanoseconds. Build is a few seconds for kRes=16. Same
+    // fit quality as the runtime homotopy - this is a precomputed cache
+    // of the same algorithm, not a gamut-edge fix. The case where the
+    // LUT wins is many-material scenes where amortizing the per-call
+    // homotopy across all materials beats running it once per material;
+    // for cornell-class scenes the build cost dominates and you should
+    // leave --lut off.
+    struct LUT
+    {
+        // Resolution per axis. 16 keeps build time tractable when each
+        // cell goes through the full homotopy (mitsuba uses warm-start
+        // through brightness with a stabler Gauss-Newton + finite-
+        // difference Jacobian; our analytical Newton-Raphson goes rank-
+        // deficient mid-chain when the sigmoid saturates, so per-cell
+        // homotopy is the reliable path for now). Trilinear interpolation
+        // between cells smooths the boundaries.
+        static constexpr int kRes = 16;
+
+        // 3 max-channel axes (R-, G-, B-dominant) x kRes brightness x
+        // kRes "x" (other-channel-1 / max) x kRes "y" (other-channel-2 /
+        // max) x 3 sigmoid coefficients (c0, c1, c2). ~12 MB at kRes=64,
+        // ~1.5 MB at kRes=32.
+        std::vector<float> data;
+
+        LUT() : data(3 * kRes * kRes * kRes * 3, 0.f) {}
+
+        // Linear address into the flat float array. (l, b, x, y, k) with
+        // k in [0, 2] selecting c0/c1/c2.
+        int linearIdx(int l, int b, int x, int y) const
+        {
+            return ((l * kRes + b) * kRes + x) * kRes * 3 + y * 3;
+        }
+    };
+
+    // Build the LUT in place. Heavy: scene-load-time investment that pays
+    // off across every fit thereafter.
+    void buildLUT(LUT &lut);
+
+    // Trilinear lookup. Replaces fitSigmoidCoefficients's runtime solver
+    // when the LUT is enabled.
+    SigmoidFit lookupSigmoidFit(const LUT &lut, const Vec3f &rgbLinear);
+
+    // Process-wide LUT pointer. Set by main() before scene load when
+    // --lut is on; left null otherwise. Material::populateSpectra (via
+    // fitSigmoidCoefficients) checks it and dispatches accordingly.
+    // Single thread of access because scene-load is serial.
+    void setActiveLUT(const LUT *lut);
+    const LUT *activeLUT();
 }

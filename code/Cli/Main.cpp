@@ -2,6 +2,7 @@
 #include <vector>
 #include <iostream>
 #include <chrono>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <filesystem>
@@ -10,6 +11,7 @@
 
 #include "Includes/CLI11.hpp"
 #include "Includes/DllSearch.h"
+#include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
 #include "Scenes/Scene.h"
 #include "Scenes/SceneDiscovery.h"
@@ -75,6 +77,7 @@ int main(int argc, char *argv[])
     bool useAdaptive = false;
     bool useOIDN = false;
     bool useSpectral = false;
+    bool useLUT = false;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -107,43 +110,47 @@ int main(int argc, char *argv[])
                  "Print all discovered scenes (hardcoded + JSON) with name, version, "
                  "and source, then exit.");
 
-    app.add_flag("--denoise", useDenoise,
+    auto *techniques = app.add_option_group(
+        "Techniques",
+        "Quality and rendering technique flags. All default off; toggle "
+        "per render via CLI flag. Most can be combined.");
+    techniques->add_flag("--denoise", useDenoise,
                  "Apply a 5x5 cross-bilateral filter to the output to reduce noise.");
-    app.add_flag("--mis", useMIS,
+    techniques->add_flag("--mis", useMIS,
                  "Multiple importance sampling on direct lighting (partial impl, "
                  "light-side weighting only). Slight effect on diffuse-only scenes.");
-    app.add_flag("--russian", useRussian,
+    techniques->add_flag("--russian", useRussian,
                  "Russian roulette path termination at depth >= 1. Cheaper paths, "
                  "unbiased estimator.");
-    app.add_flag("--stratified", useStratified,
+    techniques->add_flag("--stratified", useStratified,
                  "Jittered stratified samples for the first indirect bounce. Lower "
                  "variance per sample at no extra cost.");
-    app.add_flag("--aces", useACES,
+    techniques->add_flag("--aces", useACES,
                  "ACES filmic tone mapping (Narkowicz approximation) instead of "
                  "the default Reinhard. Better midtone contrast; slight hue shift "
                  "in saturated highlights. Output filename gets -aces appended.");
-    app.add_flag("--aa", useAA,
+    techniques->add_flag("--aa", useAA,
                  "Anti-aliasing via jittered primary rays. When set, each pixel "
                  "fires --aa-samples primary rays at sub-pixel jitters (default 4) "
                  "and averages, integrating pixel-edge coverage. Linear cost in "
                  "the AA sample count. Filename gets -aa<N> appended.");
-    app.add_option("--aa-samples", aaSamples,
+    techniques->add_option("--aa-samples", aaSamples,
                    "Number of jittered primary rays per pixel when --aa is set. "
                    "Default 4. Ignored when --aa is off.")
         ->default_str("4")
         ->check(CLI::PositiveNumber);
-    app.add_flag("--adaptive", useAdaptive,
+    techniques->add_flag("--adaptive", useAdaptive,
                  "Adaptive sampling: within the per-pixel AA loop, early-exit "
                  "once relative variance converges below threshold. Speeds up "
                  "well-converged regions at the cost of more samples in noisy "
                  "regions. Only meaningful with --aa.");
-    app.add_flag("--oidn", useOIDN,
+    techniques->add_flag("--oidn", useOIDN,
                  "Run Intel Open Image Denoise on the HDR framebuffer "
                  "before tone mapping, with albedo and shading-normal aux "
                  "buffers populated at primary-ray first hit. Replaces the "
                  "5x5 bilateral (--denoise) when both are set. Requires the "
                  "binary to be built with -DPCR_USE_OIDN=ON.");
-    app.add_flag("--spectral", useSpectral,
+    techniques->add_flag("--spectral", useSpectral,
                  "Spectral rendering mode. Each primary ray samples a "
                  "single wavelength in [400, 700] nm and tracks scalar "
                  "radiance through bounces; per-pixel CIE XYZ accumulator "
@@ -151,6 +158,24 @@ int main(int argc, char *argv[])
                  "convergence than RGB for the same sample count "
                  "(aaSamples >= 16 recommended). Output filename gets "
                  "-spectral appended.");
+
+    auto *options = app.add_option_group(
+        "Options",
+        "Configuration knobs that change how data is computed but not "
+        "the algorithmic behavior of the path tracer.");
+    options->add_flag("--lut", useLUT,
+                 "Use a precomputed lookup table for RGB-to-spectrum "
+                 "upsampling instead of running the Newton-Raphson + "
+                 "homotopy fit per material at scene-load. Builds a "
+                 "16^3 sigmoid-coefficient table at startup (~4 seconds) "
+                 "by running the fit per cell, then per-material lookup "
+                 "is trilinear interpolation in nanoseconds. Same fit "
+                 "quality as the runtime homotopy in expectation; pays "
+                 "off when scenes have hundreds-plus distinct materials "
+                 "(amortizes the per-material homotopy cost). Cornell-"
+                 "class scenes hit the build cost without the lookup "
+                 "savings, so leave it off there. Only matters in "
+                 "--spectral mode; RGB renders ignore the flag.");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -195,6 +220,24 @@ int main(int argc, char *argv[])
         for (const auto &s : registry)
             std::cerr << "  " << s.name << "\n";
         return 1;
+    }
+
+    // Build the spectral upsampling LUT if requested. Lifetime is the
+    // rest of the process - holds ~1.5 MB at the default 32^3 resolution
+    // and gets read once per material at scene-load. setActiveLUT
+    // makes it visible to RGBToSpectrum::fitSigmoidCoefficients which
+    // is what populateSpectra calls.
+    std::unique_ptr<RGBToSpectrum::LUT> lut;
+    if (useLUT)
+    {
+        std::cout << "Building RGB-to-spectrum LUT..." << std::flush;
+        auto t0 = std::chrono::steady_clock::now();
+        lut = std::make_unique<RGBToSpectrum::LUT>();
+        RGBToSpectrum::buildLUT(*lut);
+        RGBToSpectrum::setActiveLUT(lut.get());
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cout << " " << ms << " ms\n";
     }
 
     Scenes::SceneData sceneData;
