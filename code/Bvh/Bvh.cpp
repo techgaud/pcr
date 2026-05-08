@@ -150,7 +150,7 @@ namespace Bvh
     bool intersect(const std::vector<Node> &nodes,
                    const std::vector<Triangle> &triangles,
                    const Ray &ray,
-                   Vec3f &hit, Vec3f &N, Material &material,
+                   Vec3f &hit, Vec3f &N, int &matIdx,
                    float &t_out, float closest_t)
     {
         if (nodes.empty()) return false;
@@ -186,7 +186,7 @@ namespace Bvh
                     closest = tt;
                     hit = triHit;
                     N = triN;
-                    material = triangles[triIdx].material;
+                    matIdx = triangles[triIdx].matIdx;
                     anyHit = true;
                 }
             }

@@ -2,24 +2,21 @@
 
 #include "Vec3f.h"
 #include "Ray.h"
-#include "Material.h"
 
+// Material is referenced by index into SceneData::materials. See the
+// note on Sphere for context.
 class Plane
 {
 public:
     Plane() {}
-    Plane(Vec3f o, Vec3f l, Vec3f w, Material mat) : material{mat}, origin{o}, u{l}, v{w}
-    {
-        N = u.cross(v).normalize();
-    }
-    Plane(Vec3f &&o, Vec3f &&l, Vec3f &&w, Material &&mat) : material{mat}, origin{o}, u{l}, v{w}
+    Plane(Vec3f o, Vec3f l, Vec3f w, int materialIdx) : matIdx{materialIdx}, origin{o}, u{l}, v{w}
     {
         auto cross = u.cross(v);
         area = cross.length();
         N = cross.normalize();
     }
 
-    Material material;
+    int matIdx = -1;
     Vec3f origin;
     Vec3f N;
 

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "../Bvh/Bvh.h"
+#include "../Includes/Material.h"
 #include "../Includes/Sphere.h"
 #include "../Includes/Plane.h"
 #include "../Includes/Triangle.h"
@@ -59,6 +60,14 @@ namespace Scenes
         std::string name;
         std::string version;
         Camera camera;
+
+        // Materials registry. Every primitive (Sphere, Plane, Triangle,
+        // AreaLight's plane and triangle members) stores an int matIdx
+        // referencing this vector instead of a Material by value. The
+        // indirection saves ~520 bytes per primitive once spectra are on
+        // Material; for cornell-bunny that's ~35 MB recovered.
+        std::vector<Material> materials;
+
         std::vector<Sphere> spheres;
         std::vector<Plane> walls;
         std::vector<Triangle> triangles;
@@ -86,27 +95,16 @@ namespace Scenes
         return L;
     }
 
-    // Walk every Material referenced by the scene and populate its
-    // spectral counterparts (albedoSpectrum, emissiveSpectrum) from
-    // the RGB values. Called at the end of every scene-load path.
-    // Idempotent. Cheap (~10 microseconds per material via Newton-
-    // Raphson, and Cornell-class scenes have under ten materials).
+    // Populate the spectral counterparts (albedoSpectrum,
+    // emissiveSpectrum) of every Material in the scene's registry,
+    // computing each via the Newton-Raphson Jakob fit. Walks the
+    // materials vector once instead of every primitive in the scene
+    // (the old per-primitive walk did N redundant Newton-Raphson
+    // calls when N primitives shared one material; cornell-bunny had
+    // 70k of them).
     inline void populateSpectra(SceneData &s)
     {
-        for (auto &sphere : s.spheres) sphere.material.populateSpectra();
-        for (auto &wall : s.walls) wall.material.populateSpectra();
-        for (auto &tri : s.triangles) tri.material.populateSpectra();
-        for (auto &L : s.areaLights)
-        {
-            if (L.kind == AreaLightKind::Plane)
-            {
-                L.plane.material.populateSpectra();
-            }
-            else
-            {
-                for (auto &tri : L.triangles) tri.material.populateSpectra();
-            }
-        }
+        for (auto &m : s.materials) m.populateSpectra();
     }
 
     // Build an AreaLight from a contiguous list of triangles. Caches per-tri

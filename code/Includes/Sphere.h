@@ -3,15 +3,19 @@
 
 #include "Ray.h"
 #include "Vec3f.h"
-#include "Material.h"
 
+// Material is referenced by index into SceneData::materials, not stored
+// by value. The indirection saves substantial memory on mesh-heavy
+// scenes (a Triangle was ~600 bytes when it carried a full Material;
+// it's ~100 bytes now) and lets the GPU upload skip per-primitive
+// material deduplication.
 struct Sphere
 {
 public:
-    Sphere(Vec3f &&c, float r, Material &m) : center{c}, _radius{r}, material{m} {}
+    Sphere(Vec3f c, float r, int materialIdx) : center{c}, matIdx{materialIdx}, _radius{r} {}
 
     Vec3f center;
-    Material material;
+    int matIdx;
 
     bool intersect(const Ray &ray, float &t0) const
     {

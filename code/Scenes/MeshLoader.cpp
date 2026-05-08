@@ -95,9 +95,16 @@ namespace Scenes
 
     std::vector<Triangle> loadMesh(const std::string &objPath,
                                    const MeshOptions &opts,
-                                   std::unordered_map<std::string, Material> &materials)
+                                   std::vector<Material> &materials,
+                                   std::unordered_map<std::string, int> &nameToIdx)
     {
         std::vector<Triangle> result;
+        auto addMat = [&](const std::string &name, Material m) -> int {
+            int idx = (int)materials.size();
+            materials.push_back(std::move(m));
+            nameToIdx[name] = idx;
+            return idx;
+        };
 
         if (!std::filesystem::exists(objPath))
             throw SceneLoaderError("Mesh file not found: " + objPath);
@@ -143,19 +150,19 @@ namespace Scenes
             Material mat;
             mat.albedo = Vec3f(m.diffuse[0], m.diffuse[1], m.diffuse[2]);
             mat.emissive = Vec3f(m.emission[0], m.emission[1], m.emission[2]);
-            materials[m.name] = mat;
+            addMat(m.name, std::move(mat));
         }
 
         // Resolve override material once if set.
-        Material overrideMat;
+        int overrideIdx = -1;
         if (opts.hasMaterialOverride)
         {
-            auto it = materials.find(opts.materialOverride);
-            if (it == materials.end())
+            auto it = nameToIdx.find(opts.materialOverride);
+            if (it == nameToIdx.end())
                 throw SceneLoaderError("Mesh material override '" + opts.materialOverride +
                                        "' not in registry (declare it in JSON \"materials\" or "
                                        "via MTL before referencing)");
-            overrideMat = it->second;
+            overrideIdx = it->second;
         }
 
         // Walk shapes -> faces. tinyobjloader has triangulated for us so each
@@ -196,26 +203,35 @@ namespace Scenes
                 if (opts.hasSmoothOverride)
                     wantSmooth = haveNormals && opts.smoothOverride;
 
-                // Resolve material: per-face material from MTL unless an
-                // override is set. tinyobjloader assigns -1 when no MTL.
-                Material faceMat = overrideMat;
+                // Resolve material: per-face material index from MTL
+                // unless an override is set.
+                int faceMatIdx = overrideIdx;
                 if (!opts.hasMaterialOverride)
                 {
                     int mid = mesh.material_ids[f];
                     if (mid >= 0 && mid < (int)mtls.size())
                     {
-                        auto it = materials.find(mtls[mid].name);
-                        if (it != materials.end())
-                            faceMat = it->second;
+                        auto it = nameToIdx.find(mtls[mid].name);
+                        if (it != nameToIdx.end())
+                            faceMatIdx = it->second;
                     }
-                    // If no MTL material at all and no override, the JSON
-                    // author hasn't told us what color the mesh is. Fall
-                    // back to mid-grey rather than aborting. they'll see
-                    // it and add an override. Loud silence.
                     if (mtls.empty() && !opts.hasMaterialOverride)
                     {
-                        faceMat = Material{};
-                        faceMat.albedo = Vec3f(0.7f, 0.7f, 0.7f);
+                        // No MTL, no override — push a fallback grey
+                        // material once (lazily, only when we hit this
+                        // case) and reuse for every face.
+                        static const std::string kFallbackName = "__pcr_mesh_fallback_grey";
+                        auto it = nameToIdx.find(kFallbackName);
+                        if (it == nameToIdx.end())
+                        {
+                            Material fb;
+                            fb.albedo = Vec3f(0.7f, 0.7f, 0.7f);
+                            faceMatIdx = addMat(kFallbackName, std::move(fb));
+                        }
+                        else
+                        {
+                            faceMatIdx = it->second;
+                        }
                     }
                 }
 
@@ -224,11 +240,11 @@ namespace Scenes
                     Vec3f n0 = transformNormal(getNorm(idx0.normal_index), opts).normalize();
                     Vec3f n1 = transformNormal(getNorm(idx1.normal_index), opts).normalize();
                     Vec3f n2 = transformNormal(getNorm(idx2.normal_index), opts).normalize();
-                    result.emplace_back(v0, v1, v2, n0, n1, n2, faceMat);
+                    result.emplace_back(v0, v1, v2, n0, n1, n2, faceMatIdx);
                 }
                 else
                 {
-                    result.emplace_back(v0, v1, v2, faceMat);
+                    result.emplace_back(v0, v1, v2, faceMatIdx);
                 }
 
                 indexOffset += fv;

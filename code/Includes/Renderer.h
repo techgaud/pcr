@@ -106,7 +106,9 @@ private:
     // calls inside castRay leave them null so deeper bounces don't
     // overwrite. Background-hit (no intersect at depth 0) writes
     // sentinel zeros so the aux buffer doesn't get random stack values.
-    Vec3f castRay(const Ray &ray, const std::vector<Sphere> &spheres,
+    Vec3f castRay(const Ray &ray,
+                  const std::vector<Material> &materials,
+                  const std::vector<Sphere> &spheres,
                   const std::vector<Triangle> &triangles,
                   const std::vector<Bvh::Node> &bvh,
                   const std::vector<Scenes::AreaLight> &lights,
@@ -122,7 +124,9 @@ private:
     // so the path itself is sampled from a single distribution; the
     // other 3 channels ride along. OIDN aux captures RGB albedo +
     // normal at first hit regardless of mode.
-    SpectralSample castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+    SpectralSample castRaySpectral(const Ray &ray,
+                                   const std::vector<Material> &materials,
+                                   const std::vector<Sphere> &spheres,
                                    const std::vector<Triangle> &triangles,
                                    const std::vector<Bvh::Node> &bvh,
                                    const std::vector<Scenes::AreaLight> &lights,
@@ -131,8 +135,12 @@ private:
                                    Vec3f *outFirstAlbedo = nullptr,
                                    Vec3f *outFirstNormal = nullptr);
 
+    // Material lookup goes through the scene's materials registry;
+    // sceneIntersect outs the picked primitive's material index and
+    // the caller resolves to a Material reference. Saves copying a
+    // ~520-byte Material out on every intersection.
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,
-                        Vec3f &hit, Vec3f &N, Material &material);
+                        Vec3f &hit, Vec3f &N, int &matIdx);
 };

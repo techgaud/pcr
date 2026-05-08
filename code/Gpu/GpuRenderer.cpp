@@ -1544,12 +1544,14 @@ bool GpuRenderer::initGL()
 
 void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLightArea)
 {
-    // Build a flat material table: one material per scene material seen.
-    // For simplicity, materials are deduplicated by pointer identity (we
-    // copy them in sequence and reference by index). Walls and the sphere
-    // each contribute one material; the light is its own material.
+    // Material upload: one-to-one with scene.materials. The CPU side
+    // already dedupes (every primitive carries a matIdx into the
+    // shared registry), so we just translate Material -> GpuMaterial
+    // in order. SSBO indices match scene.materials indices.
     std::vector<GpuMaterial> mats;
-    auto addMaterial = [&](const Material &m) -> int {
+    mats.reserve(scene.materials.size());
+    for (const auto &m : scene.materials)
+    {
         GpuMaterial gm{};
         gm.albedo[0] = m.albedo[0];
         gm.albedo[1] = m.albedo[1];
@@ -1561,28 +1563,23 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gm.transparent = m.transparent ? 1 : 0;
         gm.ior = m.ior;
         gm.cauchyB = m.cauchyB;
-        // Copy populated spectra. populateSpectra() ran at scene-
-        // load (Material::populateSpectra inside SceneData::populateSpectra),
-        // so these are filled in by the time we get here.
         for (int i = 0; i < 61; i++)
         {
             gm.albedoSpec[i]   = m.albedoSpectrum[i];
             gm.emissiveSpec[i] = m.emissiveSpectrum[i];
         }
         mats.push_back(gm);
-        return (int)mats.size() - 1;
-    };
+    }
 
     std::vector<GpuSphere> gpuSpheres;
     for (const auto &s : scene.spheres)
     {
-        int mi = addMaterial(s.material);
         GpuSphere gs{};
         gs.center[0] = s.center[0];
         gs.center[1] = s.center[1];
         gs.center[2] = s.center[2];
         gs.center[3] = s.radius();
-        gs.matIdx = mi;
+        gs.matIdx = s.matIdx;
         gpuSpheres.push_back(gs);
     }
 
@@ -1605,32 +1602,21 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gpuPlanes.push_back(gp);
     };
 
-    // Plane lights go into the GpuPlane SSBO front-loaded so coplanar ties
-    // (cornell ceiling-cutout case) are won by the light, mirroring the CPU
-    // _planes ordering. Walls follow.
-    // Track material indices for plane-kind area lights so the
-    // spectral path can look up the picked light's emissiveSpec via
-    // sampleAreaLight's out param. TriangleSet lights track theirs
-    // per-triangle (see the lightTriangles upload below).
+    // Plane lights front-loaded so coplanar ties favor the light.
     std::vector<int> areaLightMatIdx(scene.areaLights.size(), -1);
     for (size_t li = 0; li < scene.areaLights.size(); li++)
     {
         const auto &L = scene.areaLights[li];
         if (L.kind != Scenes::AreaLightKind::Plane) continue;
-        int mi = addMaterial(L.plane.material);
-        areaLightMatIdx[li] = mi;
-        addPlane(L.plane, mi);
+        areaLightMatIdx[li] = L.plane.matIdx;
+        addPlane(L.plane, L.plane.matIdx);
     }
     for (const auto &w : scene.walls)
-    {
-        int wmi = addMaterial(w.material);
-        addPlane(w, wmi);
-    }
+        addPlane(w, w.matIdx);
 
     std::vector<GpuTriangle> gpuTris;
     for (const auto &t : scene.triangles)
     {
-        int mi = addMaterial(t.material);
         GpuTriangle gt{};
         for (int i = 0; i < 3; i++)
         {
@@ -1642,7 +1628,7 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
             gt.n2[i] = t.n2[i];
             gt.flatN[i] = t.flatN[i];
         }
-        gt.matIdx = mi;
+        gt.matIdx = t.matIdx;
         gt.smooth_ = t.smooth ? 1 : 0;
         gpuTris.push_back(gt);
     }
@@ -1714,39 +1700,36 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
             gl.kind = 0;
             const Vec3f &u = L.plane.getU();
             const Vec3f &v = L.plane.getV();
+            const Material &lightMat = scene.materials[L.plane.matIdx];
             for (int i = 0; i < 3; i++)
             {
                 gl.origin[i] = L.plane.origin[i];
                 gl.u[i] = u[i];
                 gl.v[i] = v[i];
                 gl.normal_area[i] = L.plane.N[i];
-                gl.emissive[i] = L.plane.material.emissive[i];
+                gl.emissive[i] = lightMat.emissive[i];
             }
             gl.firstTri = 0;
             gl.count = 0;
-            gl.matIdx = areaLightMatIdx[li]; // captured above
+            gl.matIdx = L.plane.matIdx;
         }
         else
         {
             gl.kind = 1;
             gl.firstTri = (int)gpuLightTris.size();
             gl.count = (int)L.triangles.size();
-            // First-triangle emissive as a representative; the GLSL
-            // sampler reads per-triangle emissive directly.
             if (!L.triangles.empty())
+            {
+                const Material &lightMat = scene.materials[L.triangles.front().matIdx];
                 for (int i = 0; i < 3; i++)
-                    gl.emissive[i] = L.triangles.front().material.emissive[i];
-            gl.matIdx = -1; // unused for TriangleSet (per-tri matIdx instead)
+                    gl.emissive[i] = lightMat.emissive[i];
+            }
+            gl.matIdx = -1; // per-triangle matIdx populated below
 
             for (size_t ti = 0; ti < L.triangles.size(); ti++)
             {
                 const Triangle &t = L.triangles[ti];
-                // Add this triangle's material to the materials SSBO so
-                // the spectral path can fetch its emissiveSpec at sample
-                // time. Duplicates with the main triangle SSBO are
-                // possible (the GPU upload doesn't dedup materials), but
-                // the cost is small for cornell-class scenes.
-                int triMi = addMaterial(t.material);
+                const Material &triMat = scene.materials[t.matIdx];
                 GpuLightTriangle glt{};
                 for (int i = 0; i < 3; i++)
                 {
@@ -1754,10 +1737,10 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
                     glt.v1[i] = t.v1[i];
                     glt.v2[i] = t.v2[i];
                     glt.flatN[i] = t.flatN[i];
-                    glt.emissive[i] = t.material.emissive[i];
+                    glt.emissive[i] = triMat.emissive[i];
                 }
                 glt.flatN[3] = L.cumulativeArea[ti];
-                glt.matIdx = triMi;
+                glt.matIdx = t.matIdx;
                 gpuLightTris.push_back(glt);
             }
         }

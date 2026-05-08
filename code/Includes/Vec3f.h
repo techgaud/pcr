@@ -82,7 +82,7 @@ public:
         return {_values[0] * scale, _values[1] * scale, _values[2] * scale};
     }
 
-    inline Vec3f operator*(Vec3f &other) const
+    inline Vec3f operator*(const Vec3f &other) const
     {
         return {_values[0] * other[0], _values[1] * other[1], _values[2] * other[2]};
     }

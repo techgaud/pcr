@@ -30,17 +30,14 @@ namespace Scenes
         bool hasSmoothOverride = false;
     };
 
-    // Loads the OBJ at `objPath`, applies transform from `opts`, returns the
-    // resulting triangles. Triangle materials reference names in `materials`;
-    // any MTL materials referenced by the OBJ are added to `materials` under
-    // their MTL-given names (overwriting any existing entry with that name.
-    // JSON authors who care about the resolution rule should override per-
-    // mesh via opts.materialOverride or pre-define materials in JSON to
-    // shadow MTL-side names).
-    //
-    // Throws Scenes::SceneLoaderError on file-not-found, parse errors, or
-    // unresolvable material references.
+    // Loads the OBJ at `objPath`, applies transform from `opts`, returns
+    // the resulting triangles with their matIdx fields populated. Any MTL
+    // materials referenced by the OBJ are pushed onto `materials` (the
+    // SceneData registry vector) and added to `nameToIdx` for subsequent
+    // resolution. Throws Scenes::SceneLoaderError on file-not-found, parse
+    // errors, or unresolvable material references.
     std::vector<Triangle> loadMesh(const std::string &objPath,
                                    const MeshOptions &opts,
-                                   std::unordered_map<std::string, Material> &materials);
+                                   std::vector<Material> &materials,
+                                   std::unordered_map<std::string, int> &nameToIdx);
 }

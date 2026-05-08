@@ -2,7 +2,6 @@
 
 #include <vector>
 
-#include "../Includes/Material.h"
 #include "../Includes/Ray.h"
 #include "../Includes/Triangle.h"
 #include "../Includes/Vec3f.h"
@@ -44,10 +43,11 @@ namespace Bvh
     // tree over 2^64 triangles fits).
     //
     // Returns true if any triangle in [0, closest_t) is hit; sets hit/N/
-    // material to the closest hit and t_out to its parametric distance.
+    // matIdx to the closest hit's material registry index, and t_out to
+    // its parametric distance.
     bool intersect(const std::vector<Node> &nodes,
                    const std::vector<Triangle> &triangles,
                    const Ray &ray,
-                   Vec3f &hit, Vec3f &N, Material &material,
+                   Vec3f &hit, Vec3f &N, int &matIdx,
                    float &t_out, float closest_t);
 }

@@ -212,7 +212,8 @@ void Renderer::render(const Scenes::SceneData &scene,
                                 if (l > Spectrum::kLambdaMax) l -= kSpan;
                                 lambdas[k] = l;
                             }
-                            SpectralSample rad = castRaySpectral(ray, scene.spheres, scene.triangles, scene.triangleBvh,
+                            SpectralSample rad = castRaySpectral(ray, scene.materials,
+                                                                 scene.spheres, scene.triangles, scene.triangleBvh,
                                                                  scene.areaLights, totalLightArea, 0, lambdas,
                                                                  albOut, nrmOut);
                             // Convert each (lambda, radiance) to a
@@ -230,7 +231,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                         }
                         else
                         {
-                            c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
+                            c = castRay(ray, scene.materials, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
                         }
                         if (albOut) albedoBuffer[i * _width + j] = firstAlbedo;
                         if (nrmOut) normalBuffer[i * _width + j] = firstNormal;
@@ -438,7 +439,9 @@ void Renderer::render(const Scenes::SceneData &scene,
     lastOutputPath = outputPath.string();
 }
 
-Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
+Vec3f Renderer::castRay(const Ray &ray,
+                        const std::vector<Material> &materials,
+                        const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,
                         const std::vector<Scenes::AreaLight> &lights,
@@ -446,58 +449,44 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                         Vec3f *outFirstAlbedo,
                         Vec3f *outFirstNormal)
 {
-    Material material;
+    int matIdx = -1;
     Vec3f hit, N;
 
-    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
+    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, matIdx))
     {
-        // Background hit: write sentinel aux so the OIDN buffer doesn't
-        // contain stack garbage for sky-pixels.
         if (outFirstAlbedo) *outFirstAlbedo = Vec3f(0.f, 0.f, 0.f);
         if (outFirstNormal) *outFirstNormal = Vec3f(0.f, 0.f, 1.f);
         return Vec3f(0.f, 0.f, 0.f);
     }
+    const Material &material = materials[matIdx];
 
-    // Capture which side of the surface we hit BEFORE flipping N. glass
-    // refraction needs to know whether we're entering (n1=air, n2=glass)
-    // or exiting (n1=glass, n2=air). Diffuse + mirror only need N facing
-    // the ray, so the flip below preserves their behavior.
     bool entering = ray.dir.dot(N) < 0.f;
     if (!entering)
         N = N * -1;
 
-    // OIDN aux at first hit. For specular materials we'd ideally capture
-    // the underlying surface's albedo (mirror's tint, glass's color);
-    // material.albedo serves that role. Normal is the geometric one
-    // facing the ray, which is what OIDN expects.
     if (outFirstAlbedo) *outFirstAlbedo = material.albedo;
     if (outFirstNormal) *outFirstNormal = N;
 
     if (material.isEmissive())
         return material.emissive;
 
-    // Perfect mirror: deterministic reflection, no diffuse contribution
-    // and no shadow rays. Albedo tints the recursive radiance.
     if (material.metallic)
     {
         float cosI = -ray.dir.dot(N);
         Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
         Vec3f reflOrigin = hit + N * 1e-3f;
-        Vec3f recurse = castRay(Ray(reflectedDir, reflOrigin),
+        Vec3f recurse = castRay(Ray(reflectedDir, reflOrigin), materials,
                                 spheres, triangles, bvh, lights, totalLightArea, depth + 1);
         return Vec3f(recurse[0] * material.albedo[0],
                      recurse[1] * material.albedo[1],
                      recurse[2] * material.albedo[2]);
     }
 
-    // Glass: Fresnel-weighted reflection vs refraction. Schlick's
-    // approximation for the Fresnel coefficient. Total internal
-    // reflection when refraction is impossible.
     if (material.transparent)
     {
         float n1 = entering ? 1.0f : material.ior;
         float n2 = entering ? material.ior : 1.0f;
-        float cosI = -ray.dir.dot(N); // positive since N faces ray
+        float cosI = -ray.dir.dot(N);
         float eta = n1 / n2;
         float sinT2 = eta * eta * (1.f - cosI * cosI);
 
@@ -505,14 +494,12 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
         Vec3f outOrigin;
         if (sinT2 >= 1.f)
         {
-            // Total internal reflection. only reflection survives.
             outDir = ray.dir + N * (2.f * cosI);
             outOrigin = hit + N * 1e-3f;
         }
         else
         {
             float cosT = std::sqrt(1.f - sinT2);
-            // Schlick's Fresnel approximation
             float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
             float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
             if (NumGen::Epsilon() < F)
@@ -526,7 +513,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                 outOrigin = hit - N * 1e-3f;
             }
         }
-        Vec3f recurse = castRay(Ray(outDir, outOrigin),
+        Vec3f recurse = castRay(Ray(outDir, outOrigin), materials,
                                 spheres, triangles, bvh, lights, totalLightArea, depth + 1);
         return Vec3f(recurse[0] * material.albedo[0],
                      recurse[1] * material.albedo[1],
@@ -567,11 +554,11 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
             float maxAlbedo = std::max({material.albedo[0], material.albedo[1], material.albedo[2]});
             float p = std::min(0.95f, std::max(0.05f, maxAlbedo));
             if (NumGen::Epsilon() > p) continue;
-            indirectLo += castRay(randomRay, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo / p;
+            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo / p;
         }
         else
         {
-            indirectLo += castRay(randomRay, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo;
+            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo;
         }
     }
     indirectLo /= _samples;
@@ -604,7 +591,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                 float rv = NumGen::Epsilon();
                 sampleP = p.origin + p.getU() * ru + p.getV() * rv;
                 sampleN = p.N;
-                sampleEmissive = p.material.emissive;
+                sampleEmissive = materials[p.matIdx].emissive;
             }
             else
             {
@@ -621,7 +608,7 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                 if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
                 sampleP = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
                 sampleN = tri.flatN;
-                sampleEmissive = tri.material.emissive;
+                sampleEmissive = materials[tri.matIdx].emissive;
             }
 
             Vec3f Li = sampleP - hit;
@@ -629,11 +616,10 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
             auto cosTheta = std::max(0.f, wi.dot(N));
             auto lightDist2 = Li.dot(Li);
 
-            // handle shadows
             auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
             Vec3f shadowHit, shadowN;
-            Material tmpMat;
-            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
+            int shadowMatIdx = -1;
+            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, shadowMatIdx) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !materials[shadowMatIdx].isEmissive();
 
             if (!inShadow)
             {
@@ -664,7 +650,9 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
     return directLo / _shadowSamples + indirectLo;
 }
 
-SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+SpectralSample Renderer::castRaySpectral(const Ray &ray,
+                                         const std::vector<Material> &materials,
+                                         const std::vector<Sphere> &spheres,
                                          const std::vector<Triangle> &triangles,
                                          const std::vector<Bvh::Node> &bvh,
                                          const std::vector<Scenes::AreaLight> &lights,
@@ -673,16 +661,18 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
                                          Vec3f *outFirstAlbedo,
                                          Vec3f *outFirstNormal)
 {
-    Material material;
+    int matIdx = -1;
     Vec3f hit, N;
 
     SpectralSample zero{};
-    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
+    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, matIdx))
     {
         if (outFirstAlbedo) *outFirstAlbedo = Vec3f(0.f, 0.f, 0.f);
         if (outFirstNormal) *outFirstNormal = Vec3f(0.f, 0.f, 1.f);
         return zero;
     }
+
+    const Material &material = materials[matIdx];
 
     bool entering = ray.dir.dot(N) < 0.f;
     if (!entering)
@@ -699,14 +689,12 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
         return emitted;
     }
 
-    // Mirror: same path geometry across all 4 channels; per-channel
-    // multiply by albedoSpectrum at each lambda.
     if (material.metallic)
     {
         float cosI = -ray.dir.dot(N);
         Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
         Vec3f reflOrigin = hit + N * 1e-3f;
-        SpectralSample recurse = castRaySpectral(Ray(reflectedDir, reflOrigin),
+        SpectralSample recurse = castRaySpectral(Ray(reflectedDir, reflOrigin), materials,
                                                  spheres, triangles, bvh, lights, totalLightArea,
                                                  depth + 1, lambdas);
         SpectralSample out;
@@ -771,7 +759,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
             // the same value when all lambdas agree).
             SpectralSample singleLambdas;
             singleLambdas.fill(lambdas[k]);
-            SpectralSample r = castRaySpectral(Ray(outDir, outOrigin),
+            SpectralSample r = castRaySpectral(Ray(outDir, outOrigin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
                                                depth + 1, singleLambdas);
             out[k] = r[0] * material.albedoSpectrum(lambdas[k]);
@@ -815,14 +803,14 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
         {
             float p = std::min(0.95f, std::max(0.05f, albedoLambdas[0]));
             if (NumGen::Epsilon() > p) continue;
-            SpectralSample r = castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+            SpectralSample r = castRaySpectral(randomRay, materials, spheres, triangles, bvh, lights,
                                                totalLightArea, depth + 1, lambdas);
             for (int k = 0; k < kHeroLambdaCount; k++)
                 indirectLo[k] += r[k] * albedoLambdas[k] / p;
         }
         else
         {
-            SpectralSample r = castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+            SpectralSample r = castRaySpectral(randomRay, materials, spheres, triangles, bvh, lights,
                                                totalLightArea, depth + 1, lambdas);
             for (int k = 0; k < kHeroLambdaCount; k++)
                 indirectLo[k] += r[k] * albedoLambdas[k];
@@ -855,7 +843,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
                 float rv = NumGen::Epsilon();
                 sampleP = p.origin + p.getU() * ru + p.getV() * rv;
                 sampleN = p.N;
-                lightMat = &p.material;
+                lightMat = &materials[p.matIdx];
             }
             else
             {
@@ -871,7 +859,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
                 if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
                 sampleP = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
                 sampleN = tri.flatN;
-                lightMat = &tri.material;
+                lightMat = &materials[tri.matIdx];
             }
 
             Vec3f Li = sampleP - hit;
@@ -881,8 +869,8 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
 
             auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
             Vec3f shadowHit, shadowN;
-            Material tmpMat;
-            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
+            int shadowMatIdx = -1;
+            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, shadowMatIdx) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !materials[shadowMatIdx].isEmissive();
 
             if (!inShadow)
             {
@@ -916,7 +904,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray, const std::vector<Spher
 bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                               const std::vector<Triangle> &triangles,
                               const std::vector<Bvh::Node> &bvh,
-                              Vec3f &hit, Vec3f &N, Material &material)
+                              Vec3f &hit, Vec3f &N, int &matIdx)
 {
     float closest_t = std::numeric_limits<float>::max();
 
@@ -929,7 +917,7 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
         closest_t = t0;
         hit = ray.origin + ray.dir * t0;
         N = (hit - sphere.center).normalize();
-        material = sphere.material;
+        matIdx = sphere.matIdx;
     }
 
     for (const auto &plane : _planes)
@@ -939,25 +927,20 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
 
         closest_t = t0;
         N = plane.N;
-
-        material = plane.material;
+        matIdx = plane.matIdx;
     }
 
-    // Triangles go through the BVH if one was built, otherwise linear.
-    // The BVH is empty for scenes with zero triangles (most cornell scenes
-    // today); for scenes with even a handful of triangles, BVH traversal is
-    // already a wash with linear, and it's a clear win once a mesh lands.
     if (!bvh.empty())
     {
         Vec3f triHit, triN;
-        Material triMat;
+        int triMatIdx;
         float triT;
-        if (Bvh::intersect(bvh, triangles, ray, triHit, triN, triMat, triT, closest_t))
+        if (Bvh::intersect(bvh, triangles, ray, triHit, triN, triMatIdx, triT, closest_t))
         {
             closest_t = triT;
             hit = triHit;
             N = triN;
-            material = triMat;
+            matIdx = triMatIdx;
         }
     }
     else
@@ -971,7 +954,7 @@ bool Renderer::sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres
             closest_t = t0;
             hit = triHit;
             N = triN;
-            material = tri.material;
+            matIdx = tri.matIdx;
         }
     }
 

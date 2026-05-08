@@ -83,13 +83,16 @@ namespace Scenes
                                        std::to_string(kSchemaMajor) + ".x)");
         }
 
-        std::unordered_map<std::string, Material> parseMaterials(const json &j, const std::string &path)
+        // Parse materials block, pushing each into out.materials and
+        // recording its name -> index mapping in nameToIdx.
+        void parseMaterials(const json &j, const std::string &path,
+                            SceneData &out,
+                            std::unordered_map<std::string, int> &nameToIdx)
         {
             auto it = j.find("materials");
             if (it == j.end() || !it->is_object())
                 throw SceneLoaderError(path + ": missing or non-object \"materials\" map");
 
-            std::unordered_map<std::string, Material> out;
             for (auto kv = it->begin(); kv != it->end(); ++kv)
             {
                 const std::string &name = kv.key();
@@ -132,11 +135,12 @@ namespace Scenes
                 }
                 if (mat.metallic && mat.transparent)
                     throw SceneLoaderError(path + ": materials." + name + " cannot be both metallic and transparent");
-                out.emplace(name, mat);
+                int idx = (int)out.materials.size();
+                out.materials.push_back(std::move(mat));
+                nameToIdx[name] = idx;
             }
-            if (out.empty())
+            if (out.materials.empty())
                 throw SceneLoaderError(path + ": \"materials\" map is empty");
-            return out;
         }
 
         Camera parseCamera(const json &j, const std::string &path)
@@ -158,13 +162,13 @@ namespace Scenes
             return c;
         }
 
-        const Material &resolveMaterial(const std::unordered_map<std::string, Material> &mats,
-                                        const std::string &ref,
-                                        const std::string &fieldPath,
-                                        const std::string &path)
+        int resolveMaterialIdx(const std::unordered_map<std::string, int> &nameToIdx,
+                               const std::string &ref,
+                               const std::string &fieldPath,
+                               const std::string &path)
         {
-            auto it = mats.find(ref);
-            if (it == mats.end())
+            auto it = nameToIdx.find(ref);
+            if (it == nameToIdx.end())
                 throw SceneLoaderError(path + ": " + fieldPath + " references unknown material \"" + ref + "\"");
             return it->second;
         }
@@ -178,7 +182,8 @@ namespace Scenes
             return it->get<std::string>();
         }
 
-        Sphere parseSphere(const json &p, const std::unordered_map<std::string, Material> &mats,
+        Sphere parseSphere(const json &p,
+                           const std::unordered_map<std::string, int> &nameToIdx,
                            const std::string &fieldPath, const std::string &path)
         {
             auto cit = p.find("center");
@@ -188,15 +193,15 @@ namespace Scenes
             Vec3f center = vec3FromJson(*cit, fieldPath + ".center");
             float radius = rit->get<float>();
             std::string matRef = requireString(p, "material", fieldPath, path);
-            Material mat = resolveMaterial(mats, matRef, fieldPath + ".material", path);
-            return Sphere(std::move(center), radius, mat);
+            int matIdx = resolveMaterialIdx(nameToIdx, matRef, fieldPath + ".material", path);
+            return Sphere(center, radius, matIdx);
         }
 
         // Triangle parser. v0/v1/v2 required. Optional smooth-shading normals
         // n0/n1/n2 (all three together or none. partial smooth normals are
         // an authoring mistake we'd rather flag than silently zero out).
         Triangle parseTriangle(const json &p,
-                               const std::unordered_map<std::string, Material> &mats,
+                               const std::unordered_map<std::string, int> &nameToIdx,
                                const std::string &fieldPath, const std::string &path)
         {
             auto v0it = p.find("v0");
@@ -210,24 +215,25 @@ namespace Scenes
             Vec3f v2 = vec3FromJson(*v2it, fieldPath + ".v2");
 
             std::string matRef = requireString(p, "material", fieldPath, path);
-            Material mat = resolveMaterial(mats, matRef, fieldPath + ".material", path);
+            int matIdx = resolveMaterialIdx(nameToIdx, matRef, fieldPath + ".material", path);
 
             auto n0it = p.find("n0");
             auto n1it = p.find("n1");
             auto n2it = p.find("n2");
             int normalCount = (n0it != p.end()) + (n1it != p.end()) + (n2it != p.end());
             if (normalCount == 0)
-                return Triangle(v0, v1, v2, mat);
+                return Triangle(v0, v1, v2, matIdx);
             if (normalCount != 3)
                 throw SceneLoaderError(path + ": " + fieldPath +
                                        " triangle normals require all of n0, n1, n2 or none");
             Vec3f n0 = vec3FromJson(*n0it, fieldPath + ".n0");
             Vec3f n1 = vec3FromJson(*n1it, fieldPath + ".n1");
             Vec3f n2 = vec3FromJson(*n2it, fieldPath + ".n2");
-            return Triangle(v0, v1, v2, n0, n1, n2, mat);
+            return Triangle(v0, v1, v2, n0, n1, n2, matIdx);
         }
 
-        Plane parsePlane(const json &p, const std::unordered_map<std::string, Material> &mats,
+        Plane parsePlane(const json &p,
+                         const std::unordered_map<std::string, int> &nameToIdx,
                          const std::string &fieldPath, const std::string &path)
         {
             auto oit = p.find("origin");
@@ -239,8 +245,8 @@ namespace Scenes
             Vec3f u = vec3FromJson(*uit, fieldPath + ".u");
             Vec3f v = vec3FromJson(*vit, fieldPath + ".v");
             std::string matRef = requireString(p, "material", fieldPath, path);
-            Material mat = resolveMaterial(mats, matRef, fieldPath + ".material", path);
-            return Plane(origin, u, v, mat);
+            int matIdx = resolveMaterialIdx(nameToIdx, matRef, fieldPath + ".material", path);
+            return Plane(origin, u, v, matIdx);
         }
 
         // Mesh primitive parser. Reads file/transform/material override,
@@ -253,7 +259,7 @@ namespace Scenes
         // out.triangles so the caller can build a TriangleSet AreaLight
         // from them when the mesh is flagged as a light.
         std::pair<int, int> parseMesh(const json &p,
-                       std::unordered_map<std::string, Material> &mats,
+                       std::unordered_map<std::string, int> &nameToIdx,
                        SceneData &out,
                        const std::string &fieldPath,
                        const std::string &scenePath)
@@ -292,7 +298,7 @@ namespace Scenes
                 opts.hasSmoothOverride = true;
             }
 
-            auto tris = loadMesh(objPath.string(), opts, mats);
+            auto tris = loadMesh(objPath.string(), opts, out.materials, nameToIdx);
             int begin = (int)out.triangles.size();
             int count = (int)tris.size();
             out.triangles.insert(out.triangles.end(),
@@ -314,7 +320,8 @@ namespace Scenes
         // triangles, mesh lights' triangles are already in triangles. The
         // AreaLight stores a copy of the geometry for sampling, decoupled
         // from the BVH builder's triangle permutation.
-        void parsePrimitives(const json &j, std::unordered_map<std::string, Material> &mats,
+        void parsePrimitives(const json &j,
+                             std::unordered_map<std::string, int> &nameToIdx,
                              SceneData &out, const std::string &path)
         {
             auto it = j.find("primitives");
@@ -338,11 +345,11 @@ namespace Scenes
                                                ": light flag is only valid on plane, triangle, "
                                                "or mesh primitives (sphere area-light sampling "
                                                "not implemented)");
-                    out.spheres.push_back(parseSphere(p, mats, fieldPath, path));
+                    out.spheres.push_back(parseSphere(p, nameToIdx, fieldPath, path));
                 }
                 else if (type == "triangle")
                 {
-                    Triangle tri = parseTriangle(p, mats, fieldPath, path);
+                    Triangle tri = parseTriangle(p, nameToIdx, fieldPath, path);
                     if (isLight)
                     {
                         std::vector<Triangle> setTris;
@@ -353,7 +360,7 @@ namespace Scenes
                 }
                 else if (type == "plane")
                 {
-                    Plane pl = parsePlane(p, mats, fieldPath, path);
+                    Plane pl = parsePlane(p, nameToIdx, fieldPath, path);
                     if (isLight)
                     {
                         // Light planes go ONLY to areaLights. the renderer
@@ -370,7 +377,7 @@ namespace Scenes
                 }
                 else if (type == "mesh")
                 {
-                    auto [begin, count] = parseMesh(p, mats, out, fieldPath, path);
+                    auto [begin, count] = parseMesh(p, nameToIdx, out, fieldPath, path);
                     if (isLight)
                     {
                         // Copy this mesh's triangle range out into the light.
@@ -419,11 +426,9 @@ namespace Scenes
         out.version = requireString(j, "version", "(root)", path);
         out.camera = parseCamera(j, path);
 
-        auto materials = parseMaterials(j, path);
-        parsePrimitives(j, materials, out, path);
-        // parsePrimitives may have grown `materials` from MTL files that
-        // OBJ meshes pull in, but we don't surface those to the caller.
-        // primitives reference them only via the registry above.
+        std::unordered_map<std::string, int> nameToIdx;
+        parseMaterials(j, path, out, nameToIdx);
+        parsePrimitives(j, nameToIdx, out, path);
 
         // Build the BVH now so renders don't pay the cost (and so the GPU
         // upload path in phase 4 can ship pre-built nodes verbatim). The
