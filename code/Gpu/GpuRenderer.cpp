@@ -506,8 +506,10 @@ bool intersectPlane(vec3 ro, vec3 rd, GpuPlane p, out float t, out vec3 hitOut) 
 R"GLSL(
 
 // Slab-method ray-AABB. Returns true if the ray segment (0, segMax)
-// intersects the box. Mirrors CPU Bvh::rayAabb.
-bool intersectAabb(vec3 ro, vec3 rd, vec3 mn, vec3 mx, float segMax) {
+// intersects the box; tNear is the ray-parametric distance at entry,
+// used by intersectBvh's ordered traversal to push the farther child
+// first. Mirrors CPU Bvh::rayAabb.
+bool intersectAabb(vec3 ro, vec3 rd, vec3 mn, vec3 mx, float segMax, out float tNear) {
     float tmin = 0.0;
     float tmax = segMax;
     for (int i = 0; i < 3; i++) {
@@ -519,6 +521,7 @@ bool intersectAabb(vec3 ro, vec3 rd, vec3 mn, vec3 mx, float segMax) {
         tmax = min(tmax, t2);
         if (tmin > tmax) return false;
     }
+    tNear = tmin;
     return true;
 }
 
@@ -533,20 +536,29 @@ bool intersectBvh(vec3 ro, vec3 rd, float closest_t,
     // past anything we'd actually render. Smaller-than-CPU stack because
     // GLSL allocates one of these per pixel-thread in private memory; a
     // 64-deep version was tipping bunny + Picture-class scenes over GPU
-    // scratch-space limits on some Windows drivers.
-    int stack[32];
+    // scratch-space limits on some Windows drivers. Each entry caches
+    // the AABB tNear so we can drop entries pointing at farther subtrees
+    // once a closer hit gets found in a near subtree (same trick the
+    // CPU traversal uses).
+    int   stackIdx[32];
+    float stackTNear[32];
     int top = 0;
-    stack[top++] = 0; // root
+    {
+        float tRoot;
+        if (!intersectAabb(ro, rd, bvhNodes[0].boxMin.xyz, bvhNodes[0].boxMax.xyz, closest_t, tRoot))
+            return false;
+        stackIdx[top] = 0;
+        stackTNear[top] = tRoot;
+        top += 1;
+    }
 
     bool anyHit = false;
     float closest = closest_t;
 
     while (top > 0) {
-        int idx = stack[top - 1];
         top -= 1;
-        GpuBvhNode n = bvhNodes[idx];
-
-        if (!intersectAabb(ro, rd, n.boxMin.xyz, n.boxMax.xyz, closest)) continue;
+        if (stackTNear[top] > closest) continue;
+        GpuBvhNode n = bvhNodes[stackIdx[top]];
 
         if (n.count > 0) {
             for (int i = 0; i < n.count; i++) {
@@ -561,12 +573,31 @@ bool intersectBvh(vec3 ro, vec3 rd, float closest_t,
                     anyHit = true;
                 }
             }
-        } else {
-            // Internal: push both children. Bounds-check the stack push.
+            continue;
+        }
+
+        // Internal: test both children, push them in far-first order so
+        // the near child is popped (and traversed) first.
+        GpuBvhNode cl = bvhNodes[n.leftOrFirst];
+        GpuBvhNode cr = bvhNodes[n.rightChild];
+        float tL, tR;
+        bool hitL = intersectAabb(ro, rd, cl.boxMin.xyz, cl.boxMax.xyz, closest, tL);
+        bool hitR = intersectAabb(ro, rd, cr.boxMin.xyz, cr.boxMax.xyz, closest, tR);
+
+        if (hitL && hitR) {
             if (top + 2 <= 32) {
-                stack[top++] = n.leftOrFirst;
-                stack[top++] = n.rightChild;
+                if (tL <= tR) {
+                    stackIdx[top]   = n.rightChild;  stackTNear[top]   = tR; top += 1;
+                    stackIdx[top]   = n.leftOrFirst; stackTNear[top]   = tL; top += 1;
+                } else {
+                    stackIdx[top]   = n.leftOrFirst; stackTNear[top]   = tL; top += 1;
+                    stackIdx[top]   = n.rightChild;  stackTNear[top]   = tR; top += 1;
+                }
             }
+        } else if (hitL && top + 1 <= 32) {
+            stackIdx[top] = n.leftOrFirst; stackTNear[top] = tL; top += 1;
+        } else if (hitR && top + 1 <= 32) {
+            stackIdx[top] = n.rightChild; stackTNear[top] = tR; top += 1;
         }
     }
 

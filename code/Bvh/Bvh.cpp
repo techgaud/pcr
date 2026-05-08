@@ -359,22 +359,30 @@ namespace Bvh
         if (nodes.empty()) return false;
 
         constexpr int kStackMax = 64;
-        int stack[kStackMax];
+        // Each stack entry caches the AABB tNear from the time it was
+        // pushed. At pop we compare against the current `closest`; if a
+        // closer hit was found in another subtree since this entry was
+        // pushed, we drop it without re-testing the AABB. This is the
+        // payoff of ordered traversal: closer hits found via the near
+        // child cull entries that point at farther subtrees.
+        struct StackEntry { int idx; float tNear; };
+        StackEntry stack[kStackMax];
         int top = 0;
-        stack[top++] = 0; // root
+        {
+            float tRoot;
+            if (!rayAabb(ray, nodes[0].boxMin, nodes[0].boxMax, closest_t, tRoot))
+                return false;
+            stack[top++] = {0, tRoot};
+        }
 
         bool anyHit = false;
         float closest = closest_t;
 
         while (top > 0)
         {
-            int idx = stack[--top];
-            const Node &n = nodes[idx];
-
-            float tNear;
-            if (!rayAabb(ray, n.boxMin, n.boxMax, closest, tNear))
-                continue;
-            if (tNear > closest) continue;
+            StackEntry e = stack[--top];
+            if (e.tNear > closest) continue;
+            const Node &n = nodes[e.idx];
 
             if (n.count > 0)
             {
@@ -392,17 +400,42 @@ namespace Bvh
                     matIdx = triangles[triIdx].matIdx;
                     anyHit = true;
                 }
+                continue;
             }
-            else
+
+            // Internal: test both children's AABBs and push them in
+            // far-first order so the near child is popped (and traversed)
+            // first. The near child often finds a hit close enough to
+            // cull the far child entirely on its eventual pop.
+            const Node &cl = nodes[n.leftOrFirst];
+            const Node &cr = nodes[n.rightChild];
+            float tL, tR;
+            bool hitL = rayAabb(ray, cl.boxMin, cl.boxMax, closest, tL);
+            bool hitR = rayAabb(ray, cr.boxMin, cr.boxMax, closest, tR);
+
+            if (hitL && hitR)
             {
-                // Internal: push both children. Ordered traversal (push the
-                // farther child first so the nearer is tested first) is a
-                // small win on coherent rays; skipping it keeps the code
-                // simpler and the scene sizes phase 2 ships with don't
-                // need it.
-                if (top + 2 > kStackMax) continue; // belt-and-suspenders
-                stack[top++] = n.leftOrFirst;
-                stack[top++] = n.rightChild;
+                if (top + 2 > kStackMax) continue;
+                if (tL <= tR)
+                {
+                    stack[top++] = {n.rightChild,  tR};
+                    stack[top++] = {n.leftOrFirst, tL};
+                }
+                else
+                {
+                    stack[top++] = {n.leftOrFirst, tL};
+                    stack[top++] = {n.rightChild,  tR};
+                }
+            }
+            else if (hitL)
+            {
+                if (top + 1 > kStackMax) continue;
+                stack[top++] = {n.leftOrFirst, tL};
+            }
+            else if (hitR)
+            {
+                if (top + 1 > kStackMax) continue;
+                stack[top++] = {n.rightChild, tR};
             }
         }
 
