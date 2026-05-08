@@ -1044,22 +1044,57 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
             continue;
         }
 
-        // Glass with chromatic dispersion: per-channel path splitting.
-        // Each hero wavelength sees its own Cauchy-dispersed IOR,
-        // refracts at its own angle, and traces an independent sub-
-        // path through the remainder of the bounce budget. After this
-        // surface the four channels physically separate — that's what
-        // produces the visible rainbow in glass caustics.
+        // Glass: cauchyB > 0 means per-channel chromatic dispersion -
+        // each hero wavelength sees its own IOR, refracts at its own
+        // angle, and traces an independent sub-path. After this
+        // surface the four channels physically separate, producing
+        // the visible rainbow in caustics.
         //
-        // Cost: 4x recursion depth at every glass surface. Zero cost
-        // for non-glass scenes since the path never enters this
-        // branch. cauchyB=0 makes all 4 sub-paths take identical
-        // geometry (same IOR per channel) so the only overhead is
-        // the 4x duplicate work, which keeps the spike honest.
+        // cauchyB == 0 (the default if a material doesn't opt into
+        // dispersion) means all four channels share the same IOR
+        // and refract identically. Short-circuit to a single shared
+        // sub-path with per-channel albedo, like the mirror branch -
+        // matches RGB-mode glass cost without changing render output
+        // in expectation.
         if (materials[matIdx].transparent != 0) {
             float cosI = -dot(rd, N);
             float baseIor = materials[matIdx].ior;
             float cb = materials[matIdx].cauchyB;
+
+            if (cb == 0.0) {
+                // Single shared sub-path. Mirrors the cauchyB == 0
+                // branch on the CPU side.
+                float n1 = entering ? 1.0 : baseIor;
+                float n2 = entering ? baseIor : 1.0;
+                float eta = n1 / n2;
+                float sinT2 = eta * eta * (1.0 - cosI * cosI);
+                vec3 newDir, newOrigin;
+                if (sinT2 >= 1.0) {
+                    newDir = reflect(rd, N);
+                    newOrigin = hit + N * 1e-3;
+                } else {
+                    float cosT = sqrt(1.0 - sinT2);
+                    float F0 = (n1 - n2) / (n1 + n2);
+                    F0 = F0 * F0;
+                    float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+                    if (rand(seed) < F) {
+                        newDir = reflect(rd, N);
+                        newOrigin = hit + N * 1e-3;
+                    } else {
+                        newDir = rd * eta + N * (eta * cosI - cosT);
+                        newOrigin = hit - N * 1e-3;
+                    }
+                }
+                rd = newDir;
+                ro = newOrigin;
+                throughput *= vec4(albedoAt(matIdx, lambdas.x),
+                                   albedoAt(matIdx, lambdas.y),
+                                   albedoAt(matIdx, lambdas.z),
+                                   albedoAt(matIdx, lambdas.w));
+                firstBounce = false;
+                continue;
+            }
+
             int remainingDepth = uDepth - bounce - 1;
             vec4 splitRad = vec4(0.0);
             for (int k = 0; k < 4; k++) {

@@ -703,56 +703,66 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
         return out;
     }
 
-    // Glass with chromatic dispersion: each hero wavelength sees a
-    // different IOR (Cauchy relation, material.cauchyB). At the
-    // glass surface the 4 channels refract at different angles, so
-    // we fork into 4 single-channel sub-paths. Each sub-path traces
-    // independently with its own IOR's path direction. After the
-    // glass surface, all 4 paths re-converge through castRaySpectral
-    // by passing the channel's lambda in all 4 slots (correlated
-    // sample, only the [k] component is read out).
+    // Glass: when material.cauchyB > 0, each hero wavelength sees a
+    // different IOR (Cauchy relation) and refracts at its own angle,
+    // so we fork into 4 single-channel sub-paths and trace each
+    // independently. After the glass surface, the four paths see
+    // physically separated geometry, which is what produces the
+    // visible rainbow in caustics.
     //
-    // Cost: 4x recursion at every glass surface. For non-glass
-    // scenes (cornell, cornell-spec) the path never enters this
-    // branch, so the cost is zero. For cornell-glass with cauchyB=0
-    // the 4 sub-paths produce identical geometry (no dispersion,
-    // same IOR per channel), so the only overhead is the 4x
-    // duplicate work, which keeps the spike honest.
+    // When cauchyB == 0 there's no dispersion: all four channels
+    // share the same IOR, refract at the same angle, and would
+    // trace identical sub-path geometry. We short-circuit to a
+    // single sub-path (like the mirror branch) and weight by per-
+    // channel albedo, matching RGB-mode glass cost.
     if (material.transparent)
     {
         float cosI = -ray.dir.dot(N);
-        SpectralSample out;
-        for (int k = 0; k < kHeroLambdaCount; k++)
-        {
-            float iorK = material.iorAtLambda(lambdas[k]);
-            float n1 = entering ? 1.0f : iorK;
-            float n2 = entering ? iorK : 1.0f;
+
+        auto refractDecision = [&](float ior, Vec3f &outDir, Vec3f &outOrigin) {
+            float n1 = entering ? 1.0f : ior;
+            float n2 = entering ? ior : 1.0f;
             float eta = n1 / n2;
             float sinT2 = eta * eta * (1.f - cosI * cosI);
-
-            Vec3f outDir;
-            Vec3f outOrigin;
             if (sinT2 >= 1.f)
+            {
+                outDir = ray.dir + N * (2.f * cosI);
+                outOrigin = hit + N * 1e-3f;
+                return;
+            }
+            float cosT = std::sqrt(1.f - sinT2);
+            float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
+            float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
+            if (NumGen::Epsilon() < F)
             {
                 outDir = ray.dir + N * (2.f * cosI);
                 outOrigin = hit + N * 1e-3f;
             }
             else
             {
-                float cosT = std::sqrt(1.f - sinT2);
-                float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
-                float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
-                if (NumGen::Epsilon() < F)
-                {
-                    outDir = ray.dir + N * (2.f * cosI);
-                    outOrigin = hit + N * 1e-3f;
-                }
-                else
-                {
-                    outDir = ray.dir * eta + N * (eta * cosI - cosT);
-                    outOrigin = hit - N * 1e-3f;
-                }
+                outDir = ray.dir * eta + N * (eta * cosI - cosT);
+                outOrigin = hit - N * 1e-3f;
             }
+        };
+
+        if (material.cauchyB == 0.f)
+        {
+            Vec3f outDir, outOrigin;
+            refractDecision(material.ior, outDir, outOrigin);
+            SpectralSample r = castRaySpectral(Ray(outDir, outOrigin), materials,
+                                               spheres, triangles, bvh, lights, totalLightArea,
+                                               depth + 1, lambdas);
+            SpectralSample out;
+            for (int k = 0; k < kHeroLambdaCount; k++)
+                out[k] = r[k] * material.albedoSpectrum(lambdas[k]);
+            return out;
+        }
+
+        SpectralSample out;
+        for (int k = 0; k < kHeroLambdaCount; k++)
+        {
+            Vec3f outDir, outOrigin;
+            refractDecision(material.iorAtLambda(lambdas[k]), outDir, outOrigin);
             // Recurse with this channel's lambda copied into all 4
             // slots; the result is the correlated single-lambda
             // radiance, picked off via index 0 (any index returns
