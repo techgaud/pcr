@@ -16,6 +16,7 @@
 #include "Includes/CIE.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
+#include "Includes/Optics.h"
 #include "Includes/ToneMap.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
@@ -484,36 +485,9 @@ Vec3f Renderer::castRay(const Ray &ray,
 
     if (material.transparent)
     {
-        float n1 = entering ? 1.0f : material.ior;
-        float n2 = entering ? material.ior : 1.0f;
-        float cosI = -ray.dir.dot(N);
-        float eta = n1 / n2;
-        float sinT2 = eta * eta * (1.f - cosI * cosI);
-
-        Vec3f outDir;
-        Vec3f outOrigin;
-        if (sinT2 >= 1.f)
-        {
-            outDir = ray.dir + N * (2.f * cosI);
-            outOrigin = hit + N * 1e-3f;
-        }
-        else
-        {
-            float cosT = std::sqrt(1.f - sinT2);
-            float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
-            float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
-            if (NumGen::Epsilon() < F)
-            {
-                outDir = ray.dir + N * (2.f * cosI);
-                outOrigin = hit + N * 1e-3f;
-            }
-            else
-            {
-                outDir = ray.dir * eta + N * (eta * cosI - cosT);
-                outOrigin = hit - N * 1e-3f;
-            }
-        }
-        Vec3f recurse = castRay(Ray(outDir, outOrigin), materials,
+        auto b = Optics::dielectricBounce(ray.dir, N, hit, entering,
+                                          material.ior, NumGen::Epsilon());
+        Vec3f recurse = castRay(Ray(b.dir, b.origin), materials,
                                 spheres, triangles, bvh, lights, totalLightArea, depth + 1);
         return Vec3f(recurse[0] * material.albedo[0],
                      recurse[1] * material.albedo[1],
@@ -717,39 +691,11 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
     // channel albedo, matching RGB-mode glass cost.
     if (material.transparent)
     {
-        float cosI = -ray.dir.dot(N);
-
-        auto refractDecision = [&](float ior, Vec3f &outDir, Vec3f &outOrigin) {
-            float n1 = entering ? 1.0f : ior;
-            float n2 = entering ? ior : 1.0f;
-            float eta = n1 / n2;
-            float sinT2 = eta * eta * (1.f - cosI * cosI);
-            if (sinT2 >= 1.f)
-            {
-                outDir = ray.dir + N * (2.f * cosI);
-                outOrigin = hit + N * 1e-3f;
-                return;
-            }
-            float cosT = std::sqrt(1.f - sinT2);
-            float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
-            float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
-            if (NumGen::Epsilon() < F)
-            {
-                outDir = ray.dir + N * (2.f * cosI);
-                outOrigin = hit + N * 1e-3f;
-            }
-            else
-            {
-                outDir = ray.dir * eta + N * (eta * cosI - cosT);
-                outOrigin = hit - N * 1e-3f;
-            }
-        };
-
         if (material.cauchyB == 0.f)
         {
-            Vec3f outDir, outOrigin;
-            refractDecision(material.ior, outDir, outOrigin);
-            SpectralSample r = castRaySpectral(Ray(outDir, outOrigin), materials,
+            auto b = Optics::dielectricBounce(ray.dir, N, hit, entering,
+                                              material.ior, NumGen::Epsilon());
+            SpectralSample r = castRaySpectral(Ray(b.dir, b.origin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
                                                depth + 1, lambdas);
             SpectralSample out;
@@ -761,15 +707,16 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
         SpectralSample out;
         for (int k = 0; k < kHeroLambdaCount; k++)
         {
-            Vec3f outDir, outOrigin;
-            refractDecision(material.iorAtLambda(lambdas[k]), outDir, outOrigin);
+            float iorK = Optics::cauchyIor(material.ior, material.cauchyB, lambdas[k]);
+            auto b = Optics::dielectricBounce(ray.dir, N, hit, entering,
+                                              iorK, NumGen::Epsilon());
             // Recurse with this channel's lambda copied into all 4
             // slots; the result is the correlated single-lambda
             // radiance, picked off via index 0 (any index returns
             // the same value when all lambdas agree).
             SpectralSample singleLambdas;
             singleLambdas.fill(lambdas[k]);
-            SpectralSample r = castRaySpectral(Ray(outDir, outOrigin), materials,
+            SpectralSample r = castRaySpectral(Ray(b.dir, b.origin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
                                                depth + 1, singleLambdas);
             out[k] = r[0] * material.albedoAt(lambdas[k]);

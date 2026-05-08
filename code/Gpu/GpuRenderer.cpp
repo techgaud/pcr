@@ -505,6 +505,46 @@ bool intersectPlane(vec3 ro, vec3 rd, GpuPlane p, out float t, out vec3 hitOut) 
 )GLSL"
 R"GLSL(
 
+// Dielectric (glass) optics. Mirrors code/Includes/Optics.h on the
+// CPU side line-for-line. The block was reproduced inline at every
+// glass-handling callsite before this lived as a helper.
+float schlickFresnel(float cosTheta, float n1, float n2) {
+    float F0 = (n1 - n2) / (n1 + n2);
+    F0 = F0 * F0;
+    return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+}
+
+float cauchyIor(float baseIor, float cb, float lambdaNm) {
+    return baseIor + cb * 1e4 / (lambdaNm * lambdaNm);
+}
+
+struct DielectricOut { vec3 dir; vec3 origin; };
+
+DielectricOut dielectricBounce(vec3 rayDir, vec3 N, vec3 hit,
+                               bool entering, float ior, float fresnelRand) {
+    float cosI = -dot(rayDir, N);
+    float n1 = entering ? 1.0 : ior;
+    float n2 = entering ? ior : 1.0;
+    float eta = n1 / n2;
+    float sinT2 = eta * eta * (1.0 - cosI * cosI);
+    DielectricOut o;
+    if (sinT2 >= 1.0) {
+        o.dir = reflect(rayDir, N);
+        o.origin = hit + N * 1e-3;
+        return o;
+    }
+    float F = schlickFresnel(cosI, n1, n2);
+    if (fresnelRand < F) {
+        o.dir = reflect(rayDir, N);
+        o.origin = hit + N * 1e-3;
+    } else {
+        float cosT = sqrt(1.0 - sinT2);
+        o.dir = rayDir * eta + N * (eta * cosI - cosT);
+        o.origin = hit - N * 1e-3;
+    }
+    return o;
+}
+
 // Slab-method ray-AABB. Returns true if the ray segment (0, segMax)
 // intersects the box; tNear is the ray-parametric distance at entry,
 // used by intersectBvh's ordered traversal to push the farther child
@@ -756,31 +796,9 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         // (Schlick's approximation), Snell's law for refraction direction.
         // Total internal reflection when refraction is impossible.
         if (mat.transparent != 0) {
-            float n1 = entering ? 1.0 : mat.ior;
-            float n2 = entering ? mat.ior : 1.0;
-            float eta = n1 / n2;
-            float cosI = -dot(rd, N);
-            float sinT2 = eta * eta * (1.0 - cosI * cosI);
-            vec3 newDir;
-            vec3 newOrigin;
-            if (sinT2 >= 1.0) {
-                newDir = reflect(rd, N);
-                newOrigin = hit + N * 1e-3;
-            } else {
-                float cosT = sqrt(1.0 - sinT2);
-                float F0 = (n1 - n2) / (n1 + n2);
-                F0 = F0 * F0;
-                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
-                if (rand(seed) < F) {
-                    newDir = reflect(rd, N);
-                    newOrigin = hit + N * 1e-3;
-                } else {
-                    newDir = rd * eta + N * (eta * cosI - cosT);
-                    newOrigin = hit - N * 1e-3;
-                }
-            }
-            rd = newDir;
-            ro = newOrigin;
+            DielectricOut b = dielectricBounce(rd, N, hit, entering, mat.ior, rand(seed));
+            rd = b.dir;
+            ro = b.origin;
             throughput *= mat.albedo.rgb;
             firstBounce = false;
             continue;
@@ -908,32 +926,10 @@ float tracePathSpectralSingle(vec3 ro, vec3 rd, float lambda,
         // this same single-wavelength's IOR; no further forking
         // because we're already on a single-channel path.
         if (materials[matIdx].transparent != 0) {
-            float cb = materials[matIdx].cauchyB;
-            float ior = materials[matIdx].ior + cb * 1e4 / (lambda * lambda);
-            float n1 = entering ? 1.0 : ior;
-            float n2 = entering ? ior : 1.0;
-            float eta = n1 / n2;
-            float cosI = -dot(rd, N);
-            float sinT2 = eta * eta * (1.0 - cosI * cosI);
-            vec3 newDir, newOrigin;
-            if (sinT2 >= 1.0) {
-                newDir = reflect(rd, N);
-                newOrigin = hit + N * 1e-3;
-            } else {
-                float cosT = sqrt(1.0 - sinT2);
-                float F0 = (n1 - n2) / (n1 + n2);
-                F0 = F0 * F0;
-                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
-                if (rand(seed) < F) {
-                    newDir = reflect(rd, N);
-                    newOrigin = hit + N * 1e-3;
-                } else {
-                    newDir = rd * eta + N * (eta * cosI - cosT);
-                    newOrigin = hit - N * 1e-3;
-                }
-            }
-            rd = newDir;
-            ro = newOrigin;
+            float ior = cauchyIor(materials[matIdx].ior, materials[matIdx].cauchyB, lambda);
+            DielectricOut b = dielectricBounce(rd, N, hit, entering, ior, rand(seed));
+            rd = b.dir;
+            ro = b.origin;
             throughput *= albedoAt(matIdx, lambda);
             firstBounce = false;
             continue;
@@ -1087,36 +1083,15 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
         // matches RGB-mode glass cost without changing render output
         // in expectation.
         if (materials[matIdx].transparent != 0) {
-            float cosI = -dot(rd, N);
             float baseIor = materials[matIdx].ior;
             float cb = materials[matIdx].cauchyB;
 
             if (cb == 0.0) {
                 // Single shared sub-path. Mirrors the cauchyB == 0
                 // branch on the CPU side.
-                float n1 = entering ? 1.0 : baseIor;
-                float n2 = entering ? baseIor : 1.0;
-                float eta = n1 / n2;
-                float sinT2 = eta * eta * (1.0 - cosI * cosI);
-                vec3 newDir, newOrigin;
-                if (sinT2 >= 1.0) {
-                    newDir = reflect(rd, N);
-                    newOrigin = hit + N * 1e-3;
-                } else {
-                    float cosT = sqrt(1.0 - sinT2);
-                    float F0 = (n1 - n2) / (n1 + n2);
-                    F0 = F0 * F0;
-                    float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
-                    if (rand(seed) < F) {
-                        newDir = reflect(rd, N);
-                        newOrigin = hit + N * 1e-3;
-                    } else {
-                        newDir = rd * eta + N * (eta * cosI - cosT);
-                        newOrigin = hit - N * 1e-3;
-                    }
-                }
-                rd = newDir;
-                ro = newOrigin;
+                DielectricOut b = dielectricBounce(rd, N, hit, entering, baseIor, rand(seed));
+                rd = b.dir;
+                ro = b.origin;
                 throughput *= vec4(albedoAt(matIdx, lambdas.x),
                                    albedoAt(matIdx, lambdas.y),
                                    albedoAt(matIdx, lambdas.z),
@@ -1129,29 +1104,9 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
             vec4 splitRad = vec4(0.0);
             for (int k = 0; k < 4; k++) {
                 float lam = lambdas[k];
-                float ior = baseIor + cb * 1e4 / (lam * lam);
-                float n1 = entering ? 1.0 : ior;
-                float n2 = entering ? ior : 1.0;
-                float eta = n1 / n2;
-                float sinT2 = eta * eta * (1.0 - cosI * cosI);
-                vec3 newDir, newOrigin;
-                if (sinT2 >= 1.0) {
-                    newDir = reflect(rd, N);
-                    newOrigin = hit + N * 1e-3;
-                } else {
-                    float cosT = sqrt(1.0 - sinT2);
-                    float F0 = (n1 - n2) / (n1 + n2);
-                    F0 = F0 * F0;
-                    float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
-                    if (rand(seed) < F) {
-                        newDir = reflect(rd, N);
-                        newOrigin = hit + N * 1e-3;
-                    } else {
-                        newDir = rd * eta + N * (eta * cosI - cosT);
-                        newOrigin = hit - N * 1e-3;
-                    }
-                }
-                float subRad = tracePathSpectralSingle(newOrigin, newDir, lam,
+                float ior = cauchyIor(baseIor, cb, lam);
+                DielectricOut b = dielectricBounce(rd, N, hit, entering, ior, rand(seed));
+                float subRad = tracePathSpectralSingle(b.origin, b.dir, lam,
                                                        remainingDepth, bounce + 1,
                                                        seed);
                 splitRad[k] = subRad * albedoAt(matIdx, lam);
