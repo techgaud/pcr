@@ -819,6 +819,153 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
 )GLSL"
 R"GLSL(
 
+// Single-wavelength continuation, used by tracePathSpectral when it
+// hits glass and forks into per-channel sub-paths. Mirrors
+// tracePathSpectral but with scalar throughput / radiance and a
+// single lambda passed in. Does not generate primary rays (those
+// come from the caller after Snell's-law refraction at glass).
+//
+// remainingDepth bounds how many more bounces this sub-path can
+// take. The caller passes uDepth - alreadyTakenBounces - 1 so the
+// total path length (counting the glass bounce itself) stays at
+// uDepth.
+float tracePathSpectralSingle(vec3 ro, vec3 rd, float lambda,
+                              int remainingDepth, inout uint seed) {
+    float throughput = 1.0;
+    float radiance = 0.0;
+    bool firstBounce = true;
+
+    for (int bounce = 0; bounce < remainingDepth; bounce++) {
+        vec3 hit, N;
+        int matIdx;
+        if (!sceneIntersect(ro, rd, hit, N, matIdx)) break;
+
+        bool entering = dot(rd, N) < 0.0;
+        if (!entering) N = -N;
+
+        if (any(greaterThan(materials[matIdx].emissive.rgb, vec3(0.0)))) {
+            radiance += throughput * emissiveAt(matIdx, lambda);
+            break;
+        }
+
+        if (materials[matIdx].metallic != 0) {
+            rd = reflect(rd, N);
+            ro = hit + N * 1e-3;
+            throughput *= albedoAt(matIdx, lambda);
+            firstBounce = false;
+            continue;
+        }
+
+        // Glass continuation. Each subsequent glass surface uses
+        // this same single-wavelength's IOR; no further forking
+        // because we're already on a single-channel path.
+        if (materials[matIdx].transparent != 0) {
+            float cb = materials[matIdx].cauchyB;
+            float ior = materials[matIdx].ior + cb * 1e4 / (lambda * lambda);
+            float n1 = entering ? 1.0 : ior;
+            float n2 = entering ? ior : 1.0;
+            float eta = n1 / n2;
+            float cosI = -dot(rd, N);
+            float sinT2 = eta * eta * (1.0 - cosI * cosI);
+            vec3 newDir, newOrigin;
+            if (sinT2 >= 1.0) {
+                newDir = reflect(rd, N);
+                newOrigin = hit + N * 1e-3;
+            } else {
+                float cosT = sqrt(1.0 - sinT2);
+                float F0 = (n1 - n2) / (n1 + n2);
+                F0 = F0 * F0;
+                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+                if (rand(seed) < F) {
+                    newDir = reflect(rd, N);
+                    newOrigin = hit + N * 1e-3;
+                } else {
+                    newDir = rd * eta + N * (eta * cosI - cosT);
+                    newOrigin = hit - N * 1e-3;
+                }
+            }
+            rd = newDir;
+            ro = newOrigin;
+            throughput *= albedoAt(matIdx, lambda);
+            firstBounce = false;
+            continue;
+        }
+
+        // Diffuse: per-lambda direct lighting + indirect.
+        float albedoLam = albedoAt(matIdx, lambda);
+
+        float directLo = 0.0;
+        if (uTotalLightArea > 0.0) {
+            for (int s = 0; s < uShadowSamples; s++) {
+                vec3 sampleP, sampleN, sampleEmissiveRGB;
+                int sampleMatIdx;
+                sampleAreaLight(seed, sampleP, sampleN, sampleEmissiveRGB, sampleMatIdx);
+
+                vec3 Li = sampleP - hit;
+                vec3 wi = normalize(Li);
+                float cosTheta = max(0.0, dot(wi, N));
+                float lightDist2 = dot(Li, Li);
+                vec3 shadowOrigin = (cosTheta <= 0.0) ? hit - N * 1e-3 : hit + N * 1e-3;
+
+                vec3 sh, sN;
+                int sMat;
+                bool occluded = false;
+                if (sceneIntersect(shadowOrigin, wi, sh, sN, sMat)) {
+                    vec3 d = sh - shadowOrigin;
+                    float occluderDist2 = dot(d, d);
+                    if (occluderDist2 < lightDist2 - 1e-3) {
+                        if (!any(greaterThan(materials[sMat].emissive.rgb, vec3(0.0))))
+                            occluded = true;
+                    }
+                }
+
+                if (!occluded) {
+                    float cosLight = max(0.0, dot(sampleN, -wi));
+                    float G = (cosTheta * cosLight) / lightDist2;
+                    float misWeight = 1.0;
+                    if (uUseMIS != 0 && cosLight > 1e-6) {
+                        float pdfLight = lightDist2 / (cosLight * uTotalLightArea);
+                        float pdfBrdf  = cosTheta / PI;
+                        misWeight = (pdfLight * pdfLight) /
+                                    (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                    }
+                    float emitL;
+                    if (sampleMatIdx >= 0) {
+                        emitL = emissiveAt(sampleMatIdx, lambda);
+                    } else {
+                        emitL = sampleEmissiveRGB.x * 0.30
+                              + sampleEmissiveRGB.y * 0.59
+                              + sampleEmissiveRGB.z * 0.11;
+                    }
+                    directLo += (albedoLam / PI) * emitL * G * uTotalLightArea * misWeight;
+                }
+            }
+            directLo /= float(uShadowSamples);
+        }
+        radiance += throughput * directLo;
+
+        if (uUseRussian != 0 && bounce >= 1) {
+            float p = clamp(albedoLam, 0.05, 0.95);
+            if (rand(seed) > p) break;
+            throughput /= p;
+        }
+
+        // Indirect bounce. Sub-paths skip stratification (no clean
+        // way to thread pr1/pr2 across the boundary); plain random
+        // here is fine since stratification was a first-bounce
+        // optimization for the primary ray.
+        vec3 newDir = sampleHemisphere(N, seed);
+        firstBounce = false;
+        ro = hit + N * 1e-3;
+        rd = newDir;
+        throughput *= albedoLam;
+    }
+    return radiance;
+}
+
+)GLSL"
+R"GLSL(
+
 // Spectral path tracer: 4 correlated wavelengths (Wilkie 2014 hero
 // wavelength sampling) share the same path geometry. throughput and
 // radiance are vec4, indexed [0..3] for the 4 hero channels.
@@ -879,50 +1026,54 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
             continue;
         }
 
-        // Glass: hero-channel approximation. Use the hero (lambdas.x)
-        // IOR for the path direction; per-channel cauchyB-dispersed
-        // IORs aren't separately traced on the GPU in this initial
-        // commit (per-channel path splitting is invasive in GLSL's
-        // iterative tracePathSpectral; phase 10 will land it). For
-        // cauchyB == 0 the result is identical to the wavelength-
-        // independent glass we had before. For cauchyB > 0 the
-        // visible dispersion is muted on GPU (hero takes the path,
-        // others ride along) but visible on CPU.
+        // Glass with chromatic dispersion: per-channel path splitting.
+        // Each hero wavelength sees its own Cauchy-dispersed IOR,
+        // refracts at its own angle, and traces an independent sub-
+        // path through the remainder of the bounce budget. After this
+        // surface the four channels physically separate — that's what
+        // produces the visible rainbow in glass caustics.
+        //
+        // Cost: 4x recursion depth at every glass surface. Zero cost
+        // for non-glass scenes since the path never enters this
+        // branch. cauchyB=0 makes all 4 sub-paths take identical
+        // geometry (same IOR per channel) so the only overhead is
+        // the 4x duplicate work, which keeps the spike honest.
         if (materials[matIdx].transparent != 0) {
+            float cosI = -dot(rd, N);
             float baseIor = materials[matIdx].ior;
             float cb = materials[matIdx].cauchyB;
-            float ior = baseIor + cb * 1e4 / (lambdas.x * lambdas.x);
-            float n1 = entering ? 1.0 : ior;
-            float n2 = entering ? ior : 1.0;
-            float eta = n1 / n2;
-            float cosI = -dot(rd, N);
-            float sinT2 = eta * eta * (1.0 - cosI * cosI);
-            vec3 newDir;
-            vec3 newOrigin;
-            if (sinT2 >= 1.0) {
-                newDir = reflect(rd, N);
-                newOrigin = hit + N * 1e-3;
-            } else {
-                float cosT = sqrt(1.0 - sinT2);
-                float F0 = (n1 - n2) / (n1 + n2);
-                F0 = F0 * F0;
-                float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
-                if (rand(seed) < F) {
+            int remainingDepth = uDepth - bounce - 1;
+            vec4 splitRad = vec4(0.0);
+            for (int k = 0; k < 4; k++) {
+                float lam = lambdas[k];
+                float ior = baseIor + cb * 1e4 / (lam * lam);
+                float n1 = entering ? 1.0 : ior;
+                float n2 = entering ? ior : 1.0;
+                float eta = n1 / n2;
+                float sinT2 = eta * eta * (1.0 - cosI * cosI);
+                vec3 newDir, newOrigin;
+                if (sinT2 >= 1.0) {
                     newDir = reflect(rd, N);
                     newOrigin = hit + N * 1e-3;
                 } else {
-                    newDir = rd * eta + N * (eta * cosI - cosT);
-                    newOrigin = hit - N * 1e-3;
+                    float cosT = sqrt(1.0 - sinT2);
+                    float F0 = (n1 - n2) / (n1 + n2);
+                    F0 = F0 * F0;
+                    float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+                    if (rand(seed) < F) {
+                        newDir = reflect(rd, N);
+                        newOrigin = hit + N * 1e-3;
+                    } else {
+                        newDir = rd * eta + N * (eta * cosI - cosT);
+                        newOrigin = hit - N * 1e-3;
+                    }
                 }
+                float subRad = tracePathSpectralSingle(newOrigin, newDir, lam,
+                                                       remainingDepth, seed);
+                splitRad[k] = subRad * albedoAt(matIdx, lam);
             }
-            rd = newDir;
-            ro = newOrigin;
-            throughput *= vec4(albedoAt(matIdx, lambdas.x),
-                               albedoAt(matIdx, lambdas.y),
-                               albedoAt(matIdx, lambdas.z),
-                               albedoAt(matIdx, lambdas.w));
-            firstBounce = false;
-            continue;
+            radiance += throughput * splitRad;
+            return radiance; // sub-paths handled the rest
         }
 
         // Diffuse path. Cache albedo at all 4 lambdas once per hit.
