@@ -75,12 +75,79 @@ jobs:
         shell: bash
         run: |
           mkdir -p stage-portable
-          # Single-file binary. No lib/ — OIDN, TBB, and the C runtime
-          # are all statically linked into this one .exe.
+          # Single-file binary. No lib/, since OIDN, TBB, and the C
+          # runtime are all statically linked into this one .exe.
           cp code/Build-Portable/Release/physically-cringe-rendering.exe \
              stage-portable/physically-cringe-rendering.exe
           cp -r Scenes stage-portable/
           cp -r models stage-portable/
+
+      - name: Verify portable artifact (file-based)
+        shell: bash
+        run: |
+          cd stage-portable
+          # No DLLs allowed at the top level. If something copied
+          # OpenImageDenoise.dll or tbb12.dll alongside the .exe,
+          # static linking didn't take and the artifact is lying
+          # about being portable.
+          DLLS=$(find . -maxdepth 1 -name "*.dll" 2>/dev/null || true)
+          if [ -n "$DLLS" ]; then
+            echo "ERROR: portable artifact contains DLLs at top level:"
+            echo "$DLLS"
+            exit 1
+          fi
+          # Sanity-check binary size. OIDN's pretrained weights blob
+          # is ~50 MB; if the static link worked, the .exe should be
+          # at least 30 MB. A normal-sized .exe (~5 MB) means OIDN
+          # isn't statically linked even though the link succeeded
+          # (probably picked up a header-only stub).
+          SIZE=$(stat -c %s physically-cringe-rendering.exe)
+          echo "physically-cringe-rendering.exe size: $((SIZE / 1024 / 1024)) MB"
+          if [ "$SIZE" -lt 30000000 ]; then
+            echo "ERROR: portable binary is suspiciously small. OIDN weights blob"
+            echo "is ~50 MB; static linking should produce a 50-80 MB binary."
+            exit 1
+          fi
+
+      - name: Verify portable artifact (import table)
+        shell: pwsh
+        run: |
+          # Locate dumpbin via vswhere (ships with the VS Installer
+          # on every windows-latest runner). Avoids third-party
+          # actions for what is ultimately a one-line DLL inspection.
+          $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -property installationPath
+          $msvcRoot = "$vsPath\VC\Tools\MSVC"
+          $msvcVer = (Get-ChildItem -Path $msvcRoot | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $dumpbin = "$msvcRoot\$msvcVer\bin\Hostx64\x64\dumpbin.exe"
+          if (-not (Test-Path $dumpbin)) {
+            Write-Error "dumpbin not found at $dumpbin"
+            exit 1
+          }
+          $exe = "stage-portable\physically-cringe-rendering.exe"
+          $imports = & $dumpbin /dependents $exe | Out-String
+          Write-Host $imports
+          # Forbidden imports for a 'portable' build: anything that
+          # would require a sibling DLL on the user's machine. System
+          # DLLs (kernel32, user32, opengl32, etc.) are fine. The C
+          # runtime should be /MT-static (no msvcp140/vcruntime140).
+          $forbidden = @(
+            'OpenImageDenoise', 'oidn',
+            'tbb12', 'tbbbind', 'tbb\.dll',
+            'MSVCP\d', 'VCRUNTIME\d', 'CONCRT\d',
+            'pi_level_zero', 'sycl'
+          )
+          $hits = @()
+          foreach ($pat in $forbidden) {
+            $matches = [regex]::Matches($imports, "(?i)\b\w*$pat\w*\.dll")
+            foreach ($m in $matches) { $hits += $m.Value }
+          }
+          $hits = $hits | Sort-Object -Unique
+          if ($hits.Count -gt 0) {
+            Write-Error "Portable binary has forbidden DLL imports: $($hits -join ', ')"
+            exit 1
+          }
+          Write-Host "OK: import table contains only system DLLs"
 
       - uses: actions/upload-artifact@v4
         with:
