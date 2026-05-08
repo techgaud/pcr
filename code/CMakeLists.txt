@@ -334,3 +334,14 @@ if(NOT APPLE)
     pcr_deploy_scenes(physically-cringe-rendering)
     pcr_link_oidn(physically-cringe-rendering)
 endif()
+
+# --- Tests (opt-in, off by default) -------------------------------------
+# Enable with -DPCR_BUILD_TESTS=ON. Pulls in the unit-test binaries under
+# tests/unit and registers them with CTest. Render tests are shell-driven
+# (tests/render/run.sh) and don't go through CMake; they invoke the
+# already-built CLI binary.
+option(PCR_BUILD_TESTS "Build unit tests under tests/unit" OFF)
+if(PCR_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../tests tests-build)
+endif()
