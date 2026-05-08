@@ -237,7 +237,7 @@ namespace RGBToSpectrum
         outC0 = lastGoodC[0]; outC1 = lastGoodC[1]; outC2 = lastGoodC[2];
     }
 
-    Spectrum fitSpectrum(const Vec3f &rgbLinear)
+    SigmoidFit fitSigmoidCoefficients(const Vec3f &rgbLinear)
     {
         // Clamp inputs to physical reflectance range. RGB > 1 is unphysical
         // for albedo (would gain energy at a wavelength). Emissive callers
@@ -247,29 +247,39 @@ namespace RGBToSpectrum
         float r = std::clamp(rgbLinear[0], 0.f, 1.f);
         float g = std::clamp(rgbLinear[1], 0.f, 1.f);
         float b = std::clamp(rgbLinear[2], 0.f, 1.f);
-        if (r <= 0.f && g <= 0.f && b <= 0.f) return Spectrum(0.f);
-        if (r >= 1.f && g >= 1.f && b >= 1.f) return Spectrum(1.f);
+        if (r <= 0.f && g <= 0.f && b <= 0.f)
+        {
+            // All-zero. Any (c0, c1, c2) work since scale=0 zeroes the
+            // result; pick a flat polynomial so debug prints look sane.
+            return {0.f, 0.f, 0.f, 0.f};
+        }
+        if (r >= 1.f && g >= 1.f && b >= 1.f)
+        {
+            // Perfect white. Choose c0 such that sigmoid(c0) * yBarIntegral
+            // = 1 exactly, c1 = c2 = 0 (flat polynomial). evalSigmoidFit's
+            // clamp would also catch a slight overshoot, but solving for c0
+            // exactly is cheap and keeps the sample equal to 1.0.
+            float scale = CIE::yBarIntegral();
+            return {sigmoidInverse(1.f / scale), 0.f, 0.f, scale};
+        }
 
         Vec3f xyz = CIE::linearSRGBToXYZ(Vec3f(r, g, b));
         float c0, c1, c2;
         fitCoefficients(xyz, c0, c1, c2);
-        Spectrum s = Spectrum::fromSigmoidCoefficients(c0, c1, c2);
-        // Convert from "fit-to-XYZ" to physical reflectance convention so
-        // multi-bounce path-tracer throughput attenuates the same way RGB
-        // albedos do. See CIE::yBarIntegral() for the full discussion.
-        s *= CIE::yBarIntegral();
-        // Clamp samples to [0, 1] reflectance. The sigmoid output is in
-        // [0, 1] but the * yBarIntegral scale-up can produce per-sample
-        // values up to ~107 for sRGB-gamut-edge inputs (pure red, pure
-        // magenta, etc.) where no smooth bounded reflectance exists in
-        // the Jakob 2019 sigmoid-of-quadratic family. Without this clamp,
-        // multi-bounce throughput at those wavelengths grows as r^N and
-        // produces fireflies. The roundtrip RGB will be slightly off for
-        // these gamut-edge inputs (i.e. they'll render slightly
-        // desaturated), which is the same trade-off the homotopy
-        // spike-stop already makes on the cool side of the basin.
+        return {c0, c1, c2, CIE::yBarIntegral()};
+    }
+
+    Spectrum fitSpectrum(const Vec3f &rgbLinear)
+    {
+        // Backwards-compat wrapper: builds a 61-sample Spectrum out of the
+        // SigmoidFit by evaluating it at every stored wavelength. Used by
+        // the probe and by Material::populateSpectra to fill the CPU
+        // Spectrum cache; per-bounce lookups go through evalSigmoidFit
+        // directly via Material::albedoAt / emissiveAt.
+        SigmoidFit fit = fitSigmoidCoefficients(rgbLinear);
+        Spectrum s;
         for (int i = 0; i < Spectrum::kSamples; i++)
-            s[i] = std::min(s[i], 1.f);
+            s[i] = evalSigmoidFit(fit, Spectrum::lambdaAt(i));
         return s;
     }
 }

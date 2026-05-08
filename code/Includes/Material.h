@@ -49,14 +49,36 @@ struct Material
     // Spectral counterparts of albedo and emissive. Populated at scene-
     // load time by populateSpectra() (called via SceneData) once the
     // RGB values are finalized. The path tracer's spectral mode reads
-    // these directly; the RGB path ignores them.
+    // these via albedoAt / emissiveAt; the RGB path ignores them.
     //
-    // Stored on the Material rather than computed on demand because a
-    // Newton-Raphson fit is ~10 microseconds per material and gets run
-    // across every primitive in every dispatch otherwise. Once at
-    // scene load is far cheaper than every ray.
+    // The Spectrum cache is convenient for whole-spectrum operations
+    // (debug prints, the probe, the rgb roundtrip in CIE::spectrumToXYZ)
+    // but not used on the per-bounce hot path. Per-lambda lookups go
+    // through the SigmoidFit form directly so the path tracer never
+    // pays for the linear-interp into the 61-sample table.
     Spectrum albedoSpectrum;
     Spectrum emissiveSpectrum;
+
+    // Sigmoid-coefficient form of the same Jakob 2019 fit, used on the
+    // spectral hot path and uploaded to GpuMaterial verbatim. 16 bytes
+    // per spectrum vs the Spectrum cache's 244, and a per-lookup eval
+    // (one sqrt + a few mads) instead of an array load + linear blend.
+    // GPU benefits the most: replacing the SSBO array load with ALU
+    // turns the per-bounce material lookup from memory-bound to
+    // ALU-bound and shrinks GpuMaterial enough to fit comfortably in
+    // L1 even with hundreds of materials.
+    RGBToSpectrum::SigmoidFit albedoFit;
+    RGBToSpectrum::SigmoidFit emissiveFit;
+
+    // Per-bounce spectral accessors. Hot path; inlined.
+    float albedoAt(float lambda) const
+    {
+        return RGBToSpectrum::evalSigmoidFit(albedoFit, lambda);
+    }
+    float emissiveAt(float lambda) const
+    {
+        return RGBToSpectrum::evalSigmoidFit(emissiveFit, lambda);
+    }
 
     bool isEmissive() const
     {
@@ -68,23 +90,27 @@ struct Material
     // deterministic (or Fresnel-weighted random) direction instead.
     bool isSpecular() const { return metallic || transparent; }
 
-    // Fit albedo and emissive into 61-sample spectra via Jakob 2019
-    // sigmoid upsampling. Idempotent. Emissive RGB is normalized
-    // before fit (the absolute brightness is restored after) because
-    // the upsampler expects values in [0, 1] and area lights
-    // routinely have emission much brighter than that.
+    // Fit albedo and emissive into Jakob 2019 sigmoid coefficients +
+    // a 61-sample Spectrum cache. Idempotent. Emissive RGB is normalized
+    // before fit (the absolute brightness is restored after via the
+    // SigmoidFit's scale field) because the upsampler expects values in
+    // [0, 1] and area lights routinely emit much brighter than that.
     void populateSpectra()
     {
+        albedoFit = RGBToSpectrum::fitSigmoidCoefficients(albedo);
         albedoSpectrum = RGBToSpectrum::fitSpectrum(albedo);
         if (isEmissive())
         {
             float maxE = std::max({emissive[0], emissive[1], emissive[2]});
             Vec3f normalized(emissive[0] / maxE, emissive[1] / maxE, emissive[2] / maxE);
+            emissiveFit = RGBToSpectrum::fitSigmoidCoefficients(normalized);
+            emissiveFit.scale *= maxE;
             emissiveSpectrum = RGBToSpectrum::fitSpectrum(normalized);
             emissiveSpectrum *= maxE;
         }
         else
         {
+            emissiveFit = {0.f, 0.f, 0.f, 0.f};
             emissiveSpectrum = Spectrum(0.f);
         }
     }

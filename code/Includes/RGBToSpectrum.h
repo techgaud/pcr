@@ -69,6 +69,46 @@ namespace RGBToSpectrum
     void fitCoefficients(const Vec3f &targetXYZ,
                          float &outC0, float &outC1, float &outC2);
 
+    // Compact form for runtime spectrum evaluation: the four floats the
+    // GPU needs to reconstruct a Spectrum sample at any wavelength
+    // without storing the 61-sample table. evalSigmoidFit below is the
+    // canonical eval, used by Material::albedoAt / emissiveAt and
+    // mirrored byte-for-byte in the GLSL spectral path.
+    //
+    //   sample(lambda) = clamp(sigmoid(c0 + L*c1 + L*L*c2) * scale, 0, 1)
+    //   L = (lambda - 550) / 150          (normalized to [-1, 1] across visible)
+    //
+    // For albedo, scale embeds the yBarIntegral conversion from
+    // "fit-to-XYZ" to physical reflectance convention. For emissive,
+    // scale additionally embeds the per-material maxE re-scaling that
+    // populateSpectra does after fitting normalized RGB.
+    struct SigmoidFit
+    {
+        float c0, c1, c2;
+        float scale;
+    };
+
+    // Linear-sRGB albedo or normalized-emissive RGB to a SigmoidFit. The
+    // emissive caller multiplies the returned scale by maxE before
+    // storage. Handles the gamut-corner cases (all-zero, all-one) with
+    // synthesized coefficients that produce exact 0 or 1 samples
+    // matching fitSpectrum's early-exit results. Defined in
+    // RGBToSpectrum.cpp.
+    SigmoidFit fitSigmoidCoefficients(const Vec3f &rgbLinear);
+
+    // Evaluate a SigmoidFit at a single wavelength. Header-only because
+    // it's on the per-bounce hot path; the compiler folds the polynomial
+    // into the calling material accessors. The 1.f cap matches the
+    // physical-reflectance clamp inside fitSpectrum.
+    inline float evalSigmoidFit(const SigmoidFit &fit, float lambda)
+    {
+        constexpr float kLambdaMid  = 0.5f * (Spectrum::kLambdaMin + Spectrum::kLambdaMax);
+        constexpr float kLambdaHalf = 0.5f * (Spectrum::kLambdaMax - Spectrum::kLambdaMin);
+        float L = (lambda - kLambdaMid) / kLambdaHalf;
+        float p = fit.c0 + L * (fit.c1 + L * fit.c2);
+        return std::min(sigmoid(p) * fit.scale, 1.f);
+    }
+
     // Linear-sRGB albedo to a 61-sample Spectrum, suitable for
     // direct storage on a Material. Defined in RGBToSpectrum.cpp.
     Spectrum fitSpectrum(const Vec3f &rgbLinear);

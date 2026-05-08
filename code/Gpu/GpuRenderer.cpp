@@ -259,19 +259,15 @@ struct GpuMaterial {
     int  transparent;     // 0 = opaque; 1 = glass dielectric
     float ior;            // index of refraction (transparent only)
     float cauchyB;        // dispersion: ior_at_lambda = ior + cauchyB*1e4/lambda^2
-    // Spectral mode (used when uUseSpectral != 0). 61-sample
-    // spectrum from 400-700 nm at 5 nm intervals, populated CPU-
-    // side from the same Jakob 2019 fit the CPU renderer uses.
-    // Stored as plain float arrays since std430 packs them tightly
-    // (4 bytes each, no per-element alignment); the trailing
-    // position in the struct keeps stride math simple.
-    float albedoSpec[61];
-    float emissiveSpec[61];
-    // std430 array stride for this struct rounds up to vec4 alignment
-    // (16 bytes), giving a 544-byte stride. The CPU C++ mirror declares
-    // matching trailing padding so sizeof and stride agree; without it
-    // the GPU reads materials[i] at the wrong offset for i > 0.
-    int  _pad0, _pad1;
+    // Spectral mode: Jakob 2019 sigmoid-of-quadratic fit packed as
+    //   sample(lambda) = clamp(sigmoid(c0 + L*c1 + L*L*c2) * scale, 0, 1)
+    //   L = (lambda - 550) / 150
+    // .xyz = (c0, c1, c2), .w = scale. evaluateSigmoidFit() below is
+    // the canonical eval; mirrors RGBToSpectrum::evalSigmoidFit on the
+    // CPU side. emissiveFit's scale field embeds the per-material maxE
+    // re-scaling so emissive intensities don't need a separate uniform.
+    vec4 albedoFit;
+    vec4 emissiveFit;
 };
 
 struct GpuTriangle {
@@ -349,25 +345,28 @@ const float kLambdaMax = 700.0;
 const int   kSpecSamples = 61;
 const float kSpecStep = 5.0; // (700-400) / (61-1)
 
-// Sample materials[matIdx].albedoSpec at an arbitrary wavelength.
-// Linear interpolation between the two surrounding stored samples.
-// Out-of-range lambdas clamp to the endpoints; the path tracer
-// shouldn't hit those, but the clamp keeps GPU memory access
-// in-bounds even if RNG produces something pathological.
+// Evaluate a sigmoid-of-quadratic Jakob fit at an arbitrary wavelength.
+// Mirrors RGBToSpectrum::evalSigmoidFit on the CPU side byte-for-byte.
+// Replaces the previous 61-sample table lookup: a vec4 SSBO read + a
+// few mads + one sqrt is faster than a strided 8-byte float-array load
+// + linear blend on every GPU we target. Also kills the std430 stride
+// landmine (the old per-material 488-byte arrays bumped GpuMaterial
+// past a vec4 boundary; the all-vec4 layout is naturally aligned).
+float evaluateSigmoidFit(vec4 fit, float lambda) {
+    const float kLambdaMid  = 550.0;  // 0.5 * (kLambdaMin + kLambdaMax)
+    const float kLambdaHalf = 150.0;  // 0.5 * (kLambdaMax - kLambdaMin)
+    float L = (lambda - kLambdaMid) / kLambdaHalf;
+    float p = fit.x + L * (fit.y + L * fit.z);
+    float s = 0.5 + p / (2.0 * sqrt(1.0 + p * p));
+    return min(s * fit.w, 1.0);
+}
+
 float albedoAt(int matIdx, float lambda) {
-    float t = (lambda - kLambdaMin) / kSpecStep;
-    int i = int(clamp(t, 0.0, float(kSpecSamples - 2)));
-    float f = clamp(t - float(i), 0.0, 1.0);
-    return materials[matIdx].albedoSpec[i] * (1.0 - f)
-         + materials[matIdx].albedoSpec[i+1] * f;
+    return evaluateSigmoidFit(materials[matIdx].albedoFit, lambda);
 }
 
 float emissiveAt(int matIdx, float lambda) {
-    float t = (lambda - kLambdaMin) / kSpecStep;
-    int i = int(clamp(t, 0.0, float(kSpecSamples - 2)));
-    float f = clamp(t - float(i), 0.0, 1.0);
-    return materials[matIdx].emissiveSpec[i] * (1.0 - f)
-         + materials[matIdx].emissiveSpec[i+1] * f;
+    return evaluateSigmoidFit(materials[matIdx].emissiveFit, lambda);
 }
 
 // Wyman 2013 CIE 1931 2-deg observer fit. ~1% accurate vs the
@@ -1418,17 +1417,12 @@ namespace
         int   transparent;
         float ior;
         float cauchyB;
-        float albedoSpec[61];
-        float emissiveSpec[61];
-        // std430 rounds the struct stride up to its largest member's
-        // alignment (vec4 = 16). Without these 8 bytes of explicit
-        // trailing padding, sizeof(GpuMaterial) = 536 in C++ but every
-        // GPU read of materials[i] for i > 0 is offset by 8*i bytes,
-        // scrambling materials. Cornell with 4 materials reads the 4th
-        // material 24 bytes off, which manifests as the magenta-walls /
-        // wrong-color GPU render bug. The static_assert below pins the
-        // size; if you add or remove fields, recompute.
-        int   _pad[2];
+        // Sigmoid-coefficient form of the Jakob 2019 fit; mirrors the
+        // GLSL declaration above. {c0, c1, c2, scale}. Each is naturally
+        // 16-byte aligned, so no trailing padding is needed for std430
+        // stride parity (struct totals 80 bytes - a multiple of 16).
+        float albedoFit[4];
+        float emissiveFit[4];
     };
     static_assert(sizeof(GpuMaterial) % 16 == 0,
                   "GpuMaterial size must be a multiple of 16 bytes for std430 array stride");
@@ -1628,11 +1622,14 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gm.transparent = m.transparent ? 1 : 0;
         gm.ior = m.ior;
         gm.cauchyB = m.cauchyB;
-        for (int i = 0; i < 61; i++)
-        {
-            gm.albedoSpec[i]   = m.albedoSpectrum[i];
-            gm.emissiveSpec[i] = m.emissiveSpectrum[i];
-        }
+        gm.albedoFit[0] = m.albedoFit.c0;
+        gm.albedoFit[1] = m.albedoFit.c1;
+        gm.albedoFit[2] = m.albedoFit.c2;
+        gm.albedoFit[3] = m.albedoFit.scale;
+        gm.emissiveFit[0] = m.emissiveFit.c0;
+        gm.emissiveFit[1] = m.emissiveFit.c1;
+        gm.emissiveFit[2] = m.emissiveFit.c2;
+        gm.emissiveFit[3] = m.emissiveFit.scale;
         mats.push_back(gm);
     }
 
