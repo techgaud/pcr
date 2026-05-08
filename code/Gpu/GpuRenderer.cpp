@@ -306,7 +306,9 @@ struct GpuLight {
     int  kind;            // 0 = Plane, 1 = TriangleSet
     int  firstTri;        // TriangleSet only
     int  count;           // TriangleSet only
-    int  _pad;
+    int  matIdx;          // index into materials[] for spectral emission
+                          // lookup (Plane kind only; TriangleSet uses the
+                          // per-triangle matIdx in lightTriangles[]).
 };
 
 // Compact triangle for area-light sampling. flatN.w stores the cumulative
@@ -317,7 +319,10 @@ struct GpuLightTriangle {
     vec4 v1;
     vec4 v2;
     vec4 flatN;           // xyz=N, w=cumulative area within parent light
-    vec4 emissive;
+    vec4 emissive;        // representative RGB (used by RGB path tracer)
+    int  matIdx;          // index into materials[] for spectral emission
+                          // lookup (TriangleSet kind).
+    int  _pad0, _pad1, _pad2;
 };
 
 layout(std430, binding = 1) buffer Spheres        { GpuSphere        spheres[];        };
@@ -608,7 +613,8 @@ bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) 
 // it. Mirrors CPU pick-and-sample. PDF over total light surface area =
 // 1/uTotalLightArea regardless of which light got picked.
 void sampleAreaLight(inout uint seed,
-                     out vec3 sampleP, out vec3 sampleN, out vec3 sampleEmissive) {
+                     out vec3 sampleP, out vec3 sampleN, out vec3 sampleEmissive,
+                     out int sampleMatIdx) {
     float pickTarget = rand(seed) * uTotalLightArea;
     int lightIdx = 0;
     float cumul = 0.0;
@@ -625,6 +631,7 @@ void sampleAreaLight(inout uint seed,
         sampleP = L.origin.xyz + L.u.xyz * ru + L.v.xyz * rv;
         sampleN = L.normal_area.xyz;
         sampleEmissive = L.emissive.rgb;
+        sampleMatIdx = L.matIdx;
     } else {
         // TriangleSet: binary-search the cumulative area (stored in flatN.w
         // of each light triangle), then uniform-sample within that triangle.
@@ -647,6 +654,7 @@ void sampleAreaLight(inout uint seed,
         sampleP = v0 + (v1 - v0) * r1 + (v2 - v0) * r2;
         sampleN = lightTriangles[triIdx].flatN.xyz;
         sampleEmissive = lightTriangles[triIdx].emissive.rgb;
+        sampleMatIdx = lightTriangles[triIdx].matIdx;
     }
 }
 )GLSL"
@@ -740,7 +748,8 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         if (uTotalLightArea > 0.0) {
             for (int s = 0; s < uShadowSamples; s++) {
                 vec3 sampleP, sampleN, sampleEmissive;
-                sampleAreaLight(seed, sampleP, sampleN, sampleEmissive);
+                int sampleMatIdx;
+                sampleAreaLight(seed, sampleP, sampleN, sampleEmissive, sampleMatIdx);
 
                 vec3 Li = sampleP - hit;
                 vec3 wi = normalize(Li);
@@ -919,7 +928,8 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
         if (uTotalLightArea > 0.0) {
             for (int s = 0; s < uShadowSamples; s++) {
                 vec3 sampleP, sampleN, sampleEmissiveRGB;
-                sampleAreaLight(seed, sampleP, sampleN, sampleEmissiveRGB);
+                int sampleMatIdx;
+                sampleAreaLight(seed, sampleP, sampleN, sampleEmissiveRGB, sampleMatIdx);
 
                 vec3 Li = sampleP - hit;
                 vec3 wi = normalize(Li);
@@ -952,30 +962,26 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
                         misWeight = (pdfLight * pdfLight) /
                                     (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
                     }
-                    // Per-channel direct contribution. Light's
-                    // emission is sampled at each lambda from the
-                    // light material's spectrum if we were able to
-                    // identify it via the shadow ray, else from a
-                    // best-effort lookup that mirrors what the CPU
-                    // sampleAreaLight gives us as RGB.
-                    //
-                    // Since sampleAreaLight returns sampleEmissiveRGB
-                    // not a material index, we approximate the
-                    // spectral emission by upsampling the RGB on the
-                    // fly. For correctness we'd plumb the picked
-                    // light's matIdx through; for simplicity here we
-                    // just use the RGB triple proportionally per
-                    // channel via the CIE observer (rough but
-                    // visually close for cornell-class lights).
-                    vec3 obs = vec3(0.0);
-                    obs.x = cieObserverAt(lambdas.x).y;  // y-bar at x
-                    // Correct approach is to thread matIdx through
-                    // sampleAreaLight; defer that to a refactor and
-                    // for now scale the RGB emission by the
-                    // observer's y at each lambda to fake
-                    // wavelength-dependence.
-                    float emitL0 = sampleEmissiveRGB.x * 0.30 + sampleEmissiveRGB.y * 0.59 + sampleEmissiveRGB.z * 0.11;
-                    vec4 emitLam = vec4(emitL0);
+                    // Per-channel direct contribution. The picked
+                    // light's matIdx threads through sampleAreaLight
+                    // so the emissive spectrum lookup is exact, not
+                    // an RGB-luminance approximation. Falls through
+                    // to the RGB emissive (luminance-weighted) only
+                    // if matIdx is unavailable, which currently
+                    // shouldn't happen but the fallback keeps the
+                    // path tracer robust.
+                    vec4 emitLam;
+                    if (sampleMatIdx >= 0) {
+                        emitLam = vec4(emissiveAt(sampleMatIdx, lambdas.x),
+                                       emissiveAt(sampleMatIdx, lambdas.y),
+                                       emissiveAt(sampleMatIdx, lambdas.z),
+                                       emissiveAt(sampleMatIdx, lambdas.w));
+                    } else {
+                        float emitL0 = sampleEmissiveRGB.x * 0.30
+                                     + sampleEmissiveRGB.y * 0.59
+                                     + sampleEmissiveRGB.z * 0.11;
+                        emitLam = vec4(emitL0);
+                    }
                     vec4 contrib = (albedoLam / PI) * emitLam * G * uTotalLightArea * misWeight;
                     directLo += contrib;
                 }
@@ -1234,7 +1240,7 @@ namespace
         int   kind;           // 0 = Plane, 1 = TriangleSet
         int   firstTri;       // TriangleSet only
         int   count;          // TriangleSet only
-        int   _pad;
+        int   matIdx;         // materials[] index for spectral emission
     };
     struct GpuLightTriangle
     {
@@ -1243,6 +1249,8 @@ namespace
         float v2[4];
         float flatN[4];   // xyz=N, w=cumulative area within parent light
         float emissive[4];
+        int   matIdx;     // materials[] index for spectral emission
+        int   _pad[3];
     };
 
     // Mirrors Renderer.cpp's compressZone. strftime("%Z") on Windows
@@ -1440,10 +1448,17 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
     // Plane lights go into the GpuPlane SSBO front-loaded so coplanar ties
     // (cornell ceiling-cutout case) are won by the light, mirroring the CPU
     // _planes ordering. Walls follow.
-    for (const auto &L : scene.areaLights)
+    // Track material indices for plane-kind area lights so the
+    // spectral path can look up the picked light's emissiveSpec via
+    // sampleAreaLight's out param. TriangleSet lights track theirs
+    // per-triangle (see the lightTriangles upload below).
+    std::vector<int> areaLightMatIdx(scene.areaLights.size(), -1);
+    for (size_t li = 0; li < scene.areaLights.size(); li++)
     {
+        const auto &L = scene.areaLights[li];
         if (L.kind != Scenes::AreaLightKind::Plane) continue;
         int mi = addMaterial(L.plane.material);
+        areaLightMatIdx[li] = mi;
         addPlane(L.plane, mi);
     }
     for (const auto &w : scene.walls)
@@ -1528,8 +1543,9 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
     std::vector<GpuLight> gpuLights;
     std::vector<GpuLightTriangle> gpuLightTris;
     float totalLightArea = 0.f;
-    for (const auto &L : scene.areaLights)
+    for (size_t li = 0; li < scene.areaLights.size(); li++)
     {
+        const auto &L = scene.areaLights[li];
         GpuLight gl{};
         gl.normal_area[3] = L.totalArea;
         totalLightArea += L.totalArea;
@@ -1548,6 +1564,7 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
             }
             gl.firstTri = 0;
             gl.count = 0;
+            gl.matIdx = areaLightMatIdx[li]; // captured above
         }
         else
         {
@@ -1559,10 +1576,17 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
             if (!L.triangles.empty())
                 for (int i = 0; i < 3; i++)
                     gl.emissive[i] = L.triangles.front().material.emissive[i];
+            gl.matIdx = -1; // unused for TriangleSet (per-tri matIdx instead)
 
             for (size_t ti = 0; ti < L.triangles.size(); ti++)
             {
                 const Triangle &t = L.triangles[ti];
+                // Add this triangle's material to the materials SSBO so
+                // the spectral path can fetch its emissiveSpec at sample
+                // time. Duplicates with the main triangle SSBO are
+                // possible (the GPU upload doesn't dedup materials), but
+                // the cost is small for cornell-class scenes.
+                int triMi = addMaterial(t.material);
                 GpuLightTriangle glt{};
                 for (int i = 0; i < 3; i++)
                 {
@@ -1573,6 +1597,7 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
                     glt.emissive[i] = t.material.emissive[i];
                 }
                 glt.flatN[3] = L.cumulativeArea[ti];
+                glt.matIdx = triMi;
                 gpuLightTris.push_back(glt);
             }
         }
