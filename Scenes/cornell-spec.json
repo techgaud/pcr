@@ -1,7 +1,7 @@
 {
   "schema": "1.0",
   "name": "cornell-spec",
-  "version": "1.1.1",
+  "version": "1.1.2",
 
   // Cornell Box, spec-faithful version. Reproduces the canonical 1984
   // Goral et al. setup (cf. http://www.graphics.cornell.edu/online/box/data.html)
@@ -30,16 +30,23 @@
   "camera": { "position": [0, 0, 0], "fov": 38 },
 
   // Materials are RGB approximations of Cornell's published spectral
-  // reflectance data for the box. The cream "white" is genuinely
-  // neutral (slightly cooler than our usual 0.74,0.74,0.64) and the
-  // light is closer to D65 daylight than our usual warm-tungsten
-  // (1.0,0.85,0.6). both choices match what canonical reference
-  // images of the Cornell Box look like.
+  // reflectance data. The "white" wall reflectance is decidedly cream,
+  // not neutral. integrated against the box's fluorescent illuminant it
+  // reads as warm, which is the look that distinguishes the canonical
+  // Cornell render from generic neutral-grey-walled imitations. The
+  // light source is the Cornell lab fluorescent, whose RGB conversion
+  // is the same warm 1.0,0.85,0.6 ratio cornell.json uses, here scaled
+  // to absolute emission units for the area light.
+  //
+  // Reference values (Mitsuba's port of the Cornell spectral data, the
+  // most-cited canonical RGB approximation):
+  //   white = (0.71, 0.69, 0.59), red = (0.63, 0.06, 0.04),
+  //   green = (0.14, 0.45, 0.09)
   "materials": {
-    "white":      { "albedo": [0.725, 0.71, 0.68] },
-    "red":        { "albedo": [0.63, 0.065, 0.05] },
-    "green":      { "albedo": [0.14, 0.45, 0.091] },
-    "neutrallight": { "emissive": [70.0, 65.0, 55.0] }
+    "white": { "albedo": [0.71, 0.69, 0.59] },
+    "red":   { "albedo": [0.63, 0.065, 0.05] },
+    "green": { "albedo": [0.14, 0.45, 0.091] },
+    "light": { "emissive": [70.0, 60.0, 42.0] }
   },
 
   "primitives": [
@@ -101,6 +108,6 @@
     // halo around the fixture.
     { "type": "plane", "name": "area-light", "light": true,
       "origin": [-0.469, 2.0, -7.41], "u": [0.937, 0, 0], "v": [0, 0, 0.757],
-      "material": "neutrallight" }
+      "material": "light" }
   ]
 }
