@@ -59,6 +59,20 @@ public:
     // a no-op and the flag prints a warning.
     bool useOIDN = false;
 
+    // Spectral rendering mode. When on, each primary ray samples a
+    // single wavelength (uniform in [400, 700] nm), tracks scalar
+    // radiance through bounces, and contributes a CIE XYZ value to
+    // the per-pixel accumulator. After all samples done, XYZ is
+    // converted to linear sRGB and the rest of the pipeline (OIDN,
+    // tone-map, bilateral, PNG) is identical. Materials must have
+    // populated spectra (set up at scene-load via populateSpectra).
+    //
+    // Single-wavelength-per-ray means convergence is slower than RGB
+    // for the same sample count, since each sample only covers one
+    // wavelength of the visible spectrum. aaSamples >= 16 recommended.
+    // Hero-wavelength sampling (phase 5) will close most of that gap.
+    bool useSpectral = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
@@ -86,6 +100,23 @@ private:
                   float totalLightArea, int depth,
                   Vec3f *outFirstAlbedo = nullptr,
                   Vec3f *outFirstNormal = nullptr);
+
+    // Single-wavelength variant for spectral mode. Tracks scalar
+    // radiance at the given lambda through the same bounces castRay
+    // would take, sampling materials' albedoSpectrum and
+    // emissiveSpectrum at lambda instead of multiplying by the RGB
+    // albedo / emissive vectors. Aux buffers (for OIDN) capture the
+    // RGB albedo and normal at first hit, same as castRay; OIDN runs
+    // on the post-XYZ-conversion linear sRGB framebuffer regardless
+    // of mode.
+    float castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+                          const std::vector<Triangle> &triangles,
+                          const std::vector<Bvh::Node> &bvh,
+                          const std::vector<Scenes::AreaLight> &lights,
+                          float totalLightArea, int depth, float lambda,
+                          Vec3f *outFirstAlbedo = nullptr,
+                          Vec3f *outFirstNormal = nullptr);
+
     bool sceneIntersect(const Ray &ray, const std::vector<Sphere> &spheres,
                         const std::vector<Triangle> &triangles,
                         const std::vector<Bvh::Node> &bvh,

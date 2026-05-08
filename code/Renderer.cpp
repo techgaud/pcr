@@ -13,6 +13,7 @@
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
+#include "Includes/CIE.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
 #include "Includes/ToneMap.h"
@@ -190,7 +191,28 @@ void Renderer::render(const Scenes::SceneData &scene,
                         Vec3f firstAlbedo, firstNormal;
                         Vec3f *albOut = (useOIDN && s == 0) ? &firstAlbedo : nullptr;
                         Vec3f *nrmOut = (useOIDN && s == 0) ? &firstNormal : nullptr;
-                        Vec3f c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
+                        Vec3f c;
+                        if (useSpectral)
+                        {
+                            // Single-wavelength path. Pick lambda
+                            // uniformly in [400, 700] nm; scale of
+                            // the XYZ contribution carries the lambda
+                            // sampling pdf so the absolute brightness
+                            // matches the full-spectrum integral.
+                            float lambda = Spectrum::kLambdaMin
+                                         + NumGen::Epsilon() * (Spectrum::kLambdaMax - Spectrum::kLambdaMin);
+                            float radL = castRaySpectral(ray, scene.spheres, scene.triangles, scene.triangleBvh,
+                                                         scene.areaLights, totalLightArea, 0, lambda,
+                                                         albOut, nrmOut);
+                            // Mean accumulator runs in XYZ for spectral mode;
+                            // we convert mean -> linear sRGB once after the
+                            // AA loop, when frameBuffer gets written below.
+                            c = CIE::singleLambdaXYZ(lambda, radL);
+                        }
+                        else
+                        {
+                            c = castRay(ray, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
+                        }
                         if (albOut) albedoBuffer[i * _width + j] = firstAlbedo;
                         if (nrmOut) normalBuffer[i * _width + j] = firstNormal;
 
@@ -224,6 +246,12 @@ void Renderer::render(const Scenes::SceneData &scene,
                             if (converged) break;
                         }
                     }
+                    // Spectral mode: mean is in CIE XYZ. Convert to
+                    // linear sRGB so the rest of the pipeline (OIDN,
+                    // tone-map, bilateral, PNG) sees the same color
+                    // space as the RGB path.
+                    if (useSpectral)
+                        mean = CIE::xyzToLinearSRGB(mean);
                     frameBuffer[i * _width + j] = mean;
                 }
                 if (progressRows)
@@ -325,11 +353,13 @@ void Renderer::render(const Scenes::SceneData &scene,
                          + "-w" + std::to_string(_width);
     if (_width != _height)
         filename += "-h" + std::to_string(_height);
-    // ACES is the only technique that ends up in the filename, since it
-    // changes the look of the image meaningfully (different tone curve)
-    // and naming it makes side-by-side comparison easier. AA / adaptive
-    // / OIDN all affect quality but produce the same "color" of image,
-    // so they live in the PNG metadata only.
+    // ACES and spectral are the techniques that change the rendered
+    // image's look (tone curve, color computation), so they end up in
+    // the filename for side-by-side comparison. AA / adaptive / OIDN
+    // / denoise all affect quality but produce the same "color" of
+    // image, so they live in the PNG metadata only.
+    if (useSpectral)
+        filename += "-spectral";
     if (useACES)
         filename += "-aces";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
@@ -368,6 +398,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("AASamples",  std::to_string(aaSamples));
     addText("Adaptive",   useAdaptive ? "1" : "0");
     addText("OIDN",       useOIDN     ? "1" : "0");
+    addText("Spectral",   useSpectral ? "1" : "0");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -598,6 +629,217 @@ Vec3f Renderer::castRay(const Ray &ray, const std::vector<Sphere> &spheres,
                 // emissive returns from indirect bounces would require a
                 // recursion refactor. For diffuse-only scenes the visible
                 // effect is small.
+                if (useMIS && cosLight > 1e-6f)
+                {
+                    float pdfLight = lightDist2 / (cosLight * totalLightArea);
+                    float pdfBrdf  = cosTheta / (float)std::numbers::pi;
+                    float w = (pdfLight * pdfLight) /
+                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                    directContrib *= w;
+                }
+                directLo += directContrib;
+            }
+        }
+    }
+
+    return directLo / _shadowSamples + indirectLo;
+}
+
+float Renderer::castRaySpectral(const Ray &ray, const std::vector<Sphere> &spheres,
+                                const std::vector<Triangle> &triangles,
+                                const std::vector<Bvh::Node> &bvh,
+                                const std::vector<Scenes::AreaLight> &lights,
+                                float totalLightArea, int depth, float lambda,
+                                Vec3f *outFirstAlbedo,
+                                Vec3f *outFirstNormal)
+{
+    Material material;
+    Vec3f hit, N;
+
+    if (depth >= _maxDepth || !sceneIntersect(ray, spheres, triangles, bvh, hit, N, material))
+    {
+        if (outFirstAlbedo) *outFirstAlbedo = Vec3f(0.f, 0.f, 0.f);
+        if (outFirstNormal) *outFirstNormal = Vec3f(0.f, 0.f, 1.f);
+        return 0.f;
+    }
+
+    bool entering = ray.dir.dot(N) < 0.f;
+    if (!entering)
+        N = N * -1;
+
+    // OIDN aux uses RGB albedo + normal regardless of render mode;
+    // OIDN itself is RGB-only, so we capture from material.albedo.
+    if (outFirstAlbedo) *outFirstAlbedo = material.albedo;
+    if (outFirstNormal) *outFirstNormal = N;
+
+    if (material.isEmissive())
+        return material.emissiveSpectrum(lambda);
+
+    // Mirror: deterministic reflection. Albedo at lambda tints the
+    // recursive scalar radiance.
+    if (material.metallic)
+    {
+        float cosI = -ray.dir.dot(N);
+        Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
+        Vec3f reflOrigin = hit + N * 1e-3f;
+        float recurse = castRaySpectral(Ray(reflectedDir, reflOrigin),
+                                        spheres, triangles, bvh, lights, totalLightArea,
+                                        depth + 1, lambda);
+        return recurse * material.albedoSpectrum(lambda);
+    }
+
+    // Glass: same Fresnel-Snell logic as the RGB castRay. The
+    // refractive index ior is wavelength-independent in our model
+    // (no chromatic dispersion yet), so the branch decision at each
+    // bounce is identical to the RGB path. Albedo at lambda still
+    // tints both branches.
+    if (material.transparent)
+    {
+        float n1 = entering ? 1.0f : material.ior;
+        float n2 = entering ? material.ior : 1.0f;
+        float cosI = -ray.dir.dot(N);
+        float eta = n1 / n2;
+        float sinT2 = eta * eta * (1.f - cosI * cosI);
+
+        Vec3f outDir;
+        Vec3f outOrigin;
+        if (sinT2 >= 1.f)
+        {
+            outDir = ray.dir + N * (2.f * cosI);
+            outOrigin = hit + N * 1e-3f;
+        }
+        else
+        {
+            float cosT = std::sqrt(1.f - sinT2);
+            float F0 = (n1 - n2) / (n1 + n2); F0 *= F0;
+            float F = F0 + (1.f - F0) * std::pow(1.f - cosI, 5.f);
+            if (NumGen::Epsilon() < F)
+            {
+                outDir = ray.dir + N * (2.f * cosI);
+                outOrigin = hit + N * 1e-3f;
+            }
+            else
+            {
+                outDir = ray.dir * eta + N * (eta * cosI - cosT);
+                outOrigin = hit - N * 1e-3f;
+            }
+        }
+        float recurse = castRaySpectral(Ray(outDir, outOrigin),
+                                        spheres, triangles, bvh, lights, totalLightArea,
+                                        depth + 1, lambda);
+        return recurse * material.albedoSpectrum(lambda);
+    }
+
+    // Diffuse path: indirect hemisphere sampling + direct light
+    // shadow rays. Both legs multiply by the per-lambda reflectance
+    // instead of the RGB albedo vector.
+    float albedoLambda = material.albedoSpectrum(lambda);
+
+    float indirectLo = 0.f;
+
+    const int strata = useStratified
+                       ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
+                       : 0;
+
+    for (size_t i = 0; i < (size_t)_samples; i++)
+    {
+        float r1, r2;
+        if (useStratified)
+        {
+            int sx = (int)i % strata;
+            int sy = ((int)i / strata) % strata;
+            r1 = (sx + NumGen::Epsilon()) / (float)strata;
+            r2 = (sy + NumGen::Epsilon()) / (float)strata;
+        }
+        else
+        {
+            r1 = NumGen::Epsilon();
+            r2 = NumGen::Epsilon();
+        }
+        auto randomRay = Ray::genRayFromIntersection(N, hit + N * 1e-3, r1, r2);
+
+        // Russian roulette uses the per-lambda reflectance for the
+        // termination probability, which is correct for the single-
+        // wavelength estimator: dimmer wavelengths terminate sooner,
+        // brighter ones survive more bounces.
+        if (useRussian && depth >= 1)
+        {
+            float p = std::min(0.95f, std::max(0.05f, albedoLambda));
+            if (NumGen::Epsilon() > p) continue;
+            indirectLo += castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+                                          totalLightArea, depth + 1, lambda)
+                          * albedoLambda / p;
+        }
+        else
+        {
+            indirectLo += castRaySpectral(randomRay, spheres, triangles, bvh, lights,
+                                          totalLightArea, depth + 1, lambda)
+                          * albedoLambda;
+        }
+    }
+    indirectLo /= _samples;
+
+    float directLo = 0.f;
+    if (totalLightArea > 0.f)
+    {
+        for (size_t i = 0; i < (size_t)_shadowSamples; i++)
+        {
+            const Scenes::AreaLight *picked = &lights.front();
+            {
+                float pickTarget = NumGen::Epsilon() * totalLightArea;
+                float cumul = 0.f;
+                for (const auto &L : lights)
+                {
+                    cumul += L.totalArea;
+                    if (pickTarget <= cumul) { picked = &L; break; }
+                }
+            }
+
+            Vec3f sampleP, sampleN;
+            float sampleEmissiveLambda;
+            if (picked->kind == Scenes::AreaLightKind::Plane)
+            {
+                const Plane &p = picked->plane;
+                float ru = NumGen::Epsilon();
+                float rv = NumGen::Epsilon();
+                sampleP = p.origin + p.getU() * ru + p.getV() * rv;
+                sampleN = p.N;
+                sampleEmissiveLambda = p.material.emissiveSpectrum(lambda);
+            }
+            else
+            {
+                float rtri = NumGen::Epsilon() * picked->totalArea;
+                auto it = std::lower_bound(picked->cumulativeArea.begin(),
+                                           picked->cumulativeArea.end(), rtri);
+                int triIdx = std::min((int)(it - picked->cumulativeArea.begin()),
+                                      (int)picked->triangles.size() - 1);
+                const Triangle &tri = picked->triangles[triIdx];
+
+                float r1 = NumGen::Epsilon();
+                float r2 = NumGen::Epsilon();
+                if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
+                sampleP = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
+                sampleN = tri.flatN;
+                sampleEmissiveLambda = tri.material.emissiveSpectrum(lambda);
+            }
+
+            Vec3f Li = sampleP - hit;
+            auto wi = Li.normalize();
+            auto cosTheta = std::max(0.f, wi.dot(N));
+            auto lightDist2 = Li.dot(Li);
+
+            auto shadowOrigin = cosTheta <= 0 ? hit - N * 1e-3 : hit + N * 1e-3;
+            Vec3f shadowHit, shadowN;
+            Material tmpMat;
+            bool inShadow = sceneIntersect(Ray(wi, shadowOrigin), spheres, triangles, bvh, shadowHit, shadowN, tmpMat) && lightDist2 - 1e-3 > (shadowHit - shadowOrigin).dot(shadowHit - shadowOrigin) && !tmpMat.isEmissive();
+
+            if (!inShadow)
+            {
+                float cosLight = std::max(0.f, sampleN.dot(Li * -1));
+                float G = (cosTheta * cosLight) / lightDist2;
+                float directContrib = (albedoLambda / (float)std::numbers::pi)
+                                      * sampleEmissiveLambda * G * totalLightArea;
+
                 if (useMIS && cosLight > 1e-6f)
                 {
                     float pdfLight = lightDist2 / (cosLight * totalLightArea);
