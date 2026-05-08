@@ -542,8 +542,12 @@ Vec3f Renderer::castRay(const Ray &ray,
     {
         for (size_t i = 0; i < (size_t)_shadowSamples; i++)
         {
-            // Pick one light proportional to its surface area.
+            // Pick one light proportional to its surface area. Single-
+            // light scenes (cornell-class) skip the random + scan; multi-
+            // light scenes do an O(L) walk that becomes worth replacing
+            // with a CDF + binary search once L grows past a handful.
             const Scenes::AreaLight *picked = &lights.front();
+            if (lights.size() > 1)
             {
                 float pickTarget = NumGen::Epsilon() * totalLightArea;
                 float cumul = 0.f;
@@ -781,6 +785,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
         for (size_t i = 0; i < (size_t)_shadowSamples; i++)
         {
             const Scenes::AreaLight *picked = &lights.front();
+            if (lights.size() > 1)
             {
                 float pickTarget = NumGen::Epsilon() * totalLightArea;
                 float cumul = 0.f;

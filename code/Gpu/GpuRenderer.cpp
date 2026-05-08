@@ -698,12 +698,19 @@ bool sceneIntersect(vec3 ro, vec3 rd, out vec3 hit, out vec3 N, out int matIdx) 
 void sampleAreaLight(inout uint seed,
                      out vec3 sampleP, out vec3 sampleN, out vec3 sampleEmissive,
                      out int sampleMatIdx) {
-    float pickTarget = rand(seed) * uTotalLightArea;
     int lightIdx = 0;
-    float cumul = 0.0;
-    for (int i = 0; i < uLightCount; i++) {
-        cumul += lights[i].normal_area.w;
-        if (pickTarget <= cumul) { lightIdx = i; break; }
+    if (uLightCount > 1) {
+        // Multi-light: linear walk over the light list, weighted by area.
+        // O(L) per shadow ray; with many lights this becomes the inner-loop
+        // bottleneck and a precomputed CDF + binary search is the standard
+        // upgrade. cornell-class scenes ship with one light and never hit
+        // the loop; we keep this branch tight rather than build the CDF.
+        float pickTarget = rand(seed) * uTotalLightArea;
+        float cumul = 0.0;
+        for (int i = 0; i < uLightCount; i++) {
+            cumul += lights[i].normal_area.w;
+            if (pickTarget <= cumul) { lightIdx = i; break; }
+        }
     }
 
     GpuLight L = lights[lightIdx];
