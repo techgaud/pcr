@@ -239,11 +239,18 @@ namespace RGBToSpectrum
 
     Spectrum fitSpectrum(const Vec3f &rgbLinear)
     {
-        float r = rgbLinear[0], g = rgbLinear[1], b = rgbLinear[2];
+        // Clamp inputs to physical reflectance range. RGB > 1 is unphysical
+        // for albedo (would gain energy at a wavelength). Emissive callers
+        // (Material::populateSpectra) already normalize to <= 1 before
+        // calling here and re-multiply by maxE afterward, so HDR emission
+        // is unaffected.
+        float r = std::clamp(rgbLinear[0], 0.f, 1.f);
+        float g = std::clamp(rgbLinear[1], 0.f, 1.f);
+        float b = std::clamp(rgbLinear[2], 0.f, 1.f);
         if (r <= 0.f && g <= 0.f && b <= 0.f) return Spectrum(0.f);
         if (r >= 1.f && g >= 1.f && b >= 1.f) return Spectrum(1.f);
 
-        Vec3f xyz = CIE::linearSRGBToXYZ(rgbLinear);
+        Vec3f xyz = CIE::linearSRGBToXYZ(Vec3f(r, g, b));
         float c0, c1, c2;
         fitCoefficients(xyz, c0, c1, c2);
         Spectrum s = Spectrum::fromSigmoidCoefficients(c0, c1, c2);
@@ -251,6 +258,18 @@ namespace RGBToSpectrum
         // multi-bounce path-tracer throughput attenuates the same way RGB
         // albedos do. See CIE::yBarIntegral() for the full discussion.
         s *= CIE::yBarIntegral();
+        // Clamp samples to [0, 1] reflectance. The sigmoid output is in
+        // [0, 1] but the * yBarIntegral scale-up can produce per-sample
+        // values up to ~107 for sRGB-gamut-edge inputs (pure red, pure
+        // magenta, etc.) where no smooth bounded reflectance exists in
+        // the Jakob 2019 sigmoid-of-quadratic family. Without this clamp,
+        // multi-bounce throughput at those wavelengths grows as r^N and
+        // produces fireflies. The roundtrip RGB will be slightly off for
+        // these gamut-edge inputs (i.e. they'll render slightly
+        // desaturated), which is the same trade-off the homotopy
+        // spike-stop already makes on the cool side of the basin.
+        for (int i = 0; i < Spectrum::kSamples; i++)
+            s[i] = std::min(s[i], 1.f);
         return s;
     }
 }
