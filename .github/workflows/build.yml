@@ -15,13 +15,24 @@ jobs:
   # spectral branch we run just this one job and skip the rest.
   windows-spectral-gpu:
     if: github.ref_name == 'spectral'
-    name: Build (Windows x64, spectral GPU only)
+    name: Build (Windows x64, spectral GPU only, clang-cl)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -S code -B code/Build
+      # clang-cl instead of cl.exe. The MSVC compiler (19.44 on the
+      # current windows-latest runner) crashes with an internal C++
+      # exception in CL!CloseTypeServerPDB during the "Generating
+      # Code..." pass on the spectral codebase, regardless of which
+      # workaround we throw at it (IPO off, /Zi stripped, /bigobj,
+      # /MP, moving heavy code into .cpp). It's a compiler bug we
+      # can't fix from outside cl.exe. clang-cl is MSVC-ABI-
+      # compatible (uses the same headers, runtime, linker, and
+      # produces equivalent COFF objects), accepts the same
+      # command-line flags, and doesn't share the buggy code path.
+      # -T ClangCL switches the VS generator's toolset.
+      - name: Configure (clang-cl toolset)
+        run: cmake -S code -B code/Build -T ClangCL
 
       - name: Build (GPU only)
         run: cmake --build code/Build --config Release --target physically-cringe-rendering
