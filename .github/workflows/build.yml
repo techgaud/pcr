@@ -9,7 +9,42 @@ on:
   workflow_dispatch:
 
 jobs:
+  # spectral-only: GPU binary, Windows, single zipped artifact. The
+  # other branches' build matrix (CPU binaries, Linux, macOS, the
+  # release job) is wasted work for the spectral spike, so on the
+  # spectral branch we run just this one job and skip the rest.
+  windows-spectral-gpu:
+    if: github.ref_name == 'spectral'
+    name: Build (Windows x64, spectral GPU only)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S code -B code/Build
+
+      - name: Build (GPU only)
+        run: cmake --build code/Build --config Release --target physically-cringe-rendering
+
+      - name: Stage GPU bundle
+        shell: bash
+        run: |
+          mkdir -p stage-gpu/physically-cringe-rendering
+          cp code/Build/Release/physically-cringe-rendering.exe \
+             stage-gpu/physically-cringe-rendering/
+          [ -d code/Build/Release/lib ] && cp -r code/Build/Release/lib stage-gpu/physically-cringe-rendering/ || true
+          cp -r Scenes stage-gpu/physically-cringe-rendering/
+          cp -r models stage-gpu/physically-cringe-rendering/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: physically-cringe-rendering-windows-x64
+          path: stage-gpu/
+          if-no-files-found: error
+          retention-days: 90
+
   windows:
+    if: github.ref_name != 'spectral'
     name: Build (Windows x64)
     runs-on: windows-latest
     steps:
@@ -71,6 +106,7 @@ jobs:
           retention-days: 90
 
   linux:
+    if: github.ref_name != 'spectral'
     name: Build (Linux x64)
     runs-on: ubuntu-latest
     steps:
@@ -111,6 +147,7 @@ jobs:
           retention-days: 90
 
   macos:
+    if: github.ref_name != 'spectral'
     name: Build (macOS arm64)
     runs-on: macos-latest
     steps:

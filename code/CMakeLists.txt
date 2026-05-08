@@ -9,6 +9,25 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Disable MSVC link-time code generation. The spectral header
+# infrastructure (Spectrum, CIE, RGBToSpectrum) is all header-only
+# with heavy inline operators on 61-element arrays plus a Newton-
+# Raphson solver, and MSVC's /GL whole-program optimizer crashes
+# in the "Generating Code..." phase trying to chew through the
+# combined inline footprint across every translation unit. CL.exe
+# exits with code -529706956 (0xE06D7363, an unhandled C++
+# exception inside the compiler itself). Disabling IPO sidesteps
+# the compiler bug at marginal release-build performance cost.
+#
+# Linux/macOS toolchains handle the same code fine; this is MSVC-
+# specific. Long-term the right fix is to move the heavy operators
+# (RGBToSpectrum::fitCoefficients, CIE::spectrumToXYZ) out of
+# headers into .cpp files, which would also drop the LTCG load on
+# MSVC even with /GL re-enabled.
+if(MSVC)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
+
 find_package(Threads REQUIRED)
 
 # --- Optional Intel Open Image Denoise (OIDN) ---------------------------
