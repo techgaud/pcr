@@ -48,6 +48,47 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  windows-portable:
+    name: Build (Windows x64 portable GPU)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ISPC
+        shell: pwsh
+        run: |
+          $url = "https://github.com/ispc/ispc/releases/download/v1.23.0/ispc-v1.23.0-windows.zip"
+          Invoke-WebRequest -Uri $url -OutFile ispc.zip
+          Expand-Archive ispc.zip -DestinationPath C:\ispc-install
+          # Add the bin/ to PATH for subsequent steps.
+          $bin = (Get-ChildItem -Path C:\ispc-install -Recurse -Filter ispc.exe | Select-Object -First 1).DirectoryName
+          echo "ISPC bin dir: $bin"
+          echo "$bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Configure (static OIDN, GPU only)
+        run: cmake -S code -B code/Build-Portable -DPCR_OIDN_STATIC=ON
+
+      - name: Build (physically-cringe-rendering only)
+        run: cmake --build code/Build-Portable --config Release --target physically-cringe-rendering
+
+      - name: Stage portable artifact
+        shell: bash
+        run: |
+          mkdir -p stage-portable
+          # Single-file binary. No lib/ — OIDN, TBB, and the C runtime
+          # are all statically linked into this one .exe.
+          cp code/Build-Portable/Release/physically-cringe-rendering.exe \
+             stage-portable/physically-cringe-rendering.exe
+          cp -r Scenes stage-portable/
+          cp -r models stage-portable/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pcr-windows-x64-portable
+          path: stage-portable/
+          if-no-files-found: error
+          retention-days: 90
+
   linux:
     name: Build (Linux x64)
     runs-on: ubuntu-latest
@@ -122,7 +163,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [windows, linux, macos]
+    needs: [windows, windows-portable, linux, macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -157,6 +198,12 @@ jobs:
              "release/physically-cringe-rendering-${VER}-windows-x64.exe"
           cp pcr-linux-x64/physically-cringe-rendering \
              "release/physically-cringe-rendering-${VER}-linux-x64"
+
+          # GPU GUI portable (Windows only): single-file .exe with OIDN
+          # statically linked. ~50 MB heavier than the bundled variant
+          # but no lib/ folder needed; double-click and run.
+          cp pcr-windows-x64-portable/physically-cringe-rendering.exe \
+             "release/physically-cringe-rendering-${VER}-portable-windows-x64.exe"
 
           # download-artifact strips +x on Unix; restore.
           chmod +x release/frank-based-rendering-cli-${VER}-linux-x64 \
