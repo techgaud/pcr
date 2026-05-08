@@ -17,11 +17,10 @@
   //          rendering artifact. cauchyB=0 (the field's default)
   //          falls back to wavelength-independent glass.
   //
-  // Visible dispersion requires --spectral mode + the CPU renderer
-  // (the GPU renderer handles cauchyB but uses a hero-IOR
-  // approximation, so its glass refracts with the hero wavelength
-  // and dispersion is muted; phase 10 will land per-channel path
-  // splitting on the GPU).
+  // Visible dispersion requires --spectral mode (CPU CLI flag or
+  // the GUI's Mode/Color radio set to Spectral). Both CPU and GPU
+  // backends fork into 4 per-channel sub-paths at glass surfaces
+  // and produce real visible spectral separation in caustics.
 
   "camera": { "position": [0, 0, 0], "fov": 65 },
 
