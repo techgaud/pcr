@@ -48,6 +48,28 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # Standalone GPU bundle: just physically-cringe-rendering.exe
+      # and the files it needs to run (lib/ for OIDN, Scenes/ for
+      # the JSON registry, models/ for the bunny mesh). Single
+      # downloadable zip named after the binary so the test cycle
+      # is "click artifact, extract, double-click .exe."
+      - name: Stage GPU bundle
+        shell: bash
+        run: |
+          mkdir -p stage-gpu/physically-cringe-rendering
+          cp code/Build/Release/physically-cringe-rendering.exe \
+             stage-gpu/physically-cringe-rendering/
+          [ -d code/Build/Release/lib ] && cp -r code/Build/Release/lib stage-gpu/physically-cringe-rendering/ || true
+          cp -r Scenes stage-gpu/physically-cringe-rendering/
+          cp -r models stage-gpu/physically-cringe-rendering/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: physically-cringe-rendering-windows-x64
+          path: stage-gpu/
+          if-no-files-found: error
+          retention-days: 90
+
   linux:
     name: Build (Linux x64)
     runs-on: ubuntu-latest
