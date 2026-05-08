@@ -206,13 +206,7 @@ namespace RGBToSpectrum
         // below converges in one Newton step. For chromatic targets the
         // flat fit gets refined in many small steps as we walk the
         // target toward its real chromaticity.
-        static const float kYBarIntegral = []() {
-            float sum = 0.f;
-            for (int i = 0; i < Spectrum::kSamples; i++)
-                sum += CIE::yBar(Spectrum::lambdaAt(i));
-            return sum * Spectrum::kStep;
-        }();
-        float c[3] = {sigmoidInverse(targetXYZ[1] / kYBarIntegral), 0.f, 0.f};
+        float c[3] = {sigmoidInverse(targetXYZ[1] / CIE::yBarIntegral()), 0.f, 0.f};
 
         // Walk the chromaticity ramp from gray to the real target. Save the
         // last "good" (smooth) coefficients along the way; if the homotopy
@@ -252,6 +246,11 @@ namespace RGBToSpectrum
         Vec3f xyz = CIE::linearSRGBToXYZ(rgbLinear);
         float c0, c1, c2;
         fitCoefficients(xyz, c0, c1, c2);
-        return Spectrum::fromSigmoidCoefficients(c0, c1, c2);
+        Spectrum s = Spectrum::fromSigmoidCoefficients(c0, c1, c2);
+        // Convert from "fit-to-XYZ" to physical reflectance convention so
+        // multi-bounce path-tracer throughput attenuates the same way RGB
+        // albedos do. See CIE::yBarIntegral() for the full discussion.
+        s *= CIE::yBarIntegral();
+        return s;
     }
 }

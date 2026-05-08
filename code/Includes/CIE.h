@@ -52,6 +52,41 @@ namespace CIE
               + 0.681f * wymanGauss(lambda, 459.0f, 0.0385f, 0.0725f);
     }
 
+    // Integral of yBar over the visible range with our discretization
+    // (61 samples at 5 nm steps, Wyman 2013 piecewise-Gaussian
+    // approximation). The normalization constant that bridges the two
+    // unit conventions for spectra used in this codebase:
+    //
+    //   "fit-to-XYZ"    s_fit(lambda) integrated against cmf gives RGB
+    //                   in [0, 1] linear-sRGB units. For a perfect
+    //                   white reflector, s_fit ~= 1/yBarIntegral ~=
+    //                   0.0095. Convenient for one-bounce sanity, but
+    //                   multi-bounce attenuates by an extra factor of
+    //                   yBarIntegral per bounce vs the RGB pipeline,
+    //                   leaving everything black.
+    //
+    //   "physical"      s(lambda) is a reflectance fraction in [0, 1].
+    //                   For a perfect white reflector, s = 1 everywhere.
+    //                   Multi-bounce throughput attenuates exactly like
+    //                   per-channel albedos do in the RGB pipeline.
+    //                   Output XYZ accumulator picks up an extra
+    //                   yBarIntegral factor that singleLambdaXYZ divides
+    //                   out below.
+    //
+    // The codebase uses the physical convention. RGBToSpectrum::fitSpectrum
+    // scales its output by yBarIntegral after Newton-Raphson, and
+    // singleLambdaXYZ divides by yBarIntegral on the way out.
+    inline float yBarIntegral()
+    {
+        static const float val = []() {
+            float sum = 0.f;
+            for (int i = 0; i < Spectrum::kSamples; i++)
+                sum += yBar(Spectrum::lambdaAt(i));
+            return sum * Spectrum::kStep;
+        }();
+        return val;
+    }
+
     // Integrate a sampled spectrum against the CIE 1931 observer to
     // produce CIE XYZ tristimulus values. Defined in CIE.cpp.
     Vec3f spectrumToXYZ(const Spectrum &s);
@@ -109,11 +144,17 @@ namespace CIE
         // kLambdaMin) cancels with the integration step in
         // spectrumToXYZ above. We carry it here so the absolute
         // brightness matches the full-spectrum case.
+        //
+        // The 1/yBarIntegral term converts back from the physical
+        // reflectance convention (s = 1 for a perfect white reflector)
+        // into linear-sRGB-comparable XYZ where Y(white) ~= 1. See
+        // yBarIntegral() above.
         constexpr float kLambdaRange = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
+        float scale = kLambdaRange / yBarIntegral();
         return Vec3f(
-            radiance * xBar(lambda) * kLambdaRange,
-            radiance * yBar(lambda) * kLambdaRange,
-            radiance * zBar(lambda) * kLambdaRange
+            radiance * xBar(lambda) * scale,
+            radiance * yBar(lambda) * scale,
+            radiance * zBar(lambda) * scale
         );
     }
 }

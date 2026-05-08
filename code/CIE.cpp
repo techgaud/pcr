@@ -22,7 +22,11 @@ namespace CIE
             Y += v * yBar(lambda);
             Z += v * zBar(lambda);
         }
-        return Vec3f(X * Spectrum::kStep, Y * Spectrum::kStep, Z * Spectrum::kStep);
+        // Normalize by yBarIntegral so a perfect white reflector (s = 1
+        // everywhere) maps to Y = 1, matching the linear-sRGB convention.
+        // See yBarIntegral() in CIE.h for the unit-convention rationale.
+        float scale = Spectrum::kStep / yBarIntegral();
+        return Vec3f(X * scale, Y * scale, Z * scale);
     }
 
     Vec3f spectrumToLinearSRGB(const Spectrum &s)
