@@ -1,17 +1,27 @@
 {
   "schema": "1.0",
   "name": "cornell-glass",
-  "version": "1.0.0",
+  "version": "1.1.0",
 
   // Whitted-style classic: a mirror sphere on the left, a glass sphere
   // on the right. Demonstrates the specular materials added in phase
-  // 5/6 (post-tonemap-and-aa work).
+  // 5/6, and (as of v1.1.0) Cauchy chromatic dispersion in glass for
+  // CPU spectral renders.
   //
   // Mirror = perfect specular reflection; tint via albedo.
   // Glass  = Fresnel-weighted reflection + refraction (Snell's law).
-  //          ior 1.5 is window-glass; bump to 1.33 for water, 2.4 for
-  //          diamond-ish dispersion would need wavelength-dependent
-  //          ior which we don't model.
+  //          ior 1.5 is window-glass; cauchyB controls how much the
+  //          IOR varies with wavelength. cauchyB=0.013 is roughly
+  //          the published Cauchy B for crown glass (BK7); the visible
+  //          rainbow on caustics through the sphere is real, not a
+  //          rendering artifact. cauchyB=0 (the field's default)
+  //          falls back to wavelength-independent glass.
+  //
+  // Visible dispersion requires --spectral mode + the CPU renderer
+  // (the GPU renderer handles cauchyB but uses a hero-IOR
+  // approximation, so its glass refracts with the hero wavelength
+  // and dispersion is muted; phase 10 will land per-channel path
+  // splitting on the GPU).
 
   "camera": { "position": [0, 0, 0], "fov": 65 },
 
@@ -21,7 +31,7 @@
     "green":     { "albedo": [0.13, 0.45, 0.10] },
     "warmlight": { "emissive": [80.0, 68.0, 48.0] },
     "mirror":    { "albedo": [0.95, 0.95, 0.95], "metallic": true },
-    "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5 }
+    "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5, "cauchyB": 0.013 }
   },
 
   "primitives": [

@@ -124,6 +124,12 @@ namespace Scenes
                         throw SceneLoaderError(path + ": materials." + name + ".ior must be a number");
                     mat.ior = it->get<float>();
                 }
+                if (auto it = m.find("cauchyB"); it != m.end())
+                {
+                    if (!it->is_number())
+                        throw SceneLoaderError(path + ": materials." + name + ".cauchyB must be a number");
+                    mat.cauchyB = it->get<float>();
+                }
                 if (mat.metallic && mat.transparent)
                     throw SceneLoaderError(path + ": materials." + name + " cannot be both metallic and transparent");
                 out.emplace(name, mat);

@@ -258,7 +258,7 @@ struct GpuMaterial {
     int  metallic;        // 0 = diffuse/glass; 1 = perfect mirror
     int  transparent;     // 0 = opaque; 1 = glass dielectric
     float ior;            // index of refraction (transparent only)
-    int  _pad;
+    float cauchyB;        // dispersion: ior_at_lambda = ior + cauchyB*1e4/lambda^2
     // Spectral mode (used when uUseSpectral != 0). 61-sample
     // spectrum from 400-700 nm at 5 nm intervals, populated CPU-
     // side from the same Jakob 2019 fit the CPU renderer uses.
@@ -879,11 +879,19 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
             continue;
         }
 
-        // Glass: ior is wavelength-independent in our model, so all
-        // 4 channels make the same reflect-vs-refract decision on
-        // the same RNG draw. Per-channel albedo tints both branches.
+        // Glass: hero-channel approximation. Use the hero (lambdas.x)
+        // IOR for the path direction; per-channel cauchyB-dispersed
+        // IORs aren't separately traced on the GPU in this initial
+        // commit (per-channel path splitting is invasive in GLSL's
+        // iterative tracePathSpectral; phase 10 will land it). For
+        // cauchyB == 0 the result is identical to the wavelength-
+        // independent glass we had before. For cauchyB > 0 the
+        // visible dispersion is muted on GPU (hero takes the path,
+        // others ride along) but visible on CPU.
         if (materials[matIdx].transparent != 0) {
-            float ior = materials[matIdx].ior;
+            float baseIor = materials[matIdx].ior;
+            float cb = materials[matIdx].cauchyB;
+            float ior = baseIor + cb * 1e4 / (lambdas.x * lambdas.x);
             float n1 = entering ? 1.0 : ior;
             float n2 = entering ? ior : 1.0;
             float eta = n1 / n2;
@@ -1204,7 +1212,7 @@ namespace
         int   metallic;
         int   transparent;
         float ior;
-        int   _pad;
+        float cauchyB;
         float albedoSpec[61];
         float emissiveSpec[61];
     };
@@ -1401,6 +1409,7 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gm.metallic = m.metallic ? 1 : 0;
         gm.transparent = m.transparent ? 1 : 0;
         gm.ior = m.ior;
+        gm.cauchyB = m.cauchyB;
         // Copy populated spectra. populateSpectra() ran at scene-
         // load (Material::populateSpectra inside SceneData::populateSpectra),
         // so these are filled in by the time we get here.

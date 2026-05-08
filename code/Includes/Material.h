@@ -25,6 +25,27 @@ struct Material
     bool transparent = false;
     float ior = 1.5f;
 
+    // Cauchy dispersion coefficient. ior_at_lambda(nm) = ior +
+    // cauchyB * 1e4 / lambda^2, so a typical crown glass (B ~ 0.013
+    // for the standard sellmeier-to-cauchy reduction) shifts ior by
+    // ~0.04 across the visible range and produces a visible
+    // rainbow when light refracts through glass at oblique angles.
+    // Default 0 = no dispersion = renders identical to before.
+    //
+    // Only meaningful in spectral mode, where the path tracer
+    // splits into per-channel sub-paths at glass surfaces (the 4
+    // hero wavelengths see different IORs and refract at different
+    // angles, producing real visible spectral separation). Ignored
+    // in RGB mode since RGB has no wavelength notion.
+    float cauchyB = 0.0f;
+
+    // Helper. Wavelength-dependent IOR via the Cauchy relation,
+    // truncated to the leading two terms. lambda is in nm.
+    float iorAtLambda(float lambda) const
+    {
+        return ior + cauchyB * 1e4f / (lambda * lambda);
+    }
+
     // Spectral counterparts of albedo and emissive. Populated at scene-
     // load time by populateSpectra() (called via SceneData) once the
     // RGB values are finalized. The path tracer's spectral mode reads
