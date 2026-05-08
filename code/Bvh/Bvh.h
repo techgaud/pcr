@@ -10,11 +10,12 @@
 // (phase 3) the linear-scan sceneIntersect collapses. The BVH gives log(N)
 // expected cost, which is what makes 70k-triangle bunny renders tractable.
 //
-// This is an object-median-split builder: at each level, sort the triangle
-// range by centroid on the longest axis of the parent box and split at the
-// middle index. Simpler than SAH and adequate for the uniformly triangulated
-// meshes typical of OBJ exports. Phase 3 may revisit with SAH if a non-
-// uniform mesh hits traversal hot-spots.
+// Default builder is Wald 2007 16-bin SAH: at each internal node, evaluate
+// candidate splits along all three axes by surface-area-weighted child
+// cost and pick the lowest. Falls back to leaf when SAH says the split
+// costs more than just intersecting the range. Object-median splits are
+// retained behind a kUseSAH constexpr toggle for debugging and as a
+// faster-to-build fallback when render budgets are tiny.
 //
 // Layout: array of nodes, depth-first allocation order. Internal nodes
 // store an explicit pair of child indices (leftChild, rightChild). Leaves
@@ -50,4 +51,16 @@ namespace Bvh
                    const Ray &ray,
                    Vec3f &hit, Vec3f &N, int &matIdx,
                    float &t_out, float closest_t);
+
+    // Tree shape stats. Useful for development and for the optional
+    // build-stats log a SceneLoader can print at scene-load time.
+    struct BuildStats
+    {
+        int nodeCount     = 0;
+        int leafCount     = 0;
+        int totalLeafTris = 0;  // sum of count across leaves
+        int maxLeafTris   = 0;
+        int depth         = 0;  // longest root-to-leaf chain
+    };
+    BuildStats statsOf(const std::vector<Node> &nodes);
 }
