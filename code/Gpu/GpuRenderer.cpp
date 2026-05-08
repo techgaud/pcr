@@ -267,6 +267,11 @@ struct GpuMaterial {
     // position in the struct keeps stride math simple.
     float albedoSpec[61];
     float emissiveSpec[61];
+    // std430 array stride for this struct rounds up to vec4 alignment
+    // (16 bytes), giving a 544-byte stride. The CPU C++ mirror declares
+    // matching trailing padding so sizeof and stride agree; without it
+    // the GPU reads materials[i] at the wrong offset for i > 0.
+    int  _pad0, _pad1;
 };
 
 struct GpuTriangle {
@@ -1374,7 +1379,18 @@ namespace
         float cauchyB;
         float albedoSpec[61];
         float emissiveSpec[61];
+        // std430 rounds the struct stride up to its largest member's
+        // alignment (vec4 = 16). Without these 8 bytes of explicit
+        // trailing padding, sizeof(GpuMaterial) = 536 in C++ but every
+        // GPU read of materials[i] for i > 0 is offset by 8*i bytes,
+        // scrambling materials. Cornell with 4 materials reads the 4th
+        // material 24 bytes off, which manifests as the magenta-walls /
+        // wrong-color GPU render bug. The static_assert below pins the
+        // size; if you add or remove fields, recompute.
+        int   _pad[2];
     };
+    static_assert(sizeof(GpuMaterial) % 16 == 0,
+                  "GpuMaterial size must be a multiple of 16 bytes for std430 array stride");
     struct GpuTriangle
     {
         float v0[4];
