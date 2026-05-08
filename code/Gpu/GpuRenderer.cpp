@@ -387,9 +387,17 @@ vec3 cieObserverAt(float lambda) {
 // Single-lambda XYZ contribution. Mirrors CIE::singleLambdaXYZ on
 // the CPU side. The kLambdaMax-kLambdaMin scaling cancels with the
 // uniform-pdf weight in the per-pixel estimator so absolute
-// brightness matches the full-spectrum case.
+// brightness matches the full-spectrum case. The 1/kYBarIntegral
+// term converts back from the physical reflectance convention used
+// in the spectrum buffers (s = 1 for a perfect white reflector) into
+// linear-sRGB-comparable XYZ where Y(white) ~= 1; see CIE.h on the
+// CPU side. The hardcoded 106.895 is the integral of the Wyman 2013
+// yBar approximation over 400-700 nm at 5 nm steps, the same
+// quantity CIE::yBarIntegral() computes at startup.
 vec3 singleLambdaXYZ(float lambda, float radiance) {
-    return cieObserverAt(lambda) * radiance * (kLambdaMax - kLambdaMin);
+    const float kYBarIntegral = 106.895210;
+    return cieObserverAt(lambda) * radiance
+         * (kLambdaMax - kLambdaMin) / kYBarIntegral;
 }
 
 // CIE XYZ to linear sRGB (D65). Standard 3x3 from IEC 61966-2-1.
