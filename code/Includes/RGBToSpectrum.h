@@ -84,8 +84,10 @@ namespace RGBToSpectrum
     // populateSpectra does after fitting normalized RGB.
     struct SigmoidFit
     {
-        float c0, c1, c2;
-        float scale;
+        float c0    = 0.f;
+        float c1    = 0.f;
+        float c2    = 0.f;
+        float scale = 0.f;
     };
 
     // Linear-sRGB albedo or normalized-emissive RGB to a SigmoidFit. The

@@ -95,13 +95,11 @@ namespace Scenes
         return L;
     }
 
-    // Populate the spectral counterparts (albedoSpectrum,
-    // emissiveSpectrum) of every Material in the scene's registry,
-    // computing each via the Newton-Raphson Jakob fit. Walks the
-    // materials vector once instead of every primitive in the scene
-    // (the old per-primitive walk did N redundant Newton-Raphson
-    // calls when N primitives shared one material; cornell-bunny had
-    // 70k of them).
+    // Populate the Jakob spectral fits (albedoFit, emissiveFit) on
+    // every Material in the scene's registry. Walks the materials
+    // vector once instead of every primitive in the scene (the old
+    // per-primitive walk did N redundant Newton-Raphson calls when
+    // N primitives shared one material; cornell-bunny had 70k of them).
     inline void populateSpectra(SceneData &s)
     {
         for (auto &m : s.materials) m.populateSpectra();

@@ -118,12 +118,12 @@ private:
 
     // Hero wavelength variant for spectral mode. Tracks N=4 scalar
     // radiances at correlated wavelengths through the same path
-    // geometry, sampling materials' albedoSpectrum and
-    // emissiveSpectrum at each lambda. Russian roulette decisions
-    // and direct-light sampling use the hero (lambdas[0]) channel
-    // so the path itself is sampled from a single distribution; the
-    // other 3 channels ride along. OIDN aux captures RGB albedo +
-    // normal at first hit regardless of mode.
+    // geometry, sampling materials' albedoFit and emissiveFit at
+    // each lambda via Material::albedoAt / emissiveAt. Russian
+    // roulette decisions and direct-light sampling use the hero
+    // (lambdas[0]) channel so the path itself is sampled from a
+    // single distribution; the other 3 channels ride along. OIDN
+    // aux captures RGB albedo + normal at first hit regardless of mode.
     SpectralSample castRaySpectral(const Ray &ray,
                                    const std::vector<Material> &materials,
                                    const std::vector<Sphere> &spheres,

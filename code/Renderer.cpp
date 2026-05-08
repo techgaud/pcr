@@ -685,7 +685,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
     {
         SpectralSample emitted;
         for (int k = 0; k < kHeroLambdaCount; k++)
-            emitted[k] = material.emissiveSpectrum(lambdas[k]);
+            emitted[k] = material.emissiveAt(lambdas[k]);
         return emitted;
     }
 
@@ -699,7 +699,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
                                                  depth + 1, lambdas);
         SpectralSample out;
         for (int k = 0; k < kHeroLambdaCount; k++)
-            out[k] = recurse[k] * material.albedoSpectrum(lambdas[k]);
+            out[k] = recurse[k] * material.albedoAt(lambdas[k]);
         return out;
     }
 
@@ -754,7 +754,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
                                                depth + 1, lambdas);
             SpectralSample out;
             for (int k = 0; k < kHeroLambdaCount; k++)
-                out[k] = r[k] * material.albedoSpectrum(lambdas[k]);
+                out[k] = r[k] * material.albedoAt(lambdas[k]);
             return out;
         }
 
@@ -772,7 +772,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
             SpectralSample r = castRaySpectral(Ray(outDir, outOrigin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
                                                depth + 1, singleLambdas);
-            out[k] = r[0] * material.albedoSpectrum(lambdas[k]);
+            out[k] = r[0] * material.albedoAt(lambdas[k]);
         }
         return out;
     }
@@ -780,7 +780,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
     // Diffuse: cache albedo at all 4 lambdas once per surface hit.
     SpectralSample albedoLambdas;
     for (int k = 0; k < kHeroLambdaCount; k++)
-        albedoLambdas[k] = material.albedoSpectrum(lambdas[k]);
+        albedoLambdas[k] = material.albedoAt(lambdas[k]);
 
     SpectralSample indirectLo{};
 
@@ -896,7 +896,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
                 }
                 for (int k = 0; k < kHeroLambdaCount; k++)
                 {
-                    float emitL = lightMat->emissiveSpectrum(lambdas[k]);
+                    float emitL = lightMat->emissiveAt(lambdas[k]);
                     float contrib = (albedoLambdas[k] / (float)std::numbers::pi)
                                     * emitL * G * totalLightArea * misWeight;
                     directLo[k] += contrib;
