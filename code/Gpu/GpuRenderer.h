@@ -45,6 +45,11 @@ public:
     int  aaSamples    = 1;
     bool useAdaptive  = false;
     bool useOIDN      = false;
+    // GPU spectral path is phase 6, not yet implemented. Field
+    // exists so the shared Gui/main.cpp source compiles against
+    // both renderers; assignment from settings is a no-op until
+    // the GLSL shader has a spectral mode to consume it.
+    bool useSpectral  = false;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

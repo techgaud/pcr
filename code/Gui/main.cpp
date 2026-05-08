@@ -138,7 +138,14 @@ struct Settings
     bool useMIS = false;
     bool useRussian = false;
     bool useStratified = false;
+    // Mode toggles. ACES and Spectral are presented as radio choices
+    // in the GUI's Mode section since they pick between two
+    // alternatives (Reinhard vs ACES tone-map; RGB vs Spectral
+    // pipeline) rather than turning a noise-reduction technique on
+    // or off. Stored as booleans because there are only two options
+    // for each axis right now.
     bool useACES = false;
+    bool useSpectral = false;
     bool useAA = false;
     int aaSamples = 4;
     bool useAdaptive = false;
@@ -198,6 +205,7 @@ static void loadSettings(Settings &s)
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
         s.useACES       = j.value("useACES",       s.useACES);
+        s.useSpectral   = j.value("useSpectral",   s.useSpectral);
         s.useAA         = j.value("useAA",         s.useAA);
         s.aaSamples     = j.value("aaSamples",     s.aaSamples);
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
@@ -249,6 +257,7 @@ static json buildSettingsJson(const Settings &s)
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
     j["useACES"]       = s.useACES;
+    j["useSpectral"]   = s.useSpectral;
     j["useAA"]         = s.useAA;
     j["aaSamples"]     = s.aaSamples;
     j["useAdaptive"]   = s.useAdaptive;
@@ -385,6 +394,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
             add(settings.useRussian,    "russian");
             add(settings.useStratified, "strat");
             add(settings.useACES,       "aces");
+            add(settings.useSpectral,   "spectral");
             if (settings.aaSamples > 1)
                 add(true, ("aa" + std::to_string(settings.aaSamples)).c_str());
             add(settings.useAdaptive,   "adaptive");
@@ -425,6 +435,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useRussian   = settings.useRussian;
         renderer.useStratified = settings.useStratified;
         renderer.useACES       = settings.useACES;
+        renderer.useSpectral   = settings.useSpectral;
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
         renderer.useOIDN       = settings.useOIDN;
@@ -1204,12 +1215,40 @@ int main(int, char **)
         pcrSliderInt("Samples", &settings.samples,       1, 4096, 1, 16);
         pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 64,   1, 4);
 
+        // Mode: pipeline-shaping choices that change WHAT the
+        // renderer computes, not how efficiently. ACES / Reinhard
+        // pick the tone curve; RGB / Spectral pick the color
+        // representation through the path tracer. Distinct from the
+        // Techniques section below, which only changes convergence
+        // speed without changing the target image.
+        ImGui::SeparatorText("Mode");
+        ImGui::TextUnformatted("Tone-map:");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Reinhard", !settings.useACES)) settings.useACES = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("ACES filmic", settings.useACES)) settings.useACES = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ACES filmic preserves midtone contrast better\n"
+                              "than Reinhard at the cost of mild hue shifts in\n"
+                              "saturated highlights. Output filename gets -aces.");
+
+        ImGui::TextUnformatted("Color:   ");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("RGB", !settings.useSpectral)) settings.useSpectral = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Spectral", settings.useSpectral)) settings.useSpectral = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Spectral mode samples one wavelength per ray and\n"
+                              "tracks scalar radiance through bounces. Slower\n"
+                              "convergence than RGB at equal sample count;\n"
+                              "AA samples >= 16 recommended. Output filename\n"
+                              "gets -spectral.");
+
         ImGui::SeparatorText("Techniques");
         ImGui::Checkbox("Denoise (5x5 cross-bilateral on output)", &settings.useDenoise);
         ImGui::Checkbox("MIS (light-side balance heuristic, partial)", &settings.useMIS);
         ImGui::Checkbox("Russian roulette (terminate paths at depth >= 1)", &settings.useRussian);
         ImGui::Checkbox("Stratified samples (jittered grid first bounce)", &settings.useStratified);
-        ImGui::Checkbox("ACES filmic tone-map (off = Reinhard)", &settings.useACES);
         ImGui::Checkbox("Anti-aliasing (jittered primary rays)", &settings.useAA);
         if (settings.useAA)
         {
