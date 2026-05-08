@@ -55,9 +55,20 @@ struct Material
     RGBToSpectrum::SigmoidFit emissiveFit;
 
     // Per-bounce spectral accessors. Hot path; inlined.
+    //
+    // Albedo clamps to [0, 1] because physical reflectance is bounded;
+    // for sRGB-gamut-edge inputs the fit can produce raw samples > 1
+    // (the sigmoid is in [0, 1] but scale = yBarIntegral ~= 107) and
+    // unclamped multi-bounce throughput would explode.
+    //
+    // Emissive is NOT clamped: radiance is HDR, and populateSpectra
+    // multiplies fit.scale by maxE so the natural sample magnitude is
+    // up to maxE per wavelength (e.g. ~80 for the cornell warm light).
+    // A clamp here would silently cap every light at 1.0, which is the
+    // bug we hit between the GPU sigmoid-coefficient migration and now.
     float albedoAt(float lambda) const
     {
-        return RGBToSpectrum::evalSigmoidFit(albedoFit, lambda);
+        return std::min(RGBToSpectrum::evalSigmoidFit(albedoFit, lambda), 1.f);
     }
     float emissiveAt(float lambda) const
     {

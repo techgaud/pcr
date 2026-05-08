@@ -347,22 +347,22 @@ const float kSpecStep = 5.0; // (700-400) / (61-1)
 
 // Evaluate a sigmoid-of-quadratic Jakob fit at an arbitrary wavelength.
 // Mirrors RGBToSpectrum::evalSigmoidFit on the CPU side byte-for-byte.
-// Replaces the previous 61-sample table lookup: a vec4 SSBO read + a
-// few mads + one sqrt is faster than a strided 8-byte float-array load
-// + linear blend on every GPU we target. Also kills the std430 stride
-// landmine (the old per-material 488-byte arrays bumped GpuMaterial
-// past a vec4 boundary; the all-vec4 layout is naturally aligned).
+// Returns the raw scaled sample - albedoAt clamps to [0, 1] because
+// physical reflectance is bounded; emissiveAt does not clamp because
+// emissive radiance is HDR (the upload's emissiveFit.w embeds the
+// per-material maxE, so the natural sample magnitude is up to maxE
+// per wavelength).
 float evaluateSigmoidFit(vec4 fit, float lambda) {
     const float kLambdaMid  = 550.0;  // 0.5 * (kLambdaMin + kLambdaMax)
     const float kLambdaHalf = 150.0;  // 0.5 * (kLambdaMax - kLambdaMin)
     float L = (lambda - kLambdaMid) / kLambdaHalf;
     float p = fit.x + L * (fit.y + L * fit.z);
     float s = 0.5 + p / (2.0 * sqrt(1.0 + p * p));
-    return min(s * fit.w, 1.0);
+    return s * fit.w;
 }
 
 float albedoAt(int matIdx, float lambda) {
-    return evaluateSigmoidFit(materials[matIdx].albedoFit, lambda);
+    return min(evaluateSigmoidFit(materials[matIdx].albedoFit, lambda), 1.0);
 }
 
 float emissiveAt(int matIdx, float lambda) {

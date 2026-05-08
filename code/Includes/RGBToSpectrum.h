@@ -75,13 +75,16 @@ namespace RGBToSpectrum
     // canonical eval, used by Material::albedoAt / emissiveAt and
     // mirrored byte-for-byte in the GLSL spectral path.
     //
-    //   sample(lambda) = clamp(sigmoid(c0 + L*c1 + L*L*c2) * scale, 0, 1)
+    //   sample(lambda) = sigmoid(c0 + L*c1 + L*L*c2) * scale
     //   L = (lambda - 550) / 150          (normalized to [-1, 1] across visible)
     //
     // For albedo, scale embeds the yBarIntegral conversion from
-    // "fit-to-XYZ" to physical reflectance convention. For emissive,
-    // scale additionally embeds the per-material maxE re-scaling that
-    // populateSpectra does after fitting normalized RGB.
+    // "fit-to-XYZ" to physical reflectance convention; the [0, 1] clamp
+    // is applied in Material::albedoAt because reflectance > 1 is
+    // unphysical. For emissive, scale additionally embeds the per-
+    // material maxE re-scaling that populateSpectra does after fitting
+    // normalized RGB; emissive radiance can be HDR so the clamp doesn't
+    // apply on the read side either.
     struct SigmoidFit
     {
         float c0    = 0.f;
@@ -100,15 +103,19 @@ namespace RGBToSpectrum
 
     // Evaluate a SigmoidFit at a single wavelength. Header-only because
     // it's on the per-bounce hot path; the compiler folds the polynomial
-    // into the calling material accessors. The 1.f cap matches the
-    // physical-reflectance clamp inside fitSpectrum.
+    // into the calling material accessors. Returns the raw scaled sample
+    // without clamping. Material::albedoAt clamps the result to [0, 1]
+    // because physical reflectance is bounded; Material::emissiveAt does
+    // not clamp because emissive radiance is HDR. Doing the clamp here
+    // would saturate emissive samples back to 1.0 once populateSpectra
+    // had baked the per-material maxE multiplier into fit.scale.
     inline float evalSigmoidFit(const SigmoidFit &fit, float lambda)
     {
         constexpr float kLambdaMid  = 0.5f * (Spectrum::kLambdaMin + Spectrum::kLambdaMax);
         constexpr float kLambdaHalf = 0.5f * (Spectrum::kLambdaMax - Spectrum::kLambdaMin);
         float L = (lambda - kLambdaMid) / kLambdaHalf;
         float p = fit.c0 + L * (fit.c1 + L * fit.c2);
-        return std::min(sigmoid(p) * fit.scale, 1.f);
+        return sigmoid(p) * fit.scale;
     }
 
     // Linear-sRGB albedo to a 61-sample Spectrum, suitable for

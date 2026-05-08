@@ -271,15 +271,18 @@ namespace RGBToSpectrum
 
     Spectrum fitSpectrum(const Vec3f &rgbLinear)
     {
-        // Backwards-compat wrapper: builds a 61-sample Spectrum out of the
-        // SigmoidFit by evaluating it at every stored wavelength. Used by
-        // the probe and by Material::populateSpectra to fill the CPU
-        // Spectrum cache; per-bounce lookups go through evalSigmoidFit
-        // directly via Material::albedoAt / emissiveAt.
+        // Convenience wrapper that builds a 61-sample Spectrum from the
+        // SigmoidFit by evaluating at every stored wavelength. Caller
+        // semantics are "spectrum samples = physical reflectance," so we
+        // clamp to [0, 1] here even though evalSigmoidFit no longer does.
+        // Used by the probe and by any external code path that wants a
+        // dense spectrum; per-bounce lookups don't go through this -
+        // they call evalSigmoidFit directly via Material::albedoAt /
+        // emissiveAt.
         SigmoidFit fit = fitSigmoidCoefficients(rgbLinear);
         Spectrum s;
         for (int i = 0; i < Spectrum::kSamples; i++)
-            s[i] = evalSigmoidFit(fit, Spectrum::lambdaAt(i));
+            s[i] = std::min(evalSigmoidFit(fit, Spectrum::lambdaAt(i)), 1.f);
         return s;
     }
 }
