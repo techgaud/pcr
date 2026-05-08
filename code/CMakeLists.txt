@@ -12,53 +12,99 @@ endif()
 find_package(Threads REQUIRED)
 
 # --- Optional Intel Open Image Denoise (OIDN) ---------------------------
-# Fetches an OS-appropriate prebuilt OIDN binary release from GitHub on
-# first configure (~30 sec download). Define PCR_HAVE_OIDN for code that
-# uses oidn::FilterRef etc; falls back gracefully when OFF (renderer
-# builds without OIDN, --oidn flag prints a clear "not available" error).
+# Two integration modes:
+#
+#   PCR_OIDN_STATIC=OFF (default): fetches an OS-appropriate prebuilt
+#     OIDN binary release from GitHub on first configure (~30 sec
+#     download). Renderer links against OpenImageDenoise.{dll,so,dylib}
+#     dynamically; the runtime libs deploy into a sibling lib/ folder
+#     next to the binary. Smaller binary, requires lib/ alongside.
+#
+#   PCR_OIDN_STATIC=ON: clones OIDN source from GitHub, configures with
+#     OIDN_STATIC_LIB + only the CPU device, builds it as a sub-project,
+#     and links the result statically. No DLL/so dependency at runtime,
+#     so the resulting binary is genuinely single-file portable. Adds
+#     ~50 MB to the binary (OIDN's pretrained weights blob) and ~5-10
+#     min to a clean build. Requires ISPC compiler on PATH (OIDN's SIMD
+#     kernel compiler).
+#
+# Define PCR_HAVE_OIDN for code that uses oidn::FilterRef etc; falls
+# back gracefully when PCR_USE_OIDN=OFF (renderer builds without OIDN,
+# --oidn flag prints a clear "not available" error).
 option(PCR_USE_OIDN "Build with Intel Open Image Denoise support" ON)
+option(PCR_OIDN_STATIC "Build OIDN from source as a static library (single-file portable binary)" OFF)
+
 if(PCR_USE_OIDN)
     include(FetchContent)
     set(_oidn_ver "2.3.0")
-    if(WIN32)
-        set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x64.windows.zip")
-    elseif(APPLE)
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
-            set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.arm64.macos.tar.gz")
+
+    if(PCR_OIDN_STATIC)
+        # Source build: only the CPU device + RT filter so the embedded
+        # weights blob stays as small as it can. OIDN_APPS=OFF skips
+        # their sample binaries; we just need the library.
+        set(OIDN_STATIC_LIB ON CACHE BOOL "" FORCE)
+        set(OIDN_DEVICE_CPU ON CACHE BOOL "" FORCE)
+        set(OIDN_DEVICE_CUDA OFF CACHE BOOL "" FORCE)
+        set(OIDN_DEVICE_HIP OFF CACHE BOOL "" FORCE)
+        set(OIDN_DEVICE_SYCL OFF CACHE BOOL "" FORCE)
+        set(OIDN_APPS OFF CACHE BOOL "" FORCE)
+        set(OIDN_FILTER_RT ON CACHE BOOL "" FORCE)
+        set(OIDN_FILTER_RTLIGHTMAP OFF CACHE BOOL "" FORCE)
+
+        FetchContent_Declare(oidn
+            GIT_REPOSITORY https://github.com/RenderKit/oidn.git
+            GIT_TAG v${_oidn_ver}
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(oidn)
+
+        # OIDN's source build creates a target literally named
+        # OpenImageDenoise. Alias it under our oidn::oidn name so the
+        # rest of the CMake (pcr_link_oidn) doesn't need to know which
+        # mode produced it.
+        add_library(oidn::oidn ALIAS OpenImageDenoise)
+        message(STATUS "OIDN: building from source as static library")
+    else()
+        if(WIN32)
+            set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x64.windows.zip")
+        elseif(APPLE)
+            if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+                set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.arm64.macos.tar.gz")
+            else()
+                set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x86_64.macos.tar.gz")
+            endif()
         else()
-            set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x86_64.macos.tar.gz")
+            set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x86_64.linux.tar.gz")
         endif()
-    else()
-        set(_oidn_url "https://github.com/RenderKit/oidn/releases/download/v${_oidn_ver}/oidn-${_oidn_ver}.x86_64.linux.tar.gz")
-    endif()
-    FetchContent_Declare(oidn URL ${_oidn_url})
-    FetchContent_MakeAvailable(oidn)
+        FetchContent_Declare(oidn URL ${_oidn_url})
+        FetchContent_MakeAvailable(oidn)
 
-    find_path(OIDN_INCLUDE_DIR OpenImageDenoise/oidn.h
-              HINTS ${oidn_SOURCE_DIR}/include NO_DEFAULT_PATH)
-    if(WIN32)
-        find_library(OIDN_LIBRARY NAMES OpenImageDenoise
-                     HINTS ${oidn_SOURCE_DIR}/lib NO_DEFAULT_PATH)
-        file(GLOB OIDN_RUNTIME_DLLS "${oidn_SOURCE_DIR}/bin/*.dll")
-    else()
-        find_library(OIDN_LIBRARY NAMES OpenImageDenoise libOpenImageDenoise
-                     HINTS ${oidn_SOURCE_DIR}/lib NO_DEFAULT_PATH)
-        file(GLOB OIDN_RUNTIME_DLLS "${oidn_SOURCE_DIR}/lib/*.so*"
-                                    "${oidn_SOURCE_DIR}/lib/*.dylib")
-    endif()
+        find_path(OIDN_INCLUDE_DIR OpenImageDenoise/oidn.h
+                  HINTS ${oidn_SOURCE_DIR}/include NO_DEFAULT_PATH)
+        if(WIN32)
+            find_library(OIDN_LIBRARY NAMES OpenImageDenoise
+                         HINTS ${oidn_SOURCE_DIR}/lib NO_DEFAULT_PATH)
+            file(GLOB OIDN_RUNTIME_DLLS "${oidn_SOURCE_DIR}/bin/*.dll")
+        else()
+            find_library(OIDN_LIBRARY NAMES OpenImageDenoise libOpenImageDenoise
+                         HINTS ${oidn_SOURCE_DIR}/lib NO_DEFAULT_PATH)
+            file(GLOB OIDN_RUNTIME_DLLS "${oidn_SOURCE_DIR}/lib/*.so*"
+                                        "${oidn_SOURCE_DIR}/lib/*.dylib")
+        endif()
 
-    if(NOT OIDN_INCLUDE_DIR OR NOT OIDN_LIBRARY)
-        message(FATAL_ERROR
-                "OIDN download succeeded but headers/library not found in "
-                "${oidn_SOURCE_DIR}. Re-run with -DPCR_USE_OIDN=OFF to build "
-                "without denoiser support.")
+        if(NOT OIDN_INCLUDE_DIR OR NOT OIDN_LIBRARY)
+            message(FATAL_ERROR
+                    "OIDN download succeeded but headers/library not found in "
+                    "${oidn_SOURCE_DIR}. Re-run with -DPCR_USE_OIDN=OFF to build "
+                    "without denoiser support.")
+        endif()
+        add_library(oidn::oidn UNKNOWN IMPORTED)
+        set_target_properties(oidn::oidn PROPERTIES
+            IMPORTED_LOCATION ${OIDN_LIBRARY}
+            INTERFACE_INCLUDE_DIRECTORIES ${OIDN_INCLUDE_DIR}
+        )
+        message(STATUS "OIDN: prebuilt include=${OIDN_INCLUDE_DIR} lib=${OIDN_LIBRARY}")
     endif()
-    add_library(oidn::oidn UNKNOWN IMPORTED)
-    set_target_properties(oidn::oidn PROPERTIES
-        IMPORTED_LOCATION ${OIDN_LIBRARY}
-        INTERFACE_INCLUDE_DIRECTORIES ${OIDN_INCLUDE_DIR}
-    )
-    message(STATUS "OIDN: include=${OIDN_INCLUDE_DIR} lib=${OIDN_LIBRARY}")
 endif()
 
 # Helper: link OIDN to a target + deploy its runtime libraries into a
@@ -88,6 +134,13 @@ function(pcr_link_oidn target)
     endif()
     target_link_libraries(${target} PRIVATE oidn::oidn)
     target_compile_definitions(${target} PRIVATE PCR_HAVE_OIDN)
+    if(PCR_OIDN_STATIC)
+        # Static OIDN: nothing to deploy alongside the binary, no
+        # delay-load needed (no DLL imports), no RPATH needed (no
+        # shared object lookup at runtime). The binary is self-
+        # contained.
+        return()
+    endif()
     if(WIN32)
         if(MSVC)
             target_link_options(${target} PRIVATE
