@@ -425,6 +425,11 @@ namespace Scenes
         // point on the order in `out.triangles` is what the BVH expects.
         out.triangleBvh = Bvh::build(out.triangles);
 
+        // Spectral upsample after BVH build because BVH permutes
+        // out.triangles, and we want every Material on every primitive
+        // (post-permutation) to carry its fitted spectrum.
+        populateSpectra(out);
+
         return out;
     }
 }

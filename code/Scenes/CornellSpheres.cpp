@@ -45,6 +45,7 @@ namespace Scenes
         s.spheres.push_back(Sphere(Vec3f(0.3f, -1.6f, -4.45f),   0.4f,  nonemissive));
         s.spheres.push_back(Sphere(Vec3f(0.75f, -0.75f, -4.75f), 0.35f, nonemissive));
 
+        populateSpectra(s);
         return s;
     }
 }

@@ -38,6 +38,7 @@ namespace Scenes
 
         s.spheres.push_back(Sphere(Vec3f(0.f, -1.f, -4.5f), 0.75f, nonemissive));
 
+        populateSpectra(s);
         return s;
     }
 }

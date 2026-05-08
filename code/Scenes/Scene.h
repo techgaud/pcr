@@ -86,6 +86,29 @@ namespace Scenes
         return L;
     }
 
+    // Walk every Material referenced by the scene and populate its
+    // spectral counterparts (albedoSpectrum, emissiveSpectrum) from
+    // the RGB values. Called at the end of every scene-load path.
+    // Idempotent. Cheap (~10 microseconds per material via Newton-
+    // Raphson, and Cornell-class scenes have under ten materials).
+    inline void populateSpectra(SceneData &s)
+    {
+        for (auto &sphere : s.spheres) sphere.material.populateSpectra();
+        for (auto &wall : s.walls) wall.material.populateSpectra();
+        for (auto &tri : s.triangles) tri.material.populateSpectra();
+        for (auto &L : s.areaLights)
+        {
+            if (L.kind == AreaLightKind::Plane)
+            {
+                L.plane.material.populateSpectra();
+            }
+            else
+            {
+                for (auto &tri : L.triangles) tri.material.populateSpectra();
+            }
+        }
+    }
+
     // Build an AreaLight from a contiguous list of triangles. Caches per-tri
     // cumulative area for binary-search sampling.
     inline AreaLight makeTriangleSetLight(std::vector<Triangle> tris)
