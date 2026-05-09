@@ -79,6 +79,7 @@ int main(int argc, char *argv[])
     bool useAdaptive = false;
     bool useOIDN = false;
     bool useSpectral = false;
+    int heroSamples = 4;
     bool useLUT = false;
     std::string lutFile;
     uint64_t seed = 0;
@@ -167,6 +168,14 @@ int main(int argc, char *argv[])
         "Options",
         "Configuration knobs that change how data is computed but not "
         "the algorithmic behavior of the path tracer.");
+    options->add_option("--hero-samples", heroSamples,
+                 "Hero wavelength sample count for spectral mode (Wilkie 2014). "
+                 "Default 4 = stratified hero sampling (recommended). "
+                 "1 = legacy single-wavelength path, exposed for benchmarking "
+                 "and visual A/B against the hero default. Other values map "
+                 "to 4 internally. Ignored in RGB mode.")
+        ->default_str("4")
+        ->check(CLI::Range(1, 4));
     options->add_option("--seed", seed,
                  "Fixed PRNG seed for bit-deterministic renders. When set "
                  "to non-zero, all per-thread Monte Carlo PRNG state "
@@ -340,6 +349,7 @@ int main(int argc, char *argv[])
     renderer.useAdaptive  = useAdaptive;
     renderer.useOIDN      = useOIDN;
     renderer.useSpectral  = useSpectral;
+    renderer.heroSamples  = heroSamples;
     renderer.render(sceneData, start, outputDir);
 
     return 0;

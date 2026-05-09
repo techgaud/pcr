@@ -153,6 +153,14 @@ struct Settings
     bool useAdaptive = false;
     bool useOIDN = false;
 
+    // Hero wavelength sample count. Default 4 = stratified hero
+    // (Wilkie 2014). 1 = legacy single-wavelength path, only meaningful
+    // for benchmarking and visual A/B against the hero default. The
+    // GUI control only appears in debug mode (when settings.debugMode
+    // is on AND settings.useSpectral is on). The setting persists
+    // regardless so toggling debug off doesn't silently revert.
+    int heroSamples = 4;
+
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
     // persisted regardless so flipping spectral on later restores the
@@ -227,6 +235,7 @@ static void loadSettings(Settings &s)
         s.aaSamples     = j.value("aaSamples",     s.aaSamples);
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
         s.useOIDN       = j.value("useOIDN",       s.useOIDN);
+        s.heroSamples   = j.value("heroSamples",   s.heroSamples);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -280,6 +289,7 @@ static json buildSettingsJson(const Settings &s)
     j["aaSamples"]     = s.aaSamples;
     j["useAdaptive"]   = s.useAdaptive;
     j["useOIDN"]       = s.useOIDN;
+    j["heroSamples"]   = s.heroSamples;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -540,6 +550,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useStratified = settings.useStratified;
         renderer.useACES       = settings.useACES;
         renderer.useSpectral   = settings.useSpectral;
+        renderer.heroSamples   = settings.heroSamples;
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
         renderer.useOIDN       = settings.useOIDN;
@@ -1362,6 +1373,36 @@ int main(int, char **)
         // predictable.
         if (settings.useSpectral)
         {
+            // Hero wavelength sampling control. Debug-only because
+            // production users have no reason to flip it - hero is
+            // always the right default for spectral mode. Exposed for
+            // benchmarking and visual A/B comparison against the
+            // legacy single-wavelength path. Setting persists across
+            // launches; debug mode only controls visibility.
+            if (settings.debugMode)
+            {
+                ImGui::SeparatorText("Hero wavelength (debug)");
+                ImGui::TextUnformatted("Channels:");
+                ImGui::SameLine();
+                bool isHero = (settings.heroSamples >= 4);
+                if (ImGui::RadioButton("1 (single-wavelength legacy)", !isHero))
+                    settings.heroSamples = 1;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Single wavelength per primary ray. Slower convergence\n"
+                        "(more noise per sample). Only useful for benchmarking\n"
+                        "the hero implementation against the legacy path.");
+                ImGui::SameLine();
+                if (ImGui::RadioButton("4 (hero, default)", isHero))
+                    settings.heroSamples = 4;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Wilkie 2014 hero wavelength sampling. 4 stratified\n"
+                        "wavelengths per primary ray share the same path\n"
+                        "geometry; ~3x faster convergence than single-\n"
+                        "wavelength on diffuse multi-bounce scenes.");
+            }
+
             static std::vector<LutDiscovery::DiscoveredLUT> discoveredLUTs =
                 LutDiscovery::discoverLUTs();
 

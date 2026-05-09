@@ -19,6 +19,7 @@
 // glfwGetProcAddress. ~80 lines of typedefs + loaders is cheaper than another
 // vendored library.
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -234,6 +235,7 @@ uniform int   uAaSamples;     // 1 = no AA; >1 = jittered primary rays per pixel
 uniform int   uUseAdaptive;   // 0/1; meaningful only when uAaSamples > 1
 uniform int   uWriteAux;      // 0/1; populate uAlbedoOut + uNormalOut for OIDN
 uniform int   uUseSpectral;   // 0 = RGB path tracer, 1 = hero-wavelength spectral
+uniform int   uHeroSamples;   // 4 = hero default; 1 = single-wavelength legacy
 
 const float PI = 3.14159265358979323846;
 
@@ -1308,28 +1310,58 @@ void main() {
                 r2 = rand(seed);
             }
             if (uUseSpectral != 0) {
-                // Hero wavelength sampling. Pick a hero lambda
-                // uniformly in the visible range; the other 3 are
-                // stratified offsets wrapped around. tracePathSpectral
-                // returns 4 scalar radiances; convert each to a CIE
-                // XYZ contribution via the observer at its lambda
-                // and average across the 4 channels (1/N is the
-                // sampling weight). The accumulator runs in XYZ for
-                // the duration of the AA loop; we convert mean to
-                // linear sRGB once after the loop.
-                float kSpan = kLambdaMax - kLambdaMin;
-                float kStride = kSpan / 4.0;
-                vec4 lambdas;
-                lambdas.x = kLambdaMin + rand(seed) * kSpan;
-                lambdas.y = lambdas.x + kStride; if (lambdas.y > kLambdaMax) lambdas.y -= kSpan;
-                lambdas.z = lambdas.x + kStride * 2.0; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
-                lambdas.w = lambdas.x + kStride * 3.0; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
-                vec4 rad = tracePathSpectral(jpix, r1, r2, lambdas, seed);
-                vec3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
-                         + singleLambdaXYZ(lambdas.y, rad.y)
-                         + singleLambdaXYZ(lambdas.z, rad.z)
-                         + singleLambdaXYZ(lambdas.w, rad.w);
-                accum += xyz * 0.25;
+                if (uHeroSamples <= 1) {
+                    // Single-wavelength legacy path. Pick one lambda
+                    // uniformly in the visible, route to the existing
+                    // single-channel kernel (already used internally
+                    // by the hero kernel for glass dispersion path
+                    // splits, so it's well-exercised). Strictly worse
+                    // noise than hero at the same sample count, but
+                    // exposed for benchmarking and visual A/B against
+                    // the hero default.
+                    //
+                    // Primary ray construction matches tracePathSpectral
+                    // (same pix-to-direction transform); we inline it
+                    // here because tracePathSpectralSingle takes the
+                    // ray as origin+direction rather than a pixel
+                    // coordinate.
+                    float kSpan = kLambdaMax - kLambdaMin;
+                    float lambda = kLambdaMin + rand(seed) * kSpan;
+                    float aspect = float(uWidth) / float(uHeight);
+                    float scale  = tan(uFov * 0.5);
+                    vec2 nd = (jpix * 2.0 - vec2(uWidth, uHeight)) /
+                              vec2(uWidth, uHeight);
+                    vec3 dir = normalize(vec3(nd.x * scale * aspect,
+                                              -nd.y * scale,
+                                              -1.0));
+                    float rad = tracePathSpectralSingle(uOrigin, dir, lambda,
+                                                        uDepth, 0, seed);
+                    accum += singleLambdaXYZ(lambda, rad);
+                } else {
+                    // Hero wavelength sampling. Pick a hero lambda
+                    // uniformly in the visible range; the other 3
+                    // are stratified offsets wrapped around.
+                    // tracePathSpectral returns 4 scalar radiances;
+                    // convert each to a CIE XYZ contribution via the
+                    // observer at its lambda and average across the
+                    // 4 channels (1/N is the sampling weight). The
+                    // accumulator runs in XYZ for the duration of
+                    // the AA loop; we convert mean to linear sRGB
+                    // once after the loop.
+                    float kSpan = kLambdaMax - kLambdaMin;
+                    float kStride = kSpan / 4.0;
+                    vec4 lambdas;
+                    lambdas.x = kLambdaMin + rand(seed) * kSpan;
+                    lambdas.y = lambdas.x + kStride; if (lambdas.y > kLambdaMax) lambdas.y -= kSpan;
+                    lambdas.z = lambdas.x + kStride * 2.0; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
+                    lambdas.w = lambdas.x + kStride * 3.0; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
+                    vec4 rad = tracePathSpectral(jpix, r1, r2, lambdas, seed);
+                    vec3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
+                             + singleLambdaXYZ(lambdas.y, rad.y)
+                             + singleLambdaXYZ(lambdas.z, rad.z)
+                             + singleLambdaXYZ(lambdas.w, rad.w);
+                    accum += xyz * 0.25;
+                }
             } else {
                 accum += tracePath(jpix, r1, r2, seed);
             }
@@ -1973,6 +2005,11 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     // not needed so the GPU isn't doing useless writes.
     setI("uWriteAux",       useOIDN ? 1 : 0);
     setI("uUseSpectral",    useSpectral ? 1 : 0);
+    // heroSamples: 4 = stratified hero (default), 1 = single-wavelength
+    // legacy (routes the primary ray through tracePathSpectralSingle).
+    // Other values clamp to 4 in the shader's branch test (uHeroSamples
+    // <= 1 triggers the single-wavelength path; everything else hero).
+    setI("uHeroSamples",    std::clamp(heroSamples, 1, 4));
     setI("uAaSamples",      std::max(1, aaSamples));
     setI("uUseAdaptive",    useAdaptive ? 1 : 0);
     setI("uStrata",         useStratified

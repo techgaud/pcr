@@ -86,6 +86,21 @@ public:
     // Hero-wavelength sampling (phase 5) will close most of that gap.
     bool useSpectral = false;
 
+    // Hero-wavelength sample count. Default 4 = stratified hero sampling
+    // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
+    // for benchmarking and visual A/B against the hero default. Other
+    // values map to 4 internally (the path tracer always carries N=4
+    // channels through bounces; smaller N just causes the unused
+    // channels to be filled with the hero's wavelength so they
+    // contribute identical values that get correctly normalized out
+    // of the final XYZ accumulation).
+    //
+    // GPU spectral renders take a fast path when this is 1: route
+    // directly to tracePathSpectralSingle (which already exists for
+    // glass dispersion). CPU stays on the 4-channel code path either
+    // way - the wasted ALU is small relative to BVH work.
+    int heroSamples = 4;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

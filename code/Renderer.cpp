@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cctype>
 #include <vector>
 #include <numbers>
@@ -207,38 +208,52 @@ void Renderer::render(const Scenes::SceneData &scene,
                         {
                             // Hero wavelength sampling. Pick a hero
                             // lambda uniformly in [400, 700] nm; the
-                            // other 3 lambdas are stratified offsets
+                            // other lambdas are stratified offsets
                             // wrapped around the visible range, so
-                            // the 4 channels collectively cover the
-                            // whole spectrum on every ray. Path
-                            // geometry is shared; per-channel scalar
-                            // multiplies happen inside castRaySpectral.
+                            // the heroSamples channels collectively
+                            // cover the whole spectrum on every ray.
+                            // Path geometry is shared; per-channel
+                            // scalar multiplies happen inside
+                            // castRaySpectral.
+                            //
+                            // heroSamples < kHeroLambdaCount (e.g. 1
+                            // for benchmarking against legacy single-
+                            // wavelength) fills the unused channels
+                            // with the hero's lambda. Those channels
+                            // produce identical radiance values which
+                            // we then exclude from the XYZ sum below
+                            // so the sampling weight stays correct.
+                            int N = std::clamp(heroSamples, 1, kHeroLambdaCount);
                             constexpr float kSpan = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
-                            constexpr float kStride = kSpan / (float)kHeroLambdaCount;
+                            float kStride = kSpan / (float)N;
                             SpectralSample lambdas;
                             lambdas[0] = Spectrum::kLambdaMin + NumGen::Epsilon() * kSpan;
-                            for (int k = 1; k < kHeroLambdaCount; k++)
+                            for (int k = 1; k < N; k++)
                             {
                                 float l = lambdas[0] + kStride * k;
                                 if (l > Spectrum::kLambdaMax) l -= kSpan;
                                 lambdas[k] = l;
                             }
+                            for (int k = N; k < kHeroLambdaCount; k++)
+                                lambdas[k] = lambdas[0];
                             SpectralSample rad = castRaySpectral(ray, scene.materials,
                                                                  scene.spheres, scene.triangles, scene.triangleBvh,
                                                                  scene.areaLights, totalLightArea, 0, lambdas,
                                                                  albOut, nrmOut);
                             // Convert each (lambda, radiance) to a
                             // CIE XYZ contribution, average across
-                            // the N channels (1/N is the lambda-
-                            // sampling weight for the hero scheme).
+                            // the N actually-sampled channels (1/N is
+                            // the lambda-sampling weight for the hero
+                            // scheme). Channels k >= N are duplicates
+                            // of channel 0 and excluded from the sum.
                             // Mean accumulator runs in XYZ; we
                             // convert mean -> linear sRGB once after
                             // the AA loop, when frameBuffer gets
                             // written below.
                             Vec3f xyz(0.f, 0.f, 0.f);
-                            for (int k = 0; k < kHeroLambdaCount; k++)
+                            for (int k = 0; k < N; k++)
                                 xyz = xyz + CIE::singleLambdaXYZ(lambdas[k], rad[k]);
-                            c = xyz / (float)kHeroLambdaCount;
+                            c = xyz / (float)N;
                         }
                         else
                         {

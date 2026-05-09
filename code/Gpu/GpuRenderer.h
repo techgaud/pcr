@@ -51,6 +51,14 @@ public:
     // the GLSL shader has a spectral mode to consume it.
     bool useSpectral  = false;
 
+    // Hero-wavelength sample count. 4 = stratified hero (Wilkie 2014,
+    // current default). 1 = legacy single-wavelength, exposed for
+    // benchmarking and visual A/B. The GPU shader takes a fast path
+    // at 1: route to tracePathSpectralSingle (already exists for
+    // glass dispersion) instead of the vec4 hero kernel. Other
+    // values map to 4 (full hero).
+    int heroSamples = 4;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
