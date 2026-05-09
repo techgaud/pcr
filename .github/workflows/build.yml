@@ -46,6 +46,8 @@ jobs:
           [ -d code/Build/Release/lib ] && cp -r code/Build/Release/lib stage-gpu/physically-cringe-rendering/ || true
           cp -r Scenes stage-gpu/physically-cringe-rendering/
           cp -r models stage-gpu/physically-cringe-rendering/
+          cp -r spd    stage-gpu/physically-cringe-rendering/
+          [ -d luts ] && cp -r luts stage-gpu/physically-cringe-rendering/ || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -99,6 +101,8 @@ jobs:
           # JSON scenes via the executable-dir fallback out of the box.
           cp -r Scenes stage/
           cp -r models stage/
+          cp -r spd    stage/
+          [ -d luts ] && cp -r luts stage/ || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -121,6 +125,8 @@ jobs:
           [ -d code/Build/Release/lib ] && cp -r code/Build/Release/lib stage-gpu/physically-cringe-rendering/ || true
           cp -r Scenes stage-gpu/physically-cringe-rendering/
           cp -r models stage-gpu/physically-cringe-rendering/
+          cp -r spd    stage-gpu/physically-cringe-rendering/
+          [ -d luts ] && cp -r luts stage-gpu/physically-cringe-rendering/ || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -162,6 +168,8 @@ jobs:
           [ -d code/Build/lib ] && cp -r code/Build/lib stage/ || true
           cp -r Scenes stage/
           cp -r models stage/
+          cp -r spd    stage/
+          [ -d luts ] && cp -r luts stage/ || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -195,6 +203,8 @@ jobs:
           [ -d code/Build/lib ] && cp -r code/Build/lib stage/ || true
           cp -r Scenes stage/
           cp -r models stage/
+          cp -r spd    stage/
+          [ -d luts ] && cp -r luts stage/ || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -320,6 +330,14 @@ jobs:
           # archive so users grabbing the cornell-bunny scene have the bunny
           # mesh available without pulling the full source tree.
           (cd pcr-linux-x64 && zip -r "../release/pcr-models-${VER}.zip" models)
+
+          # Spectral data (.spd) and precomputed LUTs are also OS-agnostic.
+          # cornell-spec references measured Cornell SPDs from spd/cornell/;
+          # luts/ contains the default-kres16 Jakob LUT shipped pre-built.
+          # Both directories need to ride along next to the binary, so ship
+          # them as separate archives matching the Scenes/ and models/ pattern.
+          (cd pcr-linux-x64 && zip -r "../release/pcr-spd-${VER}.zip" spd)
+          [ -d pcr-linux-x64/luts ] && (cd pcr-linux-x64 && zip -r "../release/pcr-luts-${VER}.zip" luts) || true
 
           ls -la release/
 
