@@ -2067,8 +2067,22 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     int tileSide = (int)std::sqrt((double)maxPixelsPerDispatch);
     // Tile floor: heavy per-pixel work needs aggressive small tiles even at
     // the cost of more dispatch overhead. Light work uses bigger tiles to
-    // avoid drowning in glFinish overhead.
-    int minTileSide = (effectivePerPixel > 5e5) ? 8 : 16;
+    // avoid drowning in glFinish overhead. Three tiers:
+    //
+    //   < 5e5      : light work (RGB cornell at modest samples) -> floor 16
+    //   < 2e6      : heavy     (RGB at high samples, spectral simple) -> floor 8
+    //   >= 2e6     : very heavy (spectral + aa + adaptive + OIDN on a
+    //                complex scene at production samples) -> floor 4
+    //
+    // The 2e6 tier was added after spectral cornell-spec at d=4 s=2048
+    // S=16 aa=4 hit TDR at a tile size of 8: the formula wanted 6 but
+    // the floor pinned 8, putting each dispatch ~75% over the 1.5e8
+    // work-per-dispatch target. Floor of 4 gives that case 16-pixel
+    // tiles which sit comfortably under budget.
+    int minTileSide;
+    if (effectivePerPixel >= 2e6)      minTileSide = 4;
+    else if (effectivePerPixel > 5e5)  minTileSide = 8;
+    else                               minTileSide = 16;
     tileSide = std::clamp(tileSide, minTileSide, 256);
     // No work-group-multiple rounding; the shader's per-axis bounds check
     // handles non-multiples. The 16x16 work-group still dispatches a few
