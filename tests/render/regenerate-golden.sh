@@ -34,6 +34,7 @@ TUPLES=(
     "cornell-spectral|cornell|spectral|"
     "cornell-spectral-lut|cornell|spectral|--lut"
     "cornell-spectral-lut-file|cornell|spectral|--lut-file default-kres16"
+    "cornell-spectral-hero1|cornell|spectral|--hero-samples 1"
     "cornell-bunny-rgb|cornell-bunny|rgb|"
     "cornell-bunny-spectral|cornell-bunny|spectral|"
     "cornell-glass-rgb|cornell-glass|rgb|"
