@@ -1,0 +1,7 @@
+# Cornell Box area light source, measured emission
+# source: Cornell University Program of Computer Graphics, graphics.cornell.edu/online/box/data.html (archived)
+# wavelength_nm value (relative radiance, scene applies a multiplier)
+400 0.0
+500 8.0
+600 15.6
+700 18.4
