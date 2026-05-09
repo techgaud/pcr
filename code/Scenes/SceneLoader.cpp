@@ -7,6 +7,7 @@
 #include "../Includes/json.hpp"
 #include "../Includes/Material.h"
 #include "../Includes/Plane.h"
+#include "../Includes/SpdLoader.h"
 #include "../Includes/Sphere.h"
 #include "../Includes/Triangle.h"
 #include "../Includes/Vec3f.h"
@@ -105,6 +106,52 @@ namespace Scenes
                     mat.albedo = vec3FromJson(*ait, "materials." + name + ".albedo");
                 if (auto eit = m.find("emissive"); eit != m.end())
                     mat.emissive = vec3FromJson(*eit, "materials." + name + ".emissive");
+
+                // Tabulated SPDs override the RGB upsampler. albedo_spd
+                // is a name like "cornell/white-paint" resolved through
+                // the spd/ search path; the file must exist or scene
+                // load fails. Mutually exclusive with albedo (the loader
+                // accepts both but the SPD wins; an explicit RGB albedo
+                // becomes redundant when an SPD is also provided, so we
+                // reject the combination to keep scene files honest).
+                if (auto sit = m.find("albedo_spd"); sit != m.end())
+                {
+                    if (!sit->is_string())
+                        throw SceneLoaderError(path + ": materials." + name + ".albedo_spd must be a string");
+                    if (m.find("albedo") != m.end())
+                        throw SceneLoaderError(path + ": materials." + name + " has both albedo and albedo_spd; pick one");
+                    std::string spdName = sit->get<std::string>();
+                    std::string err, resolvedPath;
+                    if (!SpdLoader::loadSpdByName(spdName, {}, mat.tabulatedAlbedo, &resolvedPath, &err))
+                        throw SceneLoaderError(path + ": materials." + name + ".albedo_spd: " + err);
+                    mat.useTabulatedAlbedo = true;
+                }
+                if (auto sit = m.find("emissive_spd"); sit != m.end())
+                {
+                    if (!sit->is_string())
+                        throw SceneLoaderError(path + ": materials." + name + ".emissive_spd must be a string");
+                    if (m.find("emissive") != m.end())
+                        throw SceneLoaderError(path + ": materials." + name + " has both emissive and emissive_spd; pick one");
+                    std::string spdName = sit->get<std::string>();
+                    std::string err, resolvedPath;
+                    if (!SpdLoader::loadSpdByName(spdName, {}, mat.tabulatedEmissive, &resolvedPath, &err))
+                        throw SceneLoaderError(path + ": materials." + name + ".emissive_spd: " + err);
+                    mat.useTabulatedEmissive = true;
+                    // Optional brightness multiplier baked into the
+                    // stored spectrum so the renderer doesn't carry a
+                    // separate scale field. Cornell's published light
+                    // SPD is in arbitrary radiance units; scenes apply
+                    // a multiplier to land at scene-appropriate
+                    // brightness (cornell-spec uses ~5x).
+                    if (auto cit = m.find("emissive_scale"); cit != m.end())
+                    {
+                        if (!cit->is_number())
+                            throw SceneLoaderError(path + ": materials." + name + ".emissive_scale must be a number");
+                        float scale = cit->get<float>();
+                        for (int i = 0; i < Spectrum::kSamples; i++)
+                            mat.tabulatedEmissive[i] *= scale;
+                    }
+                }
                 // Specular extensions: metallic = perfect mirror,
                 // transparent = glass dielectric with Fresnel + Snell.
                 // ior is the index of refraction; only matters when

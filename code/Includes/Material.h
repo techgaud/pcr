@@ -1,6 +1,8 @@
 #pragma once
 
+#include "CIE.h"
 #include "RGBToSpectrum.h"
+#include "Spectrum.h"
 #include "Vec3f.h"
 
 struct Material
@@ -11,6 +13,27 @@ struct Material
 
     Vec3f albedo{0, 0, 0};
     Vec3f emissive{0, 0, 0};
+
+    // Tabulated spectra. When set (via the scene format's albedo_spd /
+    // emissive_spd fields), the spectral-mode path tracer reads the
+    // 61-sample table directly and skips the Jakob RGB-to-spectrum
+    // upsampler. This is what keeps measured spectra (e.g. Cornell's
+    // published paint reflectances) faithful through multi-bounce
+    // diffuse: the upsampler's metameric fit drifts on each bounce,
+    // a measured spectrum doesn't.
+    //
+    // The CPU spectral path tracer reads albedoAt() / emissiveAt(),
+    // both of which dispatch to the tabulated table when present.
+    //
+    // The GPU spectral path uploads only SigmoidFit (16 bytes per
+    // material). For tabulated materials, populateSpectra still fits
+    // a SigmoidFit from the table's integrated RGB equivalent so GPU
+    // renders work, but they're approximate vs CPU. GPU support for
+    // tabulated SPDs would require widening GpuMaterial - deferred.
+    Spectrum tabulatedAlbedo;
+    Spectrum tabulatedEmissive;
+    bool useTabulatedAlbedo = false;
+    bool useTabulatedEmissive = false;
 
     // Perfect mirror (specular reflection only, no diffuse). albedo tints
     // the reflected radiance. set to (1,1,1) for a neutral mirror, or
@@ -68,10 +91,12 @@ struct Material
     // bug we hit between the GPU sigmoid-coefficient migration and now.
     float albedoAt(float lambda) const
     {
+        if (useTabulatedAlbedo) return tabulatedAlbedo(lambda);
         return std::min(RGBToSpectrum::evalSigmoidFit(albedoFit, lambda), 1.f);
     }
     float emissiveAt(float lambda) const
     {
+        if (useTabulatedEmissive) return tabulatedEmissive(lambda);
         return RGBToSpectrum::evalSigmoidFit(emissiveFit, lambda);
     }
 
@@ -90,8 +115,30 @@ struct Material
     // brightness is restored via the SigmoidFit's scale field) because
     // the upsampler expects values in [0, 1] and area lights routinely
     // emit much brighter than that.
+    //
+    // For tabulated materials (useTabulatedAlbedo / useTabulatedEmissive),
+    // we still derive the RGB-equivalent and a Jakob fit so:
+    //   - RGB-mode renders (which read albedo / emissive directly) work.
+    //   - GPU spectral renders, which only upload SigmoidFit, work
+    //     (approximate vs CPU's tabulated read, but visually close).
+    //   - isEmissive() correctly identifies tabulated lights as lights.
     void populateSpectra()
     {
+        if (useTabulatedAlbedo)
+        {
+            Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(tabulatedAlbedo));
+            albedo = Vec3f(std::max(0.f, rgb[0]),
+                           std::max(0.f, rgb[1]),
+                           std::max(0.f, rgb[2]));
+        }
+        if (useTabulatedEmissive)
+        {
+            Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(tabulatedEmissive));
+            emissive = Vec3f(std::max(0.f, rgb[0]),
+                             std::max(0.f, rgb[1]),
+                             std::max(0.f, rgb[2]));
+        }
+
         albedoFit = RGBToSpectrum::fitSigmoidCoefficients(albedo);
         if (isEmissive())
         {
