@@ -16,7 +16,18 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <string>
 #include <vector>
+
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#define pcr_getpid() _getpid()
+#else
+#include <unistd.h>   // getpid
+#define pcr_getpid() ::getpid()
+#endif
 
 #include "CIE.h"
 #include "Material.h"
@@ -229,6 +240,48 @@ int main()
 
     test_lut_build_and_lookup();
     test_lut_vs_homotopy_agreement();
+
+    // saveLUT/loadLUT roundtrip: write the LUT to a temp file, load it
+    // back, check the data array is bit-identical. The serialization
+    // path is the only way GUI users get a LUT into the process, so a
+    // regression here is a regression for the entire on-disk pipeline.
+    {
+        namespace fs = std::filesystem;
+        fs::path tmp = fs::temp_directory_path() /
+                       ("pcr_lut_roundtrip_" + std::to_string(pcr_getpid()) + ".lut");
+        bool wrote = RGBToSpectrum::saveLUT(g_lut, tmp.string());
+        check(wrote, "saveLUT writes a file");
+
+        RGBToSpectrum::LUT loaded;
+        std::string err;
+        bool read = RGBToSpectrum::loadLUT(tmp.string(), loaded, &err);
+        check(read, "loadLUT succeeds");
+        check(loaded.data.size() == g_lut.data.size(), "loaded LUT has same size");
+        bool identical = (loaded.data == g_lut.data);
+        check(identical, "saved/loaded LUT is bit-identical");
+
+        // Negative cases: missing file, truncated file, bad magic.
+        RGBToSpectrum::LUT trash;
+        std::string nope;
+        bool m = RGBToSpectrum::loadLUT("/this/does/not/exist.lut", trash, &nope);
+        check(!m && !nope.empty(), "loadLUT errors on missing file");
+
+        // Truncated: write only the header, payload missing.
+        fs::path bad = fs::temp_directory_path() /
+                       ("pcr_lut_truncated_" + std::to_string(pcr_getpid()) + ".lut");
+        FILE *fp = std::fopen(bad.string().c_str(), "wb");
+        if (fp) {
+            const char header[16] = {'P','L','U','T', 1,0,0,0, 16,0,0,0, 0,0,0,0};
+            std::fwrite(header, 1, sizeof(header), fp);
+            std::fclose(fp);
+        }
+        std::string truncErr;
+        bool t = RGBToSpectrum::loadLUT(bad.string(), trash, &truncErr);
+        check(!t && !truncErr.empty(), "loadLUT errors on truncated payload");
+
+        fs::remove(tmp);
+        fs::remove(bad);
+    }
 
     if (g_failed) {
         std::printf("\n%d FAIL(s)\n", g_failed);

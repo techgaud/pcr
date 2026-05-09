@@ -2,6 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <string>
 
 #include "Includes/CIE.h"
 #include "Includes/Spectrum.h"
@@ -377,6 +382,72 @@ namespace RGBToSpectrum
                 }
             }
         }
+    }
+
+    namespace
+    {
+        // Header layout for the on-disk LUT file. Sized to 16 bytes so the
+        // float payload that follows starts on a 16-byte boundary - that
+        // costs us nothing and keeps any future SIMD-aligned reader honest.
+        struct LutFileHeader
+        {
+            char     magic[4];   // 'P','L','U','T'
+            uint32_t version;    // bumped on incompatible format changes
+            uint32_t res;        // must equal LUT::kRes for a successful load
+            uint32_t nFloats;    // sanity: must equal 3 * res^3 * 3
+        };
+        static_assert(sizeof(LutFileHeader) == 16, "LutFileHeader must be 16 bytes");
+        constexpr uint32_t kLutFileVersion = 1;
+    }
+
+    bool saveLUT(const LUT &lut, const std::string &path)
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+
+        LutFileHeader h{};
+        std::memcpy(h.magic, "PLUT", 4);
+        h.version = kLutFileVersion;
+        h.res     = (uint32_t)LUT::kRes;
+        h.nFloats = (uint32_t)lut.data.size();
+
+        out.write(reinterpret_cast<const char *>(&h), sizeof(h));
+        out.write(reinterpret_cast<const char *>(lut.data.data()),
+                  std::streamsize(lut.data.size() * sizeof(float)));
+        return out.good();
+    }
+
+    bool loadLUT(const std::string &path, LUT &out, std::string *outError)
+    {
+        auto fail = [&](const char *msg) {
+            if (outError) *outError = msg;
+            return false;
+        };
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return fail("cannot open file");
+
+        LutFileHeader h{};
+        in.read(reinterpret_cast<char *>(&h), sizeof(h));
+        if (!in || in.gcount() != (std::streamsize)sizeof(h))
+            return fail("header truncated");
+        if (std::memcmp(h.magic, "PLUT", 4) != 0)
+            return fail("bad magic (not a PLUT file)");
+        if (h.version != kLutFileVersion)
+            return fail("unsupported version");
+        if (h.res != (uint32_t)LUT::kRes)
+            return fail("res mismatch (recompile pcr or rebuild this LUT)");
+        const uint32_t expectFloats = 3u * (uint32_t)LUT::kRes * (uint32_t)LUT::kRes
+                                          * (uint32_t)LUT::kRes * 3u;
+        if (h.nFloats != expectFloats)
+            return fail("nFloats mismatch (corrupt header)");
+
+        out.data.assign(expectFloats, 0.f);
+        in.read(reinterpret_cast<char *>(out.data.data()),
+                std::streamsize(expectFloats * sizeof(float)));
+        if (!in || in.gcount() != (std::streamsize)(expectFloats * sizeof(float)))
+            return fail("payload truncated");
+        return true;
     }
 
     SigmoidFit lookupSigmoidFit(const LUT &lut, const Vec3f &rgbLinear)

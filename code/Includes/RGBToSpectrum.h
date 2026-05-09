@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <string>
 #include <vector>
 
 #include "CIE.h"
@@ -193,4 +194,23 @@ namespace RGBToSpectrum
     // Single thread of access because scene-load is serial.
     void setActiveLUT(const LUT *lut);
     const LUT *activeLUT();
+
+    // Binary serialization for shippable LUTs. File format:
+    //
+    //   char[4]   magic   = "PLUT"
+    //   uint32    version = 1
+    //   uint32    res     (must equal LUT::kRes for the running build)
+    //   uint32    nFloats (= 3 * res^3 * 3, redundant but a sanity pin)
+    //   float[]   data    (nFloats values, native endianness)
+    //
+    // Native endianness is fine because pcr is currently x86_64-only on
+    // CI and cross-arch LUT exchange isn't a goal. If that ever changes,
+    // bump version and add a byte-order field.
+    //
+    // saveLUT returns true on success. loadLUT returns true and populates
+    // `out` on success; on any error (missing file, bad magic, version
+    // mismatch, res mismatch, truncated data) it returns false and writes
+    // a one-line description to `outError` (if non-null).
+    bool saveLUT(const LUT &lut, const std::string &path);
+    bool loadLUT(const std::string &path, LUT &out, std::string *outError = nullptr);
 }
