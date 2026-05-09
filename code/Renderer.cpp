@@ -15,6 +15,7 @@
 #include "Includes/lodepng.h"
 #include "Includes/CIE.h"
 #include "Includes/Denoise.h"
+#include "Includes/NumGen.h"
 #include "Includes/OidnDenoise.h"
 #include "Includes/Optics.h"
 #include "Includes/ToneMap.h"
@@ -145,7 +146,16 @@ void Renderer::render(const Scenes::SceneData &scene,
     Vec3f origin = scene.camera.position;
     float aspect = _width / (float)_height;
     float scale = std::tan((float)std::numbers::pi / 180.f * 0.5f * scene.camera.fov);
-    unsigned int numThreads = std::thread::hardware_concurrency();
+    // When a deterministic seed is set, drop to single-threaded execution.
+    // Multi-threaded renders interleave PRNG draws non-deterministically
+    // across runs (rows are striped by thread index, but the order of
+    // pixel finalization between threads still affects nothing visible -
+    // the issue is hardware_concurrency varying across machines, which
+    // changes which thread processes which row, which changes per-thread
+    // PRNG sequences). One thread = stable, machine-independent draw order.
+    unsigned int numThreads = (NumGen::getSeed() != 0)
+        ? 1u
+        : std::thread::hardware_concurrency();
     std::vector<std::thread> threads(numThreads);
 
     for (size_t t = 0; t < numThreads; t++)

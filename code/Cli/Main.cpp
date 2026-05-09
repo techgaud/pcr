@@ -11,6 +11,7 @@
 
 #include "Includes/CLI11.hpp"
 #include "Includes/DllSearch.h"
+#include "Includes/NumGen.h"
 #include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
 #include "Scenes/Scene.h"
@@ -78,6 +79,7 @@ int main(int argc, char *argv[])
     bool useOIDN = false;
     bool useSpectral = false;
     bool useLUT = false;
+    uint64_t seed = 0;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -163,6 +165,16 @@ int main(int argc, char *argv[])
         "Options",
         "Configuration knobs that change how data is computed but not "
         "the algorithmic behavior of the path tracer.");
+    options->add_option("--seed", seed,
+                 "Fixed PRNG seed for bit-deterministic renders. When set "
+                 "to non-zero, all per-thread Monte Carlo PRNG state "
+                 "initializes from this seed and the renderer drops to "
+                 "single-threaded execution to avoid thread-interleaving "
+                 "non-determinism. Renders are reproducible across runs "
+                 "on the same machine; cross-machine reproducibility is "
+                 "still subject to floating-point rounding differences "
+                 "between compilers and CPU architectures. Default 0 = "
+                 "random_device per thread (the historical behavior).");
     options->add_flag("--lut", useLUT,
                  "Use a precomputed lookup table for RGB-to-spectrum "
                  "upsampling instead of running the Newton-Raphson + "
@@ -181,6 +193,9 @@ int main(int argc, char *argv[])
 
     if (height < 0)
         height = width; // square by default
+
+    if (seed != 0)
+        NumGen::setSeed(seed);
 
     applyTimezone(timezone);
 
