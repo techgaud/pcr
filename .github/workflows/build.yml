@@ -211,8 +211,10 @@ jobs:
   #   - Linux runner is the cheapest GHA host.
   # GPU paths can't be tested headlessly; the manual visual-pass step
   # in the pre-merge checklist covers them.
+  #
+  # Runs on every triggering branch including spectral, since the test
+  # suite landed on spectral and we want every spectral push to run it.
   tests:
-    if: github.ref_name != 'spectral'
     name: Tests (unit + render diff, Linux)
     runs-on: ubuntu-latest
     steps:
