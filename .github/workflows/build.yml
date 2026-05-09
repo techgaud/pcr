@@ -339,6 +339,17 @@ jobs:
           (cd pcr-linux-x64 && zip -r "../release/pcr-spd-${VER}.zip" spd)
           [ -d pcr-linux-x64/luts ] && (cd pcr-linux-x64 && zip -r "../release/pcr-luts-${VER}.zip" luts) || true
 
+          # Bundled per-OS archives. The granular files above let users
+          # grab just the CLI on Linux or just the GPU binary on Windows
+          # without pulling everything; these bundles are for users who
+          # just want a single download containing binaries + Scenes/ +
+          # models/ + spd/ + luts/ for their platform. Each per-OS staging
+          # dir already has the right shape from the build job, so we just
+          # zip it up.
+          (cd pcr-windows-x64 && zip -r "../release/pcr-${VER}-windows-x64.zip" .)
+          (cd pcr-linux-x64   && zip -r "../release/pcr-${VER}-linux-x64.zip"   .)
+          (cd pcr-macos-arm64 && zip -r "../release/pcr-${VER}-macos-arm64.zip" .)
+
           ls -la release/
 
       - uses: softprops/action-gh-release@v2
