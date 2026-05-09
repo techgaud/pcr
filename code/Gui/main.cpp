@@ -71,6 +71,8 @@
 #include "portable-file-dialogs.h"
 
 #include "Includes/DllSearch.h"
+#include "Includes/LutDiscovery.h"
+#include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Scenes/Scene.h"
@@ -151,6 +153,21 @@ struct Settings
     bool useAdaptive = false;
     bool useOIDN = false;
 
+    // LUT for spectral RGB-to-spectrum upsampling. The control only
+    // appears in the GUI when useSpectral == true; its setting is
+    // persisted regardless so flipping spectral on later restores the
+    // user's last choice.
+    //
+    // Values:
+    //   "off"       - runtime homotopy, no LUT (default; no startup cost)
+    //   "build"     - build LUT in-process at scene-load (~4 sec)
+    //   "<name>"    - load luts/<name>.lut from disk (milliseconds)
+    //
+    // Anything not matching one of those falls back to "off". A name
+    // that points at a file that's gone since the choice was saved
+    // also falls back to "off" with a console warning at render time.
+    std::string lutChoice = "off";
+
     // Pop a debug console + log file at startup. Toggled by the Debug
     // button in the GUI top-right (or the PCR_DEBUG env var). Persisted
     // so it survives across launches.
@@ -210,6 +227,7 @@ static void loadSettings(Settings &s)
         s.aaSamples     = j.value("aaSamples",     s.aaSamples);
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
         s.useOIDN       = j.value("useOIDN",       s.useOIDN);
+        s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
@@ -262,6 +280,7 @@ static json buildSettingsJson(const Settings &s)
     j["aaSamples"]     = s.aaSamples;
     j["useAdaptive"]   = s.useAdaptive;
     j["useOIDN"]       = s.useOIDN;
+    j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
     for (const auto &p : s.presets)
@@ -306,6 +325,76 @@ static void applyTimezone(const std::string &tz)
     setenv("TZ", resolved.c_str(), 1);
 #endif
     tzset();
+}
+
+// --- LUT cache + apply-before-render -------------------------------------
+//
+// Process-scoped cache so swapping back and forth between LUT choices in a
+// session doesn't re-pay the build/load cost. Keyed by:
+//   "build"        - the in-process built LUT
+//   "<name>"       - a disk-loaded LUT (display name from LutDiscovery)
+// "off" is not cached; it just means setActiveLUT(nullptr).
+//
+// applyLutChoice runs on the GUI thread right before kicking off the
+// render worker. It's synchronous and can take several seconds the first
+// time "build" is selected (~4 sec at kRes=16). Subsequent calls hit the
+// cache and return in microseconds.
+//
+// The setActiveLUT call is process-global (single-threaded scene-load
+// contract); so long as we only swap the active LUT while no render is
+// in flight, this is safe. The GUI guarantees that by gating the apply
+// call behind "Render button pressed, no worker running yet."
+namespace
+{
+    std::unordered_map<std::string, std::unique_ptr<RGBToSpectrum::LUT>> g_lutCache;
+
+    // Returns "" on success; otherwise a one-line warning to surface in
+    // the UI. Does not throw - a missing file or load error simply falls
+    // back to off and reports the message.
+    std::string applyLutChoice(const std::string &choice)
+    {
+        if (choice == "off" || choice.empty())
+        {
+            RGBToSpectrum::setActiveLUT(nullptr);
+            return {};
+        }
+        if (choice == "build")
+        {
+            auto it = g_lutCache.find("build");
+            if (it == g_lutCache.end())
+            {
+                auto lut = std::make_unique<RGBToSpectrum::LUT>();
+                RGBToSpectrum::buildLUT(*lut);
+                it = g_lutCache.emplace("build", std::move(lut)).first;
+            }
+            RGBToSpectrum::setActiveLUT(it->second.get());
+            return {};
+        }
+        // Disk-backed LUT: resolve via discovery, load if not cached.
+        auto it = g_lutCache.find(choice);
+        if (it == g_lutCache.end())
+        {
+            auto registry = LutDiscovery::discoverLUTs();
+            auto found = std::find_if(registry.begin(), registry.end(),
+                [&](const LutDiscovery::DiscoveredLUT &d) { return d.name == choice; });
+            if (found == registry.end())
+            {
+                RGBToSpectrum::setActiveLUT(nullptr);
+                return "LUT '" + choice + "' not found; falling back to runtime homotopy";
+            }
+            auto lut = std::make_unique<RGBToSpectrum::LUT>();
+            std::string err;
+            if (!RGBToSpectrum::loadLUT(found->filePath, *lut, &err))
+            {
+                RGBToSpectrum::setActiveLUT(nullptr);
+                return "loadLUT(" + found->filePath + "): " + err
+                       + "; falling back to runtime homotopy";
+            }
+            it = g_lutCache.emplace(choice, std::move(lut)).first;
+        }
+        RGBToSpectrum::setActiveLUT(it->second.get());
+        return {};
+    }
 }
 
 // --- Render job state (shared between GUI thread and worker) -------------
@@ -367,6 +456,21 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
             job->running = false;
             return;
         }
+        // Apply the LUT choice before any material spectra get fit. Only
+        // matters when spectral mode is on - RGB ignores the active LUT
+        // entirely - so skip the work otherwise. setActiveLUT(nullptr)
+        // resets any prior session's LUT cleanly.
+        if (settings.useSpectral)
+        {
+            std::string warn = applyLutChoice(settings.lutChoice);
+            if (!warn.empty())
+                std::fprintf(stderr, "[lut] %s\n", warn.c_str());
+        }
+        else
+        {
+            RGBToSpectrum::setActiveLUT(nullptr);
+        }
+
         Scenes::SceneData sceneData = sceneLoader();
 
         std::string outDir = settings.outputDir;
@@ -1243,6 +1347,112 @@ int main(int, char **)
                               "convergence than RGB at equal sample count;\n"
                               "AA samples >= 16 recommended. Output filename\n"
                               "gets -spectral.");
+
+        // LUT section. Only meaningful when spectral mode is on - the
+        // active LUT influences how RGBToSpectrum::fitSigmoidCoefficients
+        // dispatches at scene-load, and RGB renders never call into that
+        // path. Hide when not spectral so the UI doesn't carry knobs that
+        // do nothing.
+        //
+        // Lifetime trick: discoveredLUTs is a static refreshed only at
+        // startup or on the user clicking Refresh. The cost of a rescan
+        // is a few filesystem stat calls; it's not the per-frame cost
+        // that bothers us, it's that an unstable list would shuffle the
+        // dropdown order. Static + explicit refresh keeps the list
+        // predictable.
+        if (settings.useSpectral)
+        {
+            static std::vector<LutDiscovery::DiscoveredLUT> discoveredLUTs =
+                LutDiscovery::discoverLUTs();
+
+            ImGui::SeparatorText("LUT");
+
+            // Compose the dropdown's current-label. "off" and "build"
+            // are synthetic; anything else is a discovered file name.
+            const char *currentLabel = "Off (runtime homotopy)";
+            if (settings.lutChoice == "build")
+                currentLabel = "Build in-memory (~4 sec, not saved)";
+            else if (settings.lutChoice != "off" && !settings.lutChoice.empty())
+                currentLabel = settings.lutChoice.c_str();
+
+            ImGui::TextUnformatted("Source:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ImGui::CalcItemWidth() * 0.7f);
+            if (ImGui::BeginCombo("##lutChoice", currentLabel))
+            {
+                if (ImGui::Selectable("Off (runtime homotopy)",
+                                      settings.lutChoice == "off"))
+                    settings.lutChoice = "off";
+                if (ImGui::Selectable("Build in-memory (~4 sec, not saved)",
+                                      settings.lutChoice == "build"))
+                    settings.lutChoice = "build";
+                if (!discoveredLUTs.empty())
+                    ImGui::Separator();
+                for (const auto &d : discoveredLUTs)
+                {
+                    bool sel = (settings.lutChoice == d.name);
+                    if (ImGui::Selectable(d.name.c_str(), sel))
+                        settings.lutChoice = d.name;
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", d.filePath.c_str());
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Refresh##luts"))
+                discoveredLUTs = LutDiscovery::discoverLUTs();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Rescan luts/ for *.lut files. Useful after dropping\n"
+                    "a new LUT into the directory or after clicking Save\n"
+                    "below to write a built LUT to disk.");
+
+            // When "Build in-memory" is the choice and a built LUT lives
+            // in the cache (i.e. at least one render has run with this
+            // setting since launch), offer to save it to disk. The save
+            // popups via pfd::save_file so the user picks a filename in
+            // luts/ that becomes a first-class entry on next Refresh.
+            if (settings.lutChoice == "build")
+            {
+                bool haveBuilt = (g_lutCache.find("build") != g_lutCache.end());
+                ImGui::BeginDisabled(!haveBuilt);
+                if (ImGui::Button("Save built LUT to luts/..."))
+                {
+                    fs::path defaultDir = fs::current_path() / "luts";
+                    if (!fs::exists(defaultDir))
+                        fs::create_directories(defaultDir);
+                    auto sel = pfd::save_file(
+                        "Save LUT",
+                        (defaultDir / "my-lut.lut").string(),
+                        {"PCR LUT", "*.lut"}).result();
+                    if (!sel.empty())
+                    {
+                        // Append .lut if the user typed a bare name.
+                        fs::path p = sel;
+                        if (p.extension() != ".lut")
+                            p += ".lut";
+                        const auto &lut = *g_lutCache.at("build");
+                        if (RGBToSpectrum::saveLUT(lut, p.string()))
+                        {
+                            // Refresh the registry so the new file shows
+                            // up immediately (saves the user a click).
+                            discoveredLUTs = LutDiscovery::discoverLUTs();
+                        }
+                        else
+                        {
+                            std::fprintf(stderr, "[lut] saveLUT failed: %s\n",
+                                         p.string().c_str());
+                        }
+                    }
+                }
+                ImGui::EndDisabled();
+                if (!haveBuilt && ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "Run a spectral render first - the LUT gets\n"
+                        "built lazily on the first render that needs it,\n"
+                        "and only then can it be saved.");
+            }
+        }
 
         ImGui::SeparatorText("Techniques");
         ImGui::Checkbox("Denoise (5x5 cross-bilateral on output)", &settings.useDenoise);
