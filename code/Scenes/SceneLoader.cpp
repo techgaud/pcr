@@ -107,42 +107,59 @@ namespace Scenes
                 if (auto eit = m.find("emissive"); eit != m.end())
                     mat.emissive = vec3FromJson(*eit, "materials." + name + ".emissive");
 
-                // Tabulated SPDs override the RGB upsampler. albedo_spd
-                // is a name like "cornell/white-paint" resolved through
-                // the spd/ search path; the file must exist or scene
-                // load fails. Mutually exclusive with albedo (the loader
-                // accepts both but the SPD wins; an explicit RGB albedo
-                // becomes redundant when an SPD is also provided, so we
-                // reject the combination to keep scene files honest).
+                // Tabulated SPDs are independent of the RGB albedo/emissive.
+                // A scene may specify both:
+                //   - 'albedo'     drives RGB-mode rendering
+                //   - 'albedo_spd' drives spectral-mode rendering
+                // and they're treated as two independent descriptions of the
+                // same material. cornell-spec uses this: canonical RGB
+                // approximations from Mitsuba's Cornell port, plus measured
+                // SPDs from Cornell's publication. Each pipeline reads the
+                // representation it expects and they don't have to agree
+                // (and indeed don't, because converting the measured SPD
+                // through CIE matrices doesn't reproduce the canonical RGB
+                // exactly thanks to Wyman CMF approximation drift).
+                //
+                // When only the SPD is given, fall back to deriving an
+                // RGB equivalent from the integrated XYZ so RGB-mode
+                // renders something instead of black. The RGB-mode look
+                // for SPD-only materials carries the Wyman drift; scenes
+                // that care about RGB-mode look should provide an explicit
+                // RGB albedo too.
+                bool hasAlbedo = m.contains("albedo");
                 if (auto sit = m.find("albedo_spd"); sit != m.end())
                 {
                     if (!sit->is_string())
                         throw SceneLoaderError(path + ": materials." + name + ".albedo_spd must be a string");
-                    if (m.find("albedo") != m.end())
-                        throw SceneLoaderError(path + ": materials." + name + " has both albedo and albedo_spd; pick one");
                     std::string spdName = sit->get<std::string>();
                     std::string err, resolvedPath;
                     if (!SpdLoader::loadSpdByName(spdName, {}, mat.tabulatedAlbedo, &resolvedPath, &err))
                         throw SceneLoaderError(path + ": materials." + name + ".albedo_spd: " + err);
                     mat.useTabulatedAlbedo = true;
+                    if (!hasAlbedo)
+                    {
+                        Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(mat.tabulatedAlbedo));
+                        mat.albedo = Vec3f(std::max(0.f, rgb[0]),
+                                           std::max(0.f, rgb[1]),
+                                           std::max(0.f, rgb[2]));
+                    }
                 }
+                bool hasEmissive = m.contains("emissive");
                 if (auto sit = m.find("emissive_spd"); sit != m.end())
                 {
                     if (!sit->is_string())
                         throw SceneLoaderError(path + ": materials." + name + ".emissive_spd must be a string");
-                    if (m.find("emissive") != m.end())
-                        throw SceneLoaderError(path + ": materials." + name + " has both emissive and emissive_spd; pick one");
                     std::string spdName = sit->get<std::string>();
                     std::string err, resolvedPath;
                     if (!SpdLoader::loadSpdByName(spdName, {}, mat.tabulatedEmissive, &resolvedPath, &err))
                         throw SceneLoaderError(path + ": materials." + name + ".emissive_spd: " + err);
                     mat.useTabulatedEmissive = true;
-                    // Optional brightness multiplier baked into the
-                    // stored spectrum so the renderer doesn't carry a
-                    // separate scale field. Cornell's published light
-                    // SPD is in arbitrary radiance units; scenes apply
-                    // a multiplier to land at scene-appropriate
-                    // brightness (cornell-spec uses ~5x).
+                    // Optional brightness multiplier baked into the stored
+                    // spectrum so the renderer doesn't carry a separate
+                    // scale field. Cornell's published light SPD is in
+                    // arbitrary radiance units; scenes apply a multiplier
+                    // to land at scene-appropriate brightness (cornell-spec
+                    // uses ~5x).
                     if (auto cit = m.find("emissive_scale"); cit != m.end())
                     {
                         if (!cit->is_number())
@@ -150,6 +167,13 @@ namespace Scenes
                         float scale = cit->get<float>();
                         for (int i = 0; i < Spectrum::kSamples; i++)
                             mat.tabulatedEmissive[i] *= scale;
+                    }
+                    if (!hasEmissive)
+                    {
+                        Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(mat.tabulatedEmissive));
+                        mat.emissive = Vec3f(std::max(0.f, rgb[0]),
+                                             std::max(0.f, rgb[1]),
+                                             std::max(0.f, rgb[2]));
                     }
                 }
                 // Specular extensions: metallic = perfect mirror,

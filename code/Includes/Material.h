@@ -116,29 +116,14 @@ struct Material
     // the upsampler expects values in [0, 1] and area lights routinely
     // emit much brighter than that.
     //
-    // For tabulated materials (useTabulatedAlbedo / useTabulatedEmissive),
-    // we still derive the RGB-equivalent and a Jakob fit so:
-    //   - RGB-mode renders (which read albedo / emissive directly) work.
-    //   - GPU spectral renders, which only upload SigmoidFit, work
-    //     (approximate vs CPU's tabulated read, but visually close).
-    //   - isEmissive() correctly identifies tabulated lights as lights.
+    // For tabulated materials, the SigmoidFit still gets computed (from
+    // whatever Material.albedo / Material.emissive end up at) so the GPU
+    // upload's lookupTabulated has a valid fallback for any path that
+    // doesn't go through the tabulated read. The CPU spectral path
+    // tracer prefers tabulatedAlbedo via the dispatch in albedoAt;
+    // this fit is for RGB-mode rendering and as a safety net.
     void populateSpectra()
     {
-        if (useTabulatedAlbedo)
-        {
-            Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(tabulatedAlbedo));
-            albedo = Vec3f(std::max(0.f, rgb[0]),
-                           std::max(0.f, rgb[1]),
-                           std::max(0.f, rgb[2]));
-        }
-        if (useTabulatedEmissive)
-        {
-            Vec3f rgb = CIE::xyzToLinearSRGB(CIE::spectrumToXYZ(tabulatedEmissive));
-            emissive = Vec3f(std::max(0.f, rgb[0]),
-                             std::max(0.f, rgb[1]),
-                             std::max(0.f, rgb[2]));
-        }
-
         albedoFit = RGBToSpectrum::fitSigmoidCoefficients(albedo);
         if (isEmissive())
         {

@@ -29,24 +29,37 @@
 
   "camera": { "position": [0, 0, 0], "fov": 38 },
 
-  // Materials use Cornell's MEASURED spectral data directly via the
-  // albedo_spd / emissive_spd fields, not RGB approximations. SPD files
-  // live under spd/cornell/ and were transcribed from Cornell's publication
-  // (graphics.cornell.edu/online/box/data.html). Tabulated spectra survive
-  // multi-bounce diffuse interreflection without the metameric drift that
-  // an RGB-upsampled Jakob spectrum exhibits, so the cream walls actually
-  // read as cream and the red/green walls retain saturation through the
-  // bounces.
+  // Each material specifies BOTH an RGB form (for RGB-mode rendering)
+  // and an SPD form (for spectral-mode rendering). The two are
+  // independent descriptions of the same physical material:
+  //
+  //   - albedo / emissive are the canonical RGB approximations from
+  //     Mitsuba's Cornell port. RGB-mode renderer reads these directly.
+  //   - albedo_spd / emissive_spd are Cornell's publication-measured
+  //     spectral reflectances and emission, transcribed from
+  //     graphics.cornell.edu/online/box/data.html. Spectral-mode
+  //     renderer reads these directly (no Jakob upsampling, hence no
+  //     multi-bounce metameric drift).
+  //
+  // The two forms wouldn't match if you converted between them: integrating
+  // the measured SPD through CIE matrices and the sRGB conversion gives a
+  // ~25% warmer cream than the canonical (0.71, 0.69, 0.59), thanks to
+  // Wyman CMF approximation drift. So we declare both explicitly and let
+  // each pipeline read what it expects.
   //
   // emissive_scale on the light multiplies the published radiance values
   // (which are in arbitrary units) into scene-appropriate brightness.
-  // The Cornell publication's raw values peak at 18.4 at 700 nm; ~5x lifts
-  // that to the same visible-luminance range as cornell.json's RGB lights.
+  // The Cornell publication's raw values peak at 18.4 at 700 nm; ~5x
+  // lifts that to the same visible-luminance range as the RGB emissive.
   "materials": {
-    "white": { "albedo_spd":   "cornell/white-paint" },
-    "red":   { "albedo_spd":   "cornell/red-paint" },
-    "green": { "albedo_spd":   "cornell/green-paint" },
-    "light": { "emissive_spd": "cornell/light", "emissive_scale": 5.0 }
+    "white": { "albedo":   [0.71, 0.69, 0.59],
+               "albedo_spd":   "cornell/white-paint" },
+    "red":   { "albedo":   [0.63, 0.065, 0.05],
+               "albedo_spd":   "cornell/red-paint" },
+    "green": { "albedo":   [0.14, 0.45, 0.091],
+               "albedo_spd":   "cornell/green-paint" },
+    "light": { "emissive": [70.0, 60.0, 42.0],
+               "emissive_spd": "cornell/light", "emissive_scale": 5.0 }
   },
 
   "primitives": [
