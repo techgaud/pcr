@@ -11,6 +11,7 @@
 
 #include "Includes/CLI11.hpp"
 #include "Includes/DllSearch.h"
+#include "Includes/LutDiscovery.h"
 #include "Includes/NumGen.h"
 #include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
@@ -79,6 +80,7 @@ int main(int argc, char *argv[])
     bool useOIDN = false;
     bool useSpectral = false;
     bool useLUT = false;
+    std::string lutFile;
     uint64_t seed = 0;
 
     CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
@@ -175,7 +177,7 @@ int main(int argc, char *argv[])
                  "still subject to floating-point rounding differences "
                  "between compilers and CPU architectures. Default 0 = "
                  "random_device per thread (the historical behavior).");
-    options->add_flag("--lut", useLUT,
+    auto *lutFlag = options->add_flag("--lut", useLUT,
                  "Use a precomputed lookup table for RGB-to-spectrum "
                  "upsampling instead of running the Newton-Raphson + "
                  "homotopy fit per material at scene-load. Builds a "
@@ -188,6 +190,17 @@ int main(int argc, char *argv[])
                  "class scenes hit the build cost without the lookup "
                  "savings, so leave it off there. Only matters in "
                  "--spectral mode; RGB renders ignore the flag.");
+    auto *lutFileOpt = options->add_option("--lut-file", lutFile,
+                 "Load a precomputed LUT from disk instead of building one. "
+                 "Argument is either a path to a .lut file (PLUT binary "
+                 "format produced by saveLUT / the GUI 'Save LUT' button) "
+                 "or a bare name resolved against the luts/ search path "
+                 "($PWD/luts then <binary-dir>/luts; no .lut extension "
+                 "needed). Loading from disk is milliseconds vs the ~4 "
+                 "second build, so this is the fast-startup path once you "
+                 "have a saved LUT. Mutually exclusive with --lut.");
+    lutFlag->excludes(lutFileOpt);
+    lutFileOpt->excludes(lutFlag);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -237,11 +250,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Build the spectral upsampling LUT if requested. Lifetime is the
-    // rest of the process - holds ~1.5 MB at the default 32^3 resolution
-    // and gets read once per material at scene-load. setActiveLUT
-    // makes it visible to RGBToSpectrum::fitSigmoidCoefficients which
-    // is what populateSpectra calls.
+    // Build or load the spectral upsampling LUT if requested. Lifetime is
+    // the rest of the process - holds ~144 KB at kRes=16 and gets read
+    // once per material at scene-load. setActiveLUT makes it visible to
+    // RGBToSpectrum::fitSigmoidCoefficients which is what populateSpectra
+    // calls. --lut and --lut-file are mutually exclusive (CLI11 enforces).
     std::unique_ptr<RGBToSpectrum::LUT> lut;
     if (useLUT)
     {
@@ -249,6 +262,57 @@ int main(int argc, char *argv[])
         auto t0 = std::chrono::steady_clock::now();
         lut = std::make_unique<RGBToSpectrum::LUT>();
         RGBToSpectrum::buildLUT(*lut);
+        RGBToSpectrum::setActiveLUT(lut.get());
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cout << " " << ms << " ms\n";
+    }
+    else if (!lutFile.empty())
+    {
+        // Resolve: if the user passed a path with directory components or
+        // a .lut extension, take it as-is. Otherwise treat it as a bare
+        // name and look it up in the luts/ registry. Falling back to a
+        // direct file open after a registry miss covers ad-hoc paths
+        // (e.g. ../experimental.lut) without needing a separate flag.
+        std::string resolved = lutFile;
+        bool looksLikePath = lutFile.find('/') != std::string::npos
+                          || lutFile.find('\\') != std::string::npos
+                          || (lutFile.size() >= 4 &&
+                              lutFile.substr(lutFile.size() - 4) == ".lut");
+        if (!looksLikePath)
+        {
+            auto registry = LutDiscovery::discoverLUTs();
+            auto found = std::find_if(registry.begin(), registry.end(),
+                [&](const LutDiscovery::DiscoveredLUT &d) { return d.name == lutFile; });
+            if (found == registry.end())
+            {
+                std::cerr << "Unknown LUT name: " << lutFile << "\n";
+                if (registry.empty())
+                {
+                    std::cerr << "No .lut files found in $PWD/luts or <binary-dir>/luts.\n"
+                              << "Pass --lut to build one in-process, or use --lut-file <path>.\n";
+                }
+                else
+                {
+                    std::cerr << "Available LUTs:\n";
+                    for (const auto &d : registry)
+                        std::cerr << "  " << d.name << " (" << d.filePath << ")\n";
+                }
+                return 1;
+            }
+            resolved = found->filePath;
+        }
+
+        std::cout << "Loading LUT from " << resolved << "..." << std::flush;
+        auto t0 = std::chrono::steady_clock::now();
+        lut = std::make_unique<RGBToSpectrum::LUT>();
+        std::string err;
+        if (!RGBToSpectrum::loadLUT(resolved, *lut, &err))
+        {
+            std::cout << " FAIL\n";
+            std::cerr << "loadLUT(" << resolved << "): " << err << "\n";
+            return 1;
+        }
         RGBToSpectrum::setActiveLUT(lut.get());
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
