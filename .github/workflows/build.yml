@@ -56,13 +56,26 @@ jobs:
 
   windows:
     if: github.ref_name != 'spectral'
-    name: Build (Windows x64)
+    name: Build (Windows x64, clang-cl)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -S code -B code/Build
+      # clang-cl instead of cl.exe. The MSVC compiler crashes in
+      # CL!CloseTypeServerPDB during "Generating Code..." on the
+      # spectral codebase regardless of the workarounds in
+      # code/CMakeLists.txt (IPO off, /Zi stripped, /bigobj). The
+      # spectral branch's CI proved clang-cl handles the same source
+      # cleanly; this `windows` job uses the same toolset for the
+      # full binary matrix (CPU CLI + CPU GUI + GPU GUI) so the
+      # spectral->main merge inherits a Windows build that already
+      # works with the spectral source.
+      #
+      # clang-cl is MSVC-ABI-compatible: same headers, runtime, linker,
+      # equivalent COFF objects. -T ClangCL switches the VS generator's
+      # toolset.
+      - name: Configure (clang-cl toolset)
+        run: cmake -S code -B code/Build -T ClangCL
 
       - name: Build
         run: cmake --build code/Build --config Release
