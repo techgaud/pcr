@@ -173,6 +173,7 @@ set(PCR_RENDERER_SOURCES
     OidnDenoise.cpp
     CIE.cpp
     RGBToSpectrum.cpp
+    LutDiscovery.cpp
 )
 
 # --- Scene file deployment ----------------------------------------------
@@ -187,8 +188,10 @@ set(PCR_RENDERER_SOURCES
 # CMake post-build resolves by mirroring the layout.
 set(PCR_SCENES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Scenes)
 set(PCR_MODELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../models)
+set(PCR_LUTS_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/../luts)
 file(GLOB PCR_SCENE_JSON_FILES "${PCR_SCENES_DIR}/*.json")
 file(GLOB PCR_MODEL_FILES "${PCR_MODELS_DIR}/*.obj" "${PCR_MODELS_DIR}/*.mtl")
+file(GLOB PCR_LUT_FILES "${PCR_LUTS_DIR}/*.lut")
 function(pcr_deploy_scenes target)
     foreach(scene_file ${PCR_SCENE_JSON_FILES})
         get_filename_component(scene_name ${scene_file} NAME)
@@ -209,6 +212,24 @@ function(pcr_deploy_scenes target)
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     ${model_file}
                     $<TARGET_FILE_DIR:${target}>/models/${model_name}
+            VERBATIM
+        )
+    endforeach()
+    # luts/ ships shippable LUT files (PLUT binary format). Same deploy
+    # pattern as Scenes/ and models/. The directory may be empty (no
+    # shipped LUTs) but the function still creates the target dir so a
+    # GUI "save built LUT here" path resolves to a real folder.
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                $<TARGET_FILE_DIR:${target}>/luts
+        VERBATIM
+    )
+    foreach(lut_file ${PCR_LUT_FILES})
+        get_filename_component(lut_name ${lut_file} NAME)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    ${lut_file}
+                    $<TARGET_FILE_DIR:${target}>/luts/${lut_name}
             VERBATIM
         )
     endforeach()
