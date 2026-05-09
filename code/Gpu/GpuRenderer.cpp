@@ -259,15 +259,23 @@ struct GpuMaterial {
     int  transparent;     // 0 = opaque; 1 = glass dielectric
     float ior;            // index of refraction (transparent only)
     float cauchyB;        // dispersion: ior_at_lambda = ior + cauchyB*1e4/lambda^2
-    // Spectral mode: Jakob 2019 sigmoid-of-quadratic fit packed as
-    //   sample(lambda) = clamp(sigmoid(c0 + L*c1 + L*L*c2) * scale, 0, 1)
-    //   L = (lambda - 550) / 150
-    // .xyz = (c0, c1, c2), .w = scale. evaluateSigmoidFit() below is
-    // the canonical eval; mirrors RGBToSpectrum::evalSigmoidFit on the
-    // CPU side. emissiveFit's scale field embeds the per-material maxE
-    // re-scaling so emissive intensities don't need a separate uniform.
-    vec4 albedoFit;
-    vec4 emissiveFit;
+    // Spectral mode: 61-sample tabulated reflectance / emission. Values
+    // 0..60 cover 400 nm to 700 nm at 5 nm spacing; values 61..63 are
+    // unused, present only to keep the float[64] array naturally
+    // 16-byte-aligned (256 bytes -> multiple of vec4) so the struct's
+    // total size stays a multiple of 16 bytes for std430 array stride.
+    //
+    // CPU Material::populateSpectraGpu fills these from EITHER the
+    // material's loaded SPD (for measured-data materials, e.g. cornell-spec
+    // with its albedo_spd: "cornell/white-paint") OR by evaluating the
+    // material's Jakob SigmoidFit at every wavelength (for RGB-described
+    // materials where the upsampler is the only source).
+    //
+    // Albedo samples are clamped to [0, 1] at upload time (the CPU side
+    // does the same in Material::albedoAt). Emissive samples are not
+    // clamped because radiance is HDR.
+    float albedoSpectrum[64];
+    float emissiveSpectrum[64];
 };
 
 struct GpuTriangle {
@@ -345,28 +353,43 @@ const float kLambdaMax = 700.0;
 const int   kSpecSamples = 61;
 const float kSpecStep = 5.0; // (700-400) / (61-1)
 
-// Evaluate a sigmoid-of-quadratic Jakob fit at an arbitrary wavelength.
-// Mirrors RGBToSpectrum::evalSigmoidFit on the CPU side byte-for-byte.
-// Returns the raw scaled sample - albedoAt clamps to [0, 1] because
-// physical reflectance is bounded; emissiveAt does not clamp because
-// emissive radiance is HDR (the upload's emissiveFit.w embeds the
-// per-material maxE, so the natural sample magnitude is up to maxE
-// per wavelength).
-float evaluateSigmoidFit(vec4 fit, float lambda) {
-    const float kLambdaMid  = 550.0;  // 0.5 * (kLambdaMin + kLambdaMax)
-    const float kLambdaHalf = 150.0;  // 0.5 * (kLambdaMax - kLambdaMin)
-    float L = (lambda - kLambdaMid) / kLambdaHalf;
-    float p = fit.x + L * (fit.y + L * fit.z);
-    float s = 0.5 + p / (2.0 * sqrt(1.0 + p * p));
-    return s * fit.w;
+// Linearly-interpolated lookup into a 61-sample tabulated spectrum
+// (400 nm to 700 nm at 5 nm spacing). Mirrors CPU's Spectrum::operator()
+// at the same wavelength. Out-of-range wavelengths return 0; in-range
+// wavelengths interpolate between the two bracketing samples.
+//
+// The 'src' parameter is 0 for albedo and 1 for emissive. Inlining the
+// dispatch here keeps the per-bounce hot path branch-free relative to
+// driver-specific decisions about array passing.
+float lookupTabulated(int matIdx, int src, float lambda) {
+    if (lambda < kLambdaMin || lambda > kLambdaMax) return 0.0;
+    float t = (lambda - kLambdaMin) / kSpecStep;
+    int   i = int(t);
+    if (i >= kSpecSamples - 1) {
+        return src == 0 ? materials[matIdx].albedoSpectrum[kSpecSamples - 1]
+                        : materials[matIdx].emissiveSpectrum[kSpecSamples - 1];
+    }
+    float f = t - float(i);
+    if (src == 0) {
+        float a = materials[matIdx].albedoSpectrum[i];
+        float b = materials[matIdx].albedoSpectrum[i + 1];
+        return mix(a, b, f);
+    } else {
+        float a = materials[matIdx].emissiveSpectrum[i];
+        float b = materials[matIdx].emissiveSpectrum[i + 1];
+        return mix(a, b, f);
+    }
 }
 
 float albedoAt(int matIdx, float lambda) {
-    return min(evaluateSigmoidFit(materials[matIdx].albedoFit, lambda), 1.0);
+    // CPU clamps to [0, 1] in Material::albedoAt; we clamp at upload
+    // time so the GPU side doesn't need a per-bounce min().
+    return lookupTabulated(matIdx, 0, lambda);
 }
 
 float emissiveAt(int matIdx, float lambda) {
-    return evaluateSigmoidFit(materials[matIdx].emissiveFit, lambda);
+    // No clamp - emissive radiance is HDR.
+    return lookupTabulated(matIdx, 1, lambda);
 }
 
 // Wyman 2013 CIE 1931 2-deg observer fit. ~1% accurate vs the
@@ -1410,13 +1433,17 @@ namespace
         int   transparent;
         float ior;
         float cauchyB;
-        // Sigmoid-coefficient form of the Jakob 2019 fit; mirrors the
-        // GLSL declaration above. {c0, c1, c2, scale}. Each is naturally
-        // 16-byte aligned, so no trailing padding is needed for std430
-        // stride parity (struct totals 80 bytes - a multiple of 16).
-        float albedoFit[4];
-        float emissiveFit[4];
+        // 61-sample tabulated spectra mirroring the GLSL struct above.
+        // Indices 0..60 cover 400-700 nm at 5 nm spacing; 61..63 are
+        // unused padding to keep each array's footprint at 256 bytes
+        // (a multiple of 16) so the total struct stays std430-clean.
+        // Total: 16+16+16 + 256+256 = 560 bytes, which is 16 * 35.
+        // Static-assert below guards against accidental layout drift.
+        float albedoSpectrum[64];
+        float emissiveSpectrum[64];
     };
+    static_assert(sizeof(GpuMaterial) == 560,
+                  "GpuMaterial size must be 560 bytes (3 vec4 + 2 float[64])");
     static_assert(sizeof(GpuMaterial) % 16 == 0,
                   "GpuMaterial size must be a multiple of 16 bytes for std430 array stride");
     struct GpuTriangle
@@ -1615,14 +1642,33 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
         gm.transparent = m.transparent ? 1 : 0;
         gm.ior = m.ior;
         gm.cauchyB = m.cauchyB;
-        gm.albedoFit[0] = m.albedoFit.c0;
-        gm.albedoFit[1] = m.albedoFit.c1;
-        gm.albedoFit[2] = m.albedoFit.c2;
-        gm.albedoFit[3] = m.albedoFit.scale;
-        gm.emissiveFit[0] = m.emissiveFit.c0;
-        gm.emissiveFit[1] = m.emissiveFit.c1;
-        gm.emissiveFit[2] = m.emissiveFit.c2;
-        gm.emissiveFit[3] = m.emissiveFit.scale;
+        // Fill the 61-sample tabulated spectra. Source depends on whether
+        // the material has a measured SPD (preferred) or only an RGB
+        // albedo / emissive (fall back to evaluating the Jakob fit at
+        // each wavelength). Both paths produce the same shape on disk,
+        // so the GPU shader has only one lookup function and parity
+        // with the CPU side is true: same per-wavelength values feed
+        // both backends.
+        //
+        // Albedo samples are clamped to [0, 1] here so the GLSL hot
+        // path doesn't need a per-bounce min() call (CPU clamps inside
+        // Material::albedoAt for the same reason). Emissive samples are
+        // not clamped because radiance is HDR.
+        for (int i = 0; i < Spectrum::kSamples; i++)
+        {
+            float lambda = Spectrum::lambdaAt(i);
+            float a = m.useTabulatedAlbedo
+                      ? m.tabulatedAlbedo[i]
+                      : RGBToSpectrum::evalSigmoidFit(m.albedoFit, lambda);
+            gm.albedoSpectrum[i] = std::min(std::max(0.f, a), 1.f);
+
+            float e = m.useTabulatedEmissive
+                      ? m.tabulatedEmissive[i]
+                      : RGBToSpectrum::evalSigmoidFit(m.emissiveFit, lambda);
+            gm.emissiveSpectrum[i] = std::max(0.f, e);
+        }
+        // Tail padding (61..63) stays zero-initialized via the {} brace
+        // construction above.
         mats.push_back(gm);
     }
 
