@@ -87,3 +87,39 @@ If that works, real install with `cmake --install Build` (with appropriate sudo 
 
 - A `cpack` config to produce `.deb`/`.rpm`/`.pkg` packages instead of just installing files. Useful if pcr ever gets distributed.
 - A GitHub Actions workflow that runs `cmake --install` and uploads the binary to GitHub Releases. Useful if pcr ever gets multiple users on different platforms.
+
+## Fourth binary: GPU CLI (`physically-cringe-rendering-cli`)
+
+**Status:** not started. v1.3.1 ships GPU on all three OSes via `physically-cringe-rendering` (the GUI binary), but there's no headless GPU path. Scripted / batch / CI renders that want the GPU still have to launch the GUI.
+
+### Why deferred
+
+The Metal port made GPU compute structurally feasible without a display server (Metal doesn't need a window the way OpenGL does), but the existing `frank-based-rendering-cli` is intentionally CPU-only so it can run on headless homelab servers without dragging GLFW + X11 deps. Adding `--gpu` to the existing CLI would force those deps onto every CLI build, regressing the headless-server fitness.
+
+A fourth binary keeps the separation clean: CPU CLI stays lean, GPU CLI is its own target with its own dep graph.
+
+### Why a separate binary, not just a flag
+
+Two of three options were considered and rejected (see chat history during the v1.3.1 Metal port for the full analysis):
+
+- **`--gpu` flag on existing CLI:** drags GLFW onto Linux/Windows CLI builds even when unused. Bad for headless servers.
+- **Mac-only `--gpu` flag:** smaller, but makes the CLI behavior asymmetric across platforms (works on Mac, errors on Win/Linux). Future-confusing.
+- **Fourth binary (this one):** symmetric across all three OSes. Win/Linux pull in GLFW as expected for the GPU backend; Mac uses Metal cleanly. CPU CLI stays untouched.
+
+### Implementation sketch
+
+1. New target in `code/CMakeLists.txt` named `physically-cringe-rendering-cli`. Sources: `Cli/Main.cpp` (with one new code path that constructs `GpuRenderer` instead of `Renderer` when invoked) + `${PCR_GPU_BACKEND_SRC}` (already conditionally Opengl/.cpp or Metal/.mm) + the shared renderer sources + the GUI's GLFW dep on non-Apple.
+2. Refactor `Cli/Main.cpp` to dispatch to either CPU or GPU renderer based on a build-time `PCR_USE_GPU` define (mirrors what the GUI binaries already do via the same define).
+3. On Win/Linux: at startup, `glfwInit()` + `glfwCreateWindow(1, 1, ..., GLFW_VISIBLE=FALSE)` to satisfy the OpenGL backend's shared-context requirement. On Apple: nothing extra; Metal stands alone.
+4. CMake conditional: link Foundation + Metal frameworks on Apple (mirror what the GPU GUI does); link GLFW + OpenGL on Win/Linux.
+5. CI: stage the new binary in all three OS jobs, plus add it to the release-job rename matrix as `physically-cringe-rendering-cli-vX.Y.Z-<os>-<arch>`. Release goes from 8 individual binary assets to 11.
+
+### Why `physically-cringe-rendering-cli` as the name
+
+Keeps the silly-naming convention from v1.0.0. `frank-based-rendering-cli` is the CPU one; `physically-cringe-rendering-cli` is the GPU one. Symmetric with the GUI pair.
+
+### Use cases this unlocks
+
+- Scripted batch renders on Mac Studio (the obvious motivator: M1 Ultra GPU is much faster than the 20-core CPU for path tracing, and the GUI is overkill for "render this list of scenes overnight")
+- CI render-diff goldens regenerated on the GPU, faster turnaround when adding a new render-test tuple
+- Homelab GPU rendering jobs without remote-X / VNC into the GUI
