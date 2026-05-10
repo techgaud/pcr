@@ -204,6 +204,7 @@ target_include_directories(frank-based-rendering-cli PRIVATE
 target_link_libraries(frank-based-rendering-cli PRIVATE Threads::Threads)
 target_compile_definitions(frank-based-rendering-cli PRIVATE
     PCR_BINARY_NAME="frank-based-rendering-cli"
+    PCR_USE_GPU=0
 )
 
 if(MSVC)
@@ -341,6 +342,48 @@ pcr_apply_msvc_release_flags(physically-cringe-rendering)
 pcr_silence_apple_gl_deprecation(physically-cringe-rendering)
 pcr_link_oidn(physically-cringe-rendering)
 
+# --- GPU CLI: physically-cringe-rendering-cli ----------------------------
+# Headless GPU renderer. Same Cli/Main.cpp source as the CPU CLI, gated
+# on PCR_USE_GPU=1 which routes the renderer construction through the
+# Gpu/GpuRenderer.h backend-typedef shim. Mac uses Metal directly (no
+# display server / window required); Win/Linux create a hidden 1x1 GLFW
+# window to host the OpenGL 4.3 compute context.
+#
+# Why this is a separate binary instead of a --gpu flag on the CPU CLI:
+# adding GPU support to the CPU CLI would drag GLFW + OpenGL onto every
+# CLI build, regressing headless-server fitness. A fourth target keeps
+# the dep graphs separate: CPU CLI stays lean for homelab/CI use, GPU
+# CLI ships only where the GPU backend is wanted.
+add_executable(physically-cringe-rendering-cli
+    Cli/Main.cpp
+    ${PCR_GPU_BACKEND_SRC}
+    ${PCR_RENDERER_SOURCES}
+)
+target_include_directories(physically-cringe-rendering-cli PRIVATE
+    ${PCR_GUI_INCLUDES}
+)
+target_link_libraries(physically-cringe-rendering-cli PRIVATE
+    glfw
+    OpenGL::GL
+    Threads::Threads
+)
+target_compile_definitions(physically-cringe-rendering-cli PRIVATE
+    PCR_BINARY_NAME="physically-cringe-rendering-cli"
+    PCR_USE_GPU=1
+)
+if(APPLE)
+    set_source_files_properties(Gpu/Metal/MetalRenderer.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    target_link_libraries(physically-cringe-rendering-cli PRIVATE
+        "-framework Foundation"
+        "-framework Metal"
+    )
+endif()
+pcr_apply_msvc_release_flags(physically-cringe-rendering-cli)
+pcr_silence_apple_gl_deprecation(physically-cringe-rendering-cli)
+pcr_link_oidn(physically-cringe-rendering-cli)
+
 # --- Single deploy target ------------------------------------------------
 # All three binaries (CLI, CPU GUI, GPU GUI) land in the same
 # TARGET_FILE_DIR. The previous design ran a per-target POST_BUILD
@@ -427,6 +470,7 @@ add_dependencies(pcr-deploy-data
     frank-based-rendering-cli
     frank-based-rendering
     physically-cringe-rendering
+    physically-cringe-rendering-cli
 )
 
 # --- Tests (opt-in, off by default) -------------------------------------

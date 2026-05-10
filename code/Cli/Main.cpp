@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <cstdlib>
+#include <cstdio>
 #include <ctime>
 
 #include "Includes/CLI11.hpp"
@@ -14,10 +15,26 @@
 #include "Includes/LutDiscovery.h"
 #include "Includes/NumGen.h"
 #include "Includes/RGBToSpectrum.h"
-#include "Includes/Renderer.h"
+#if PCR_USE_GPU
+    #include "Gpu/GpuRenderer.h"
+    #if !defined(__APPLE__)
+        #include <GLFW/glfw3.h>
+    #endif
+#else
+    #include "Includes/Renderer.h"
+#endif
 #include "Scenes/Scene.h"
 #include "Scenes/SceneDiscovery.h"
 #include "Scenes/SceneLoader.h"
+
+#ifndef PCR_BINARY_NAME
+#define PCR_BINARY_NAME "frank-based-rendering-cli"
+#endif
+#if PCR_USE_GPU
+    #define PCR_CLI_DESC "GPU path tracer (headless)"
+#else
+    #define PCR_CLI_DESC "CPU path tracer"
+#endif
 
 namespace
 {
@@ -84,7 +101,7 @@ int main(int argc, char *argv[])
     std::string lutFile;
     uint64_t seed = 0;
 
-    CLI::App app{"frank-based-rendering-cli - CPU path tracer"};
+    CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
         ->default_str("cornell");
     app.add_option("-d,--depth", depth, "Max ray bounces")
@@ -339,7 +356,43 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+#if PCR_USE_GPU
+    // GPU CLI needs an OpenGL context on non-Apple (OpenglRenderer
+    // borrows it via glfwMakeContextCurrent inside render()). On Apple
+    // Metal stands alone and the constructor takes a nullptr placeholder
+    // just so the signature matches OpenglRenderer.
+    GLFWwindow *gpuShared = nullptr;
+    #if !defined(__APPLE__)
+        if (!glfwInit())
+        {
+            std::cerr << "GLFW: glfwInit failed; cannot create the hidden "
+                      << "GPU context this binary needs." << std::endl;
+            return 1;
+        }
+        // Match the headers-and-version dance Gui/main.cpp does on Apple
+        // (3.2 Core + forward-compat). The OpenGL compute shader wants
+        // 4.3 but we ask for 3.2 here because the driver hands back the
+        // newest profile it can; on every Win/Linux box that runs pcr
+        // that's >= 4.3 anyway. macOS only matters in the Metal branch
+        // above so the Apple-only hints don't apply here.
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+        gpuShared = glfwCreateWindow(1, 1, "pcr-gpu-headless", nullptr, nullptr);
+        if (!gpuShared)
+        {
+            std::cerr << "GLFW: could not create hidden GPU context window."
+                      << std::endl;
+            glfwTerminate();
+            return 1;
+        }
+    #endif
+
+    GpuRenderer renderer{width, height, depth, samples, shadowSamples, gpuShared};
+#else
     Renderer renderer{width, height, depth, samples, shadowSamples};
+#endif
+
     renderer.useDenoise   = useDenoise;
     renderer.useMIS       = useMIS;
     renderer.useRussian   = useRussian;
@@ -351,6 +404,11 @@ int main(int argc, char *argv[])
     renderer.useSpectral  = useSpectral;
     renderer.heroSamples  = heroSamples;
     renderer.render(sceneData, start, outputDir);
+
+#if PCR_USE_GPU && !defined(__APPLE__)
+    glfwDestroyWindow(gpuShared);
+    glfwTerminate();
+#endif
 
     return 0;
 }
