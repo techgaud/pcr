@@ -158,6 +158,21 @@ struct GpuLightTriangle {
     int    _pad0, _pad1, _pad2;
 };
 
+// Uniforms total: 128 bytes. The 29 active fields are 116 bytes; the
+// trailing 3-int padding rounds the struct up to a multiple of 16
+// bytes. Two reasons:
+//   - When this struct is the element type of a per-strip uniforms
+//     array bound at offset i * sizeof(Uniforms), Apple Silicon's MSL
+//     compiler issues vectorized 16-byte loads for the constant-
+//     address-space struct read. Those loads expect the base offset
+//     to be 16-aligned. With unpadded 116 bytes the offset alignment
+//     would be gcd(116, 16) = 4, not 16, so only every fourth strip
+//     would hit a clean alignment - the rest read garbage uniforms
+//     and the kernel's pix.y >= u.yEnd early-out kills those threads
+//     (visible as horizontal black stripes in heavy renders where
+//     the compiler choose the vectorized path).
+//   - It also keeps the host POD layout below symmetric with this
+//     struct so memcpy-via-shared-buffer is byte-equivalent.
 struct Uniforms {
     int   width;
     int   height;
@@ -188,6 +203,7 @@ struct Uniforms {
     int   writeAux;
     int   useSpectral;
     int   heroSamples;
+    int   _pad0, _pad1, _pad2;
 };
 
 // Bundle of all device buffers + uniforms threaded through every helper
@@ -1195,7 +1211,11 @@ namespace
         int   writeAux;
         int   useSpectral;
         int   heroSamples;
+        int   _pad0, _pad1, _pad2;
     };
+    static_assert(sizeof(Uniforms) == 128,
+                  "Uniforms must be 128 bytes (multiple of 16) so per-strip "
+                  "buffer offsets are 16-aligned for MSL vectorized loads");
 
     // Mirrors the OpenGL backend's compressZone helper (Windows long
     // zone names like "Eastern Daylight Time" -> "EDT"). On macOS the
@@ -1622,22 +1642,44 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     //
     // The OpenGL backend uses 16x16 tiles + glFinish() per tile because
     // Windows kills any single shader invocation that runs longer than
-    // ~2 sec (TDR watchdog). Apple has no equivalent. Per-tile waits
-    // here serialized CPU encoding and GPU execution: GPU drained, CPU
-    // re-encoded, GPU drained again, ad nauseam. coarse samplers like
-    // `asitop` saw "100% GPU utilization" while the actual duty cycle
-    // was a fraction of that. Killing the wait lets the command queue
-    // pipeline strips - while strip N is computing on the GPU, the CPU
-    // is encoding strip N+1.
+    // ~2 sec (TDR watchdog). Apple has no equivalent of TDR but does
+    // have a softer compute-kernel watchdog at ~5-10 sec; cmd buffers
+    // that exceed it come back with status=Error and their writes
+    // never land. So strip count needs to scale with per-pixel work:
+    //   - Production preset (256 samples * 4 depth * 8 shadow * 4 AA
+    //     ~= 32k op/pixel) at 1080 over 32 strips = ~1 sec/strip. Safe.
+    //   - Picture preset (2048 * 6 * 32 * 4 ~= 1.5M op/pixel) at the
+    //     same 32 strips = ~30 sec/strip. Watchdog kills several;
+    //     visible as horizontal black bands in the output.
     //
-    // Strip count target: 32 strips, each at least 16 rows tall. Why
-    // strips at all instead of one image-wide dispatch: progress UX.
-    // 32 strips gives a progress bar that updates ~3% at a time on a
-    // 1080-row render, which feels live without wasting overhead on
-    // dispatch micro-management. Tiny renders collapse to a single
-    // strip.
-    constexpr int kTargetStrips = 32;
-    int stripHeight = std::max(16, (_height + kTargetStrips - 1) / kTargetStrips);
+    // Target: ~3 sec per strip max. Calibrated against the 33-sec
+    // Production-preset 1080^2 render on M1 Ultra (~1 sec/strip at
+    // 32k op/pixel): the GPU does roughly 1.1B op/sec on this kernel
+    // post-perf-fixes. 3-sec budget = 3.3B op/strip.
+    //
+    // Floor at 32 strips so progress UX still feels live on light
+    // renders. Ceiling at strip-height = 1 row (one threadgroup row
+    // per dispatch) to avoid pathological "1080 strips of < 1 row".
+    int aaMult = std::max(1, aaSamples);
+    long long workPerPixel =
+        (long long)_samples * _maxDepth * _shadowSamples * aaMult;
+    if (useAdaptive) workPerPixel = (long long)((double)workPerPixel * 1.15);
+    if (useSpectral) workPerPixel = (long long)((double)workPerPixel * 2.5);
+
+    constexpr long long kTargetWorkPerStrip = 3'300'000'000LL;
+    long long pixelsPerStrip = std::max(
+        (long long)_width,
+        kTargetWorkPerStrip / std::max(1LL, workPerPixel));
+    int stripHeight = std::clamp(
+        (int)(pixelsPerStrip / std::max(1, _width)),
+        1, _height);
+
+    constexpr int kMinStrips = 32;
+    int provisionalNumStrips = (_height + stripHeight - 1) / stripHeight;
+    if (provisionalNumStrips < kMinStrips && _height >= kMinStrips)
+    {
+        stripHeight = std::max(1, _height / kMinStrips);
+    }
     int numStrips = (_height + stripHeight - 1) / stripHeight;
 
     // Common uniform fields (everything except per-strip y bounds).
@@ -1788,6 +1830,37 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // renders, since encoding is much faster than execution).
     if ([pending count] > 0)
         [[pending lastObject] waitUntilCompleted];
+
+    // Audit cmd buffer outcomes. Apple's compute watchdog (the
+    // looser-than-Windows-TDR equivalent) shows up here as
+    // status=MTLCommandBufferStatusError; the kernel ran out of
+    // wallclock and was killed before its writes landed. Visible
+    // in the output as horizontal black bands matching the killed
+    // strips. Surface those failures explicitly rather than letting
+    // them masquerade as "the kernel ran fine, the image just looks
+    // weird."
+    int erroredStrips = 0;
+    for (id<MTLCommandBuffer> cb in pending)
+    {
+        if (cb.status == MTLCommandBufferStatusError)
+        {
+            erroredStrips++;
+            if (cb.error)
+            {
+                std::cerr << "Metal strip error: "
+                          << [[cb.error localizedDescription] UTF8String]
+                          << std::endl;
+            }
+        }
+    }
+    if (erroredStrips > 0)
+    {
+        std::cerr << "Metal render: " << erroredStrips << " of "
+                  << [pending count] << " strips failed (likely GPU "
+                  << "watchdog timeout). Reduce samples / depth / "
+                  << "shadow / AA, or render at a smaller resolution."
+                  << std::endl;
+    }
 
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
         std::cout << "Metal render cancelled." << std::endl;
