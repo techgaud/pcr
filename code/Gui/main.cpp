@@ -203,6 +203,15 @@ struct Settings
     // regardless so toggling debug off doesn't silently revert.
     int heroSamples = 4;
 
+    // Metal compute threadgroup shape. Effective on Apple Silicon
+    // backends only; OpenGL ignores them. Common A/B shapes: 8x8
+    // (small, more concurrent groups, better for divergent paths),
+    // 16x16, 32x8 (wide, favors horizontal cache locality), 32x32
+    // (current default, maximum spatial reuse). The GUI surfaces these
+    // as preset buttons next to the quality presets.
+    int threadgroupX = 32;
+    int threadgroupY = 32;
+
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
     // persisted regardless so flipping spectral on later restores the
@@ -278,6 +287,8 @@ static void loadSettings(Settings &s)
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
         s.useOIDN       = j.value("useOIDN",       s.useOIDN);
         s.heroSamples   = j.value("heroSamples",   s.heroSamples);
+        s.threadgroupX  = j.value("threadgroupX",  s.threadgroupX);
+        s.threadgroupY  = j.value("threadgroupY",  s.threadgroupY);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -344,6 +355,8 @@ static json buildSettingsJson(const Settings &s)
     j["useAdaptive"]   = s.useAdaptive;
     j["useOIDN"]       = s.useOIDN;
     j["heroSamples"]   = s.heroSamples;
+    j["threadgroupX"]  = s.threadgroupX;
+    j["threadgroupY"]  = s.threadgroupY;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -621,6 +634,10 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
         renderer.useOIDN       = settings.useOIDN;
+#if PCR_USE_GPU
+        renderer.threadgroupX  = settings.threadgroupX;
+        renderer.threadgroupY  = settings.threadgroupY;
+#endif
         if (live)
         {
             renderer.onPartialFrame = [live](const std::vector<Vec3f> &fb, int w, int h) {
@@ -1423,6 +1440,48 @@ int main(int, char **)
         pcrSliderInt("Depth",   &settings.depth,         1, 8,    1, 2);
         pcrSliderInt("Samples", &settings.samples,       1, 4096, 1, 16);
         pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 64,   1, 4);
+
+#if PCR_USE_GPU
+        // GPU Tuning: Metal compute threadgroup shape. Hot-tunable A/B
+        // knob, not a quality/aesthetic choice; effective only on the
+        // Metal backend (OpenGL bakes local_size into the GLSL string
+        // and ignores these fields). Multiples of 32 in total threads
+        // align with M1 Ultra's SIMD width; smaller groups tend to win
+        // on divergent path-tracing workloads, larger groups tend to
+        // win on coherent compute. Read ThreadgroupX/Y from the PNG
+        // tEXt metadata after a render to confirm what shipped.
+        ImGui::SeparatorText("GPU Tuning");
+        ImGui::TextUnformatted("Threadgroup:");
+        struct TgPreset { const char *label; int x; int y; };
+        static const TgPreset kTgPresets[] = {
+            {"8x8",   8,  8},
+            {"16x16", 16, 16},
+            {"32x8",  32, 8},
+            {"32x32", 32, 32},
+        };
+        for (const auto &tp : kTgPresets)
+        {
+            ImGui::SameLine();
+            bool isActive = (settings.threadgroupX == tp.x &&
+                             settings.threadgroupY == tp.y);
+            if (isActive)
+                ImGui::PushStyleColor(ImGuiCol_Button,
+                                      ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+            if (ImGui::Button(tp.label))
+            {
+                settings.threadgroupX = tp.x;
+                settings.threadgroupY = tp.y;
+            }
+            if (isActive)
+                ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%d x %d = %d threads/group (%d SIMD groups)",
+                                  tp.x, tp.y, tp.x * tp.y, (tp.x * tp.y) / 32);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(current %dx%d)",
+                            settings.threadgroupX, settings.threadgroupY);
+#endif
 
         // Mode: pipeline-shaping choices that change WHAT the
         // renderer computes, not how efficiently. ACES / Reinhard

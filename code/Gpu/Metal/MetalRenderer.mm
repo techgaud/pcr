@@ -2268,9 +2268,22 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     id<MTLComputePipelineState> activePipeline =
         useAdaptive ? _impl->pipelinePassAdapt : _impl->pipelinePass;
 
-    int tgX = 32, tgY = 32;
+    // User-configurable threadgroup shape. Defaults to 32x32 (matches
+    // the v1.4.0 hardcoded value); 8x8 / 16x16 / 32x8 are common shapes
+    // worth A/B-testing. Validate against the pipeline's limit and fall
+    // back to 16x16 if invalid (e.g. user picked something the pipeline
+    // can't actually run with). Total threads also has to be > 0; treat
+    // a zero in either axis as "use the default".
+    int tgX = (threadgroupX > 0) ? threadgroupX : 32;
+    int tgY = (threadgroupY > 0) ? threadgroupY : 32;
     if (activePipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(tgX * tgY))
     {
+        std::cerr << "MetalRenderer: requested threadgroup "
+                  << tgX << "x" << tgY << " (=" << (tgX * tgY)
+                  << " threads) exceeds pipeline limit of "
+                  << activePipeline.maxTotalThreadsPerThreadgroup
+                  << "; falling back to 16x16."
+                  << std::endl;
         tgX = 16;
         tgY = 16;
     }
@@ -2555,6 +2568,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     addText("AASamples",     std::to_string(aaSamples));
     addText("Adaptive",      useAdaptive ? "1" : "0");
     addText("OIDN",          useOIDN     ? "1" : "0");
+    addText("ThreadgroupX",  std::to_string(tgX));
+    addText("ThreadgroupY",  std::to_string(tgY));
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

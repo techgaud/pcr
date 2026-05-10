@@ -100,6 +100,8 @@ int main(int argc, char *argv[])
     bool useLUT = false;
     std::string lutFile;
     uint64_t seed = 0;
+    int threadgroupX = 32;
+    int threadgroupY = 32;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -227,6 +229,23 @@ int main(int argc, char *argv[])
                  "have a saved LUT. Mutually exclusive with --lut.");
     lutFlag->excludes(lutFileOpt);
     lutFileOpt->excludes(lutFlag);
+
+#if PCR_USE_GPU
+    options->add_option("--threadgroup-x", threadgroupX,
+                 "Metal compute threadgroup width (in threads). Together "
+                 "with --threadgroup-y selects the per-dispatch threadgroup "
+                 "shape. Effective values on Apple Silicon are multiples of "
+                 "32 in total threads (SIMD width = 32); common shapes are "
+                 "8x8, 16x16, 32x8, 32x32. Default 32. Ignored on the "
+                 "OpenGL backend (local_size baked into the GLSL kernel).")
+        ->default_str("32")
+        ->check(CLI::PositiveNumber);
+    options->add_option("--threadgroup-y", threadgroupY,
+                 "Metal compute threadgroup height (in threads). See "
+                 "--threadgroup-x. Default 32.")
+        ->default_str("32")
+        ->check(CLI::PositiveNumber);
+#endif
 
     CLI11_PARSE(app, argc, argv);
 
@@ -403,6 +422,13 @@ int main(int argc, char *argv[])
     renderer.useOIDN      = useOIDN;
     renderer.useSpectral  = useSpectral;
     renderer.heroSamples  = heroSamples;
+#if PCR_USE_GPU
+    renderer.threadgroupX = threadgroupX;
+    renderer.threadgroupY = threadgroupY;
+#else
+    (void)threadgroupX;
+    (void)threadgroupY;
+#endif
     renderer.render(sceneData, start, outputDir);
 
 #if PCR_USE_GPU && !defined(__APPLE__)

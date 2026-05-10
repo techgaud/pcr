@@ -64,6 +64,14 @@ public:
     // values map to 4 (full hero).
     int heroSamples = 4;
 
+    // Field exists so Gui/main.cpp and Cli/Main.cpp compile against
+    // either backend with the same surface. OpenGL's local_size_xy is
+    // baked into the GLSL kernel string at compile time so changing
+    // these at runtime has no effect on this backend. The Metal backend
+    // honors them.
+    int threadgroupX = 32;
+    int threadgroupY = 32;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
