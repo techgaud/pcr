@@ -90,7 +90,7 @@ If that works, real install with `cmake --install Build` (with appropriate sudo 
 
 ## Fourth binary: GPU CLI (`physically-cringe-rendering-cli`)
 
-**Status:** not started. v1.3.1 ships GPU on all three OSes via `physically-cringe-rendering` (the GUI binary), but there's no headless GPU path. Scripted / batch / CI renders that want the GPU still have to launch the GUI.
+**Status:** not started. v1.4.0 ships GPU on all three OSes via `physically-cringe-rendering` (the GUI binary), but there's no headless GPU path. Scripted / batch / CI renders that want the GPU still have to launch the GUI.
 
 ### Why deferred
 
@@ -100,7 +100,7 @@ A fourth binary keeps the separation clean: CPU CLI stays lean, GPU CLI is its o
 
 ### Why a separate binary, not just a flag
 
-Two of three options were considered and rejected (see chat history during the v1.3.1 Metal port for the full analysis):
+Two of three options were considered and rejected (see chat history during the v1.4.0 Metal port for the full analysis):
 
 - **`--gpu` flag on existing CLI:** drags GLFW onto Linux/Windows CLI builds even when unused. Bad for headless servers.
 - **Mac-only `--gpu` flag:** smaller, but makes the CLI behavior asymmetric across platforms (works on Mac, errors on Win/Linux). Future-confusing.
@@ -123,3 +123,38 @@ Keeps the silly-naming convention from v1.0.0. `frank-based-rendering-cli` is th
 - Scripted batch renders on Mac Studio (the obvious motivator: M1 Ultra GPU is much faster than the 20-core CPU for path tracing, and the GUI is overkill for "render this list of scenes overnight")
 - CI render-diff goldens regenerated on the GPU, faster turnaround when adding a new render-test tuple
 - Homelab GPU rendering jobs without remote-X / VNC into the GUI
+
+## Spatial chopping in the multi-pass dispatch (Apple-only, very-high-res)
+
+**Status:** not started. Multi-pass dispatch handles cleanly up to ~8K square; 16K square (Apple Silicon's MTLTexture hard limit) trips Apple's compute watchdog because per-dispatch ops don't fit in the ~3-sec budget even at the floor of one sample per pixel per pass.
+
+### Why deferred
+
+For the workloads pcr's audience (one) actually runs, 4K-8K is the hero-render sweet spot. 16K is "because we can" rather than "because the output is meaningfully different." Implementing spatial chopping is real work for a corner case nobody's asked for.
+
+### Numbers
+
+Multi-pass per-pass work scales as `pixels * samples_per_pass * shadow * depth`. The watchdog target is ~9B ops per dispatch (calibrated against the M1 Ultra's measured ~3.15 G ops/sec saturated throughput). At Picture-class settings (shadow=32, depth=6, ~192 ops/pixel/sample):
+
+- 1080² (1.17M pixels): samplesPerPass = 9B / (1.17M × 192) = 40, well under the budget
+- 4K (16.7M pixels): samplesPerPass = 2, ~12.8B ops/dispatch, still safe
+- 8K (67M pixels): samplesPerPass = 1 (clamped), ~12.9B ops/dispatch, ~4 sec — borderline
+- 16K (268M pixels): samplesPerPass = 1 (clamped), ~52B ops/dispatch, ~16 sec — very likely killed by the watchdog
+
+The fix is to dispatch a SUBREGION of the image each pass instead of the full image when the full-image dispatch would exceed budget at samplesPerPass=1. Treat the budget as "a slice of work that's both spatially and sample-axis bounded."
+
+### Implementation sketch
+
+1. Compute pixelsPerDispatch as `kTargetOpsPerDispatch / opsPerPixelPerSample`. If pixelsPerDispatch >= total pixels, current full-image multi-pass continues to work.
+2. If pixelsPerDispatch < total pixels, also chop the image into spatial regions of approximately pixelsPerDispatch each. Total dispatches = `aaSamples * sampleBatches * spatialTiles`.
+3. Per-pass uniforms grow: alongside `aaIdx / sampleStart / sampleCount`, add `xOffset / xEnd / yOffset / yEnd` for the spatial region.
+4. The kernel already supports spatial bounds (the strip path uses them). Same Uniforms struct can carry both.
+5. Pass 0's "clobber the texture" branch needs to apply only at the per-pixel level (not per-dispatch); easier to just zero-fill the output texture once at render start with a tiny clear kernel (which we'd wanted anyway).
+
+### Risk
+
+Adds ordering complexity to the pass loop. Currently pass index uniquely determines (aaIdx, sampleStart). With spatial chopping, pass index → (aaIdx, sampleStart, spatialRegion). The mapping is straightforward but easy to off-by-one. Test fixture: render Picture at exactly 16K and confirm the output PNG matches (within rounding) a 16K render done by tiling 4× of an 8K render.
+
+### When to revisit
+
+When someone asks for 16K renders. Until then, the slider letting users PICK 16K is the cosmetic accessibility; the cmd-buffer-error logging that already exists will surface the watchdog kill explicitly to stderr if anyone tries it. Not silently broken, just not supported.
