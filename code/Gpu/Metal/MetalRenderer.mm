@@ -1283,10 +1283,10 @@ struct MetalRenderer::Impl
     id<MTLBuffer>               bvhBuf         = nil;
     id<MTLBuffer>               lightBuf       = nil;
     id<MTLBuffer>               lightTriBuf    = nil;
-    // Uniforms are pushed inline per-dispatch via setBytes:length:atIndex:
-    // (~100 bytes, well under the 4 KB inline limit). No persistent
-    // uniform MTLBuffer needed; that pattern would alias across pipelined
-    // command buffers on the same queue.
+    // Uniforms aren't kept here: render() allocates a fresh per-render
+    // MTLBuffer with one Uniforms entry per strip, since per-strip data
+    // has to be addressable independently while pipelined command buffers
+    // are still in flight on the queue.
 
     bool                        initialized    = false;
 };
@@ -1692,6 +1692,37 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
     MTLSize threadsPerGroup = MTLSizeMake(tgX, tgY, 1);
 
+    // Per-strip uniforms in a single MTLBuffer with N entries. Bind
+    // strip i with offset = i * sizeof(Uniforms) so each command
+    // buffer reads its own immutable copy.
+    //
+    // Why not setBytes:length:atIndex: like the obvious-looking first
+    // pass: that path uses Metal's internal "constant pool", which
+    // is a single rotating allocator shared across all command
+    // buffers on the queue. With N strips queued back-to-back without
+    // waiting between them, later strips' inline data aliased over
+    // earlier strips' data before the GPU got around to reading it.
+    // The earlier strips then read whatever yOffset/yEnd the later
+    // strips had written, the early-out check killed those threads,
+    // and the output texture kept its zero-init value for those
+    // pixels (visible as horizontal black stripes in the rendered
+    // image). A real MTLBuffer with per-strip offsets is the
+    // pipeline-safe way to do this.
+    size_t uniformsStride = sizeof(Uniforms);
+    id<MTLBuffer> uniformsBuf =
+        [_impl->device newBufferWithLength:uniformsStride * (size_t)numStrips
+                                   options:MTLResourceStorageModeShared];
+    Uniforms *uniformsPtr = (Uniforms *)[uniformsBuf contents];
+    for (int i = 0; i < numStrips; i++)
+    {
+        int yStart = i * stripHeight;
+        int yEnd = std::min(yStart + stripHeight, _height);
+        Uniforms u = uBase;
+        u.yOffset = yStart;
+        u.yEnd    = yEnd;
+        uniformsPtr[i] = u;
+    }
+
     // Atomic counter bumped from each command buffer's completion
     // handler. The handlers fire on a Metal-internal thread; the
     // counter lives on this stack frame and stays alive until the
@@ -1703,22 +1734,19 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     NSMutableArray<id<MTLCommandBuffer>> *pending =
         [[NSMutableArray alloc] initWithCapacity:numStrips];
 
-    for (int yStart = 0; yStart < _height; yStart += stripHeight)
+    for (int i = 0; i < numStrips; i++)
     {
         if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
             break;
 
+        int yStart = i * stripHeight;
         int yEnd = std::min(yStart + stripHeight, _height);
         int stripH = yEnd - yStart;
-
-        Uniforms u = uBase;
-        u.yOffset = yStart;
-        u.yEnd    = yEnd;
 
         id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         [enc setComputePipelineState:_impl->pipeline];
-        [enc setBytes:&u length:sizeof(u) atIndex:0];
+        [enc setBuffer:uniformsBuf      offset:(NSUInteger)(i * uniformsStride) atIndex:0];
         [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
         [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
         [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
