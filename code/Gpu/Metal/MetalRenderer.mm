@@ -159,7 +159,7 @@ struct GpuLightTriangle {
     int    _pad0, _pad1, _pad2;
 };
 
-// Uniforms total: 144 bytes (33 active fields = 132 bytes + 3 trailing
+// Uniforms total: 144 bytes (34 active fields = 136 bytes + 2 trailing
 // padding ints to round up to a multiple of 16). Two reasons for the
 // alignment padding:
 //   - When this struct is the element type of a per-pass uniforms
@@ -174,8 +174,9 @@ struct GpuLightTriangle {
 //   - Keeps the host POD layout below symmetric so memcpy-via-shared-
 //     buffer is byte-equivalent on both sides.
 //
-// The trailing four fields (passIdx, aaIdx, sampleStart, sampleCount)
-// are used only by path_trace_pass; the legacy path_trace ignores them.
+// The trailing five fields (passIdx, aaIdx, sampleStart, sampleCount,
+// batchEndOfAa) are used only by path_trace_pass / path_trace_pass_adaptive;
+// the legacy path_trace ignores them.
 struct Uniforms {
     int   width;
     int   height;
@@ -210,7 +211,25 @@ struct Uniforms {
     int   aaIdx;
     int   sampleStart;
     int   sampleCount;
-    int   _pad0, _pad1, _pad2;
+    int   batchEndOfAa;
+    int   _pad1, _pad2;
+};
+
+// Per-pixel Welford state for the adaptive multi-pass kernel.
+// Layout matches the host PCRWelfordState POD below.
+struct Welford {
+    float stagingR;   // sum of contributions within the current aaIdx
+    float stagingG;
+    float stagingB;
+    float meanR;      // running Welford mean of completed-aaIdx means
+    float meanG;
+    float meanB;
+    float m2R;        // running Welford M2 of completed-aaIdx means
+    float m2G;
+    float m2B;
+    int   taken;      // number of completed aaIdx data points
+    int   done;       // 1 = converged, skip remaining work
+    int   _pad0;
 };
 
 // Bundle of all device buffers + uniforms threaded through every helper
@@ -1234,6 +1253,222 @@ kernel void path_trace_pass(
         output.write(prev + float4(accum, 0.0f), uint2(pix.x, pix.y));
     }
 }
+
+// ---- Multi-pass adaptive kernel ------------------------------------
+//
+// Used by the saturation-friendly dispatch path when useAdaptive=ON.
+// Same per-pass full-image dispatch geometry as path_trace_pass (so
+// the GPU stays saturated) but augmented with per-pixel Welford state
+// living in a device-side buffer. State per pixel:
+//   - stagingRGB: running sum of contributions within the CURRENT aaIdx
+//   - meanRGB / m2RGB / taken: Welford accumulator over COMPLETED aaIdx
+//     means, matching the strip path's Welford granularity exactly
+//     (each data point = one full AA iteration's mean)
+//   - done: 1 if relative variance < threshold after >=4 aaIdx taken
+//
+// Per pass:
+//   - On passIdx == 0, the kernel clobbers the per-pixel state to zero.
+//   - If done==1, the kernel returns immediately and the pixel's
+//     prior output-texture write (the running Welford mean) stands.
+//   - Otherwise: same sampling loop as path_trace_pass adds to staging.
+//   - If batchEndOfAa==1, the staging is divided by samples to get the
+//     AA iteration mean, that mean is folded into Welford, staging is
+//     reset, and the running mean is written to the output texture.
+//     The convergence check fires after >=4 aaIdx taken using the same
+//     rel-variance threshold (0.05) the strip path uses.
+//
+// Output texture writes contain the MEAN, not a sum: done pixels keep
+// their last-written mean intact across subsequent passes. CPU readback
+// for this path therefore SKIPS the divide-by-total-contributions step
+// that non-adaptive multi-pass uses.
+//
+// Memory cost: 48 bytes per pixel for the Welford buffer (private
+// storage mode, GPU-only). 1080^2 = 56 MB, 4K = 800 MB, 8K = 3.2 GB.
+// Well within M1 Ultra's 64 GB unified memory budget.
+
+kernel void path_trace_pass_adaptive(
+    constant Uniforms                          &u            [[buffer(0)]],
+    device const GpuSphere                     *spheres      [[buffer(1)]],
+    device const GpuPlane                      *planes       [[buffer(2)]],
+    device const GpuMaterial                   *materials    [[buffer(3)]],
+    device const GpuTriangle                   *triangles    [[buffer(4)]],
+    device const GpuBvhNode                    *bvhNodes     [[buffer(5)]],
+    device const GpuLight                      *lights       [[buffer(6)]],
+    device const GpuLightTriangle              *lightTris    [[buffer(7)]],
+    device Welford                             *welford      [[buffer(8)]],
+    texture2d<float, access::read_write>        output       [[texture(0)]],
+    texture2d<float, access::write>             albedoOut    [[texture(1)]],
+    texture2d<float, access::write>             normalOut    [[texture(2)]],
+    uint2                                       gid          [[thread_position_in_grid]])
+{
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris };
+
+    int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
+    if (pix.x >= u.xEnd || pix.x >= u.width ||
+        pix.y >= u.yEnd || pix.y >= u.height) return;
+
+    int wfIdx = pix.y * u.width + pix.x;
+
+    // On passIdx==0 clobber the per-pixel state. Avoids needing a
+    // separate clear kernel before the run.
+    if (u.passIdx == 0) {
+        welford[wfIdx].stagingR = 0.0f;
+        welford[wfIdx].stagingG = 0.0f;
+        welford[wfIdx].stagingB = 0.0f;
+        welford[wfIdx].meanR    = 0.0f;
+        welford[wfIdx].meanG    = 0.0f;
+        welford[wfIdx].meanB    = 0.0f;
+        welford[wfIdx].m2R      = 0.0f;
+        welford[wfIdx].m2G      = 0.0f;
+        welford[wfIdx].m2B      = 0.0f;
+        welford[wfIdx].taken    = 0;
+        welford[wfIdx].done     = 0;
+    }
+
+    // Done pixels: skip the work, leave output texture write intact.
+    if (welford[wfIdx].done != 0) return;
+
+    // OIDN aux capture: only when uniforms ask for it. Done pixels
+    // are excluded by the early return above, but converged pixels
+    // already had aux captured on pass 0 so they don't miss anything.
+    if (u.writeAux != 0) {
+        float aspect = float(u.width) / float(u.height);
+        float scale = tan(PI / 180.0f * 0.5f * u.fov);
+        float ax = ((2.0f * (float(pix.x) + 0.5f) / float(u.width)) - 1.0f) * scale * aspect;
+        float ay = -((2.0f * (float(pix.y) + 0.5f) / float(u.height)) - 1.0f) * scale;
+        float3 ard = normalize(float3(ax, ay, -1.0f));
+        float3 aro = float3(u.originX, u.originY, u.originZ);
+        float3 ahit, aN;
+        int aMatIdx;
+        if (sceneIntersect(S, aro, ard, ahit, aN, aMatIdx)) {
+            if (dot(ard, aN) > 0.0f) aN = -aN;
+            albedoOut.write(float4(materials[aMatIdx].albedo.rgb, 1.0f), uint2(pix.x, pix.y));
+            normalOut.write(float4(aN, 0.0f), uint2(pix.x, pix.y));
+        } else {
+            albedoOut.write(float4(0.0f), uint2(pix.x, pix.y));
+            normalOut.write(float4(0.0f), uint2(pix.x, pix.y));
+        }
+    }
+
+    int aaN = max(1, u.aaSamples);
+
+    uint jitterSeed = uint(pix.x) * 1973u + uint(pix.y) * 9277u
+                    + uint(u.frameSeed) * 26699u
+                    + uint(u.aaIdx) * 16127u;
+    float2 jpix = float2(pix);
+    if (aaN > 1) {
+        jpix.x += rand(jitterSeed) - 0.5f;
+        jpix.y += rand(jitterSeed) - 0.5f;
+    }
+
+    uint seed = jitterSeed
+              + uint(u.sampleStart) * 7919u
+              + 0x9e3779b9u;
+
+    int sampleEnd = u.sampleStart + u.sampleCount;
+    float3 batchSum = float3(0.0f);
+
+    for (int s = u.sampleStart; s < sampleEnd; s++) {
+        float r1, r2;
+        if (u.useStratified != 0 && u.strata > 0) {
+            int sx = s % u.strata;
+            int sy = (s / u.strata) % u.strata;
+            r1 = (float(sx) + rand(seed)) / float(u.strata);
+            r2 = (float(sy) + rand(seed)) / float(u.strata);
+        } else {
+            r1 = rand(seed);
+            r2 = rand(seed);
+        }
+        if (u.useSpectral != 0) {
+            if (u.heroSamples <= 1) {
+                float kSpan = kLambdaMax - kLambdaMin;
+                float lambda = kLambdaMin + rand(seed) * kSpan;
+                float aspect = float(u.width) / float(u.height);
+                float scale  = tan(u.fov * 0.5f);
+                float2 nd = (jpix * 2.0f - float2(u.width, u.height)) /
+                            float2(u.width, u.height);
+                float3 dir = normalize(float3(nd.x * scale * aspect,
+                                              -nd.y * scale,
+                                              -1.0f));
+                float3 origin = float3(u.originX, u.originY, u.originZ);
+                float rad = tracePathSpectralSingle(S, origin, dir, lambda,
+                                                    u.depth, 0, seed);
+                batchSum += singleLambdaXYZ(lambda, rad);
+            } else {
+                float kSpan = kLambdaMax - kLambdaMin;
+                float kStride = kSpan / 4.0f;
+                float4 lambdas;
+                lambdas.x = kLambdaMin + rand(seed) * kSpan;
+                lambdas.y = lambdas.x + kStride; if (lambdas.y > kLambdaMax) lambdas.y -= kSpan;
+                lambdas.z = lambdas.x + kStride * 2.0f; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
+                lambdas.w = lambdas.x + kStride * 3.0f; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
+                float4 rad = tracePathSpectral(S, jpix, r1, r2, lambdas, seed);
+                float3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
+                           + singleLambdaXYZ(lambdas.y, rad.y)
+                           + singleLambdaXYZ(lambdas.z, rad.z)
+                           + singleLambdaXYZ(lambdas.w, rad.w);
+                batchSum += xyz * 0.25f;
+            }
+        } else {
+            batchSum += tracePath(S, jpix, r1, r2, seed);
+        }
+    }
+
+    // Fold the batch sum into the per-pixel staging buffer.
+    welford[wfIdx].stagingR += batchSum.x;
+    welford[wfIdx].stagingG += batchSum.y;
+    welford[wfIdx].stagingB += batchSum.z;
+
+    if (u.batchEndOfAa == 0) return;
+
+    // Last batch of this aaIdx: finalize the AA iteration mean and
+    // feed it into the Welford accumulator.
+    float invSamples = 1.0f / float(max(1, u.samples));
+    float3 aaMean = float3(welford[wfIdx].stagingR,
+                           welford[wfIdx].stagingG,
+                           welford[wfIdx].stagingB) * invSamples;
+
+    welford[wfIdx].stagingR = 0.0f;
+    welford[wfIdx].stagingG = 0.0f;
+    welford[wfIdx].stagingB = 0.0f;
+
+    int takenNew = welford[wfIdx].taken + 1;
+    float3 mean = float3(welford[wfIdx].meanR,
+                         welford[wfIdx].meanG,
+                         welford[wfIdx].meanB);
+    float3 m2   = float3(welford[wfIdx].m2R,
+                         welford[wfIdx].m2G,
+                         welford[wfIdx].m2B);
+
+    float3 delta  = aaMean - mean;
+    mean += delta / float(takenNew);
+    float3 delta2 = aaMean - mean;
+    m2 += delta * delta2;
+
+    welford[wfIdx].meanR = mean.x;
+    welford[wfIdx].meanG = mean.y;
+    welford[wfIdx].meanB = mean.z;
+    welford[wfIdx].m2R   = m2.x;
+    welford[wfIdx].m2G   = m2.y;
+    welford[wfIdx].m2B   = m2.z;
+    welford[wfIdx].taken = takenNew;
+
+    // Convergence check: same threshold as the strip-path kernel
+    // (0.05 on rel variance) since data points have identical
+    // granularity (mean of `samples` paths per aaIdx).
+    if (takenNew >= 4) {
+        float3 variance = m2 / float(takenNew - 1);
+        float3 rel = variance / (mean * mean + float3(0.01f));
+        if (max(max(rel.r, rel.g), rel.b) < 0.05f) {
+            welford[wfIdx].done = 1;
+        }
+    }
+
+    // Output texture holds the running mean. Done pixels' last
+    // write persists across the remaining passes since they
+    // early-return above.
+    output.write(float4(mean, 1.0f), uint2(pix.x, pix.y));
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -1372,11 +1607,32 @@ namespace
         int   aaIdx;
         int   sampleStart;
         int   sampleCount;
-        int   _pad0, _pad1, _pad2;
+        // 1 if this pass is the last batch of its aaIdx (so the
+        // adaptive multi-pass kernel finalizes the AA mean + folds
+        // it into per-pixel Welford). 0 otherwise. Non-adaptive
+        // multi-pass and legacy path_trace ignore this field.
+        int   batchEndOfAa;
+        int   _pad1, _pad2;
     };
     static_assert(sizeof(Uniforms) == 144,
                   "Uniforms must be 144 bytes (multiple of 16) so per-pass "
                   "buffer offsets are 16-aligned for MSL vectorized loads");
+
+    // Per-pixel state for the adaptive multi-pass kernel. Layout matches
+    // the MSL Welford struct above. GPU-only (private storage); host
+    // doesn't read or write the contents - sizeof here is purely so we
+    // can newBufferWithLength(numPixels * sizeof(PCRWelfordState)).
+    struct PCRWelfordState
+    {
+        float stagingR, stagingG, stagingB;
+        float meanR,    meanG,    meanB;
+        float m2R,      m2G,      m2B;
+        int   taken;
+        int   done;
+        int   _pad0;
+    };
+    static_assert(sizeof(PCRWelfordState) == 48,
+                  "PCRWelfordState must be 48 bytes to match the MSL Welford struct");
 
     // Mirrors the OpenGL backend's compressZone helper (Windows long
     // zone names like "Eastern Daylight Time" -> "EDT"). On macOS the
@@ -1446,17 +1702,24 @@ struct MetalRenderer::Impl
 {
     id<MTLDevice>               device         = nil;
     id<MTLCommandQueue>         queue          = nil;
-    // Two compute pipelines from the same MSL library:
-    //   pipeline      = legacy single-pass kernel (path_trace), used by
-    //                   the strip dispatch path. Honors useAdaptive's
-    //                   per-pixel Welford early-exit.
-    //   pipelinePass  = multi-pass accumulator kernel (path_trace_pass),
-    //                   used by the saturation-friendly dispatch path
-    //                   when useAdaptive is off. Each invocation covers
-    //                   the full image and contributes one (aaIdx,
-    //                   sample-batch) slice to the running sum.
-    id<MTLComputePipelineState> pipeline       = nil;
-    id<MTLComputePipelineState> pipelinePass   = nil;
+    // Three compute pipelines from the same MSL library:
+    //   pipeline            = legacy single-pass kernel (path_trace),
+    //                         kept as a fallback for unusual configs.
+    //   pipelinePass        = multi-pass accumulator kernel
+    //                         (path_trace_pass), used when useAdaptive
+    //                         is off. Each invocation covers the full
+    //                         image and contributes one (aaIdx,
+    //                         sample-batch) slice to the running sum.
+    //   pipelinePassAdapt   = multi-pass accumulator kernel with
+    //                         per-pixel Welford state and sparse skip
+    //                         (path_trace_pass_adaptive), used when
+    //                         useAdaptive is on. Same dispatch geometry
+    //                         as pipelinePass, full GPU saturation;
+    //                         converged pixels early-return so total
+    //                         work shrinks for low-variance regions.
+    id<MTLComputePipelineState> pipeline           = nil;
+    id<MTLComputePipelineState> pipelinePass       = nil;
+    id<MTLComputePipelineState> pipelinePassAdapt  = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -1475,7 +1738,7 @@ struct MetalRenderer::Impl
     id<MTLBuffer>               lightBuf       = nil;
     id<MTLBuffer>               lightTriBuf    = nil;
     // Uniforms aren't kept here: render() allocates a fresh per-render
-    // MTLBuffer with one Uniforms entry per strip, since per-strip data
+    // MTLBuffer with one Uniforms entry per pass, since per-pass data
     // has to be addressable independently while pipelined command buffers
     // are still in flight on the queue.
 
@@ -1555,6 +1818,22 @@ namespace
         if (!im.pipelinePass)
         {
             std::cerr << "MetalRenderer: multi-pass compute pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        id<MTLFunction> fnPassAdapt = [lib newFunctionWithName:@"path_trace_pass_adaptive"];
+        if (!fnPassAdapt)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'path_trace_pass_adaptive' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelinePassAdapt = [im.device newComputePipelineStateWithFunction:fnPassAdapt error:&err];
+        if (!im.pipelinePassAdapt)
+        {
+            std::cerr << "MetalRenderer: adaptive multi-pass compute pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
@@ -1824,29 +2103,43 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     for (const auto &L : scene.areaLights)
         if (L.kind == Scenes::AreaLightKind::Plane) planeLightCount++;
 
-    // Two dispatch paths, selected at runtime by useAdaptive:
+    // One dispatch path, two kernel variants selected at runtime by
+    // useAdaptive:
     //
-    //   useAdaptive ON  -> strip path (legacy path_trace kernel).
-    //                      Each strip is a small spatial region; the
-    //                      kernel keeps Welford state per pixel and
-    //                      can early-exit converged AA samples. Doesn't
-    //                      saturate the GPU on heavy renders (small
-    //                      strips => few threadgroups => idle cores)
-    //                      but adaptive sampling is preserved.
+    //   useAdaptive OFF -> path_trace_pass (non-adaptive accumulator).
+    //                      Each dispatch covers the FULL image at full
+    //                      GPU saturation (e.g. 1080^2 / (32*32) = 1156
+    //                      threadgroups vs. 48 M1-Ultra cores) but only
+    //                      computes one (aaIdx, sample-batch) slice per
+    //                      pass. The output texture acts as a running-
+    //                      sum accumulator; CPU divides by total
+    //                      contribution count at readback.
     //
-    //   useAdaptive OFF -> multi-pass path (path_trace_pass kernel).
-    //                      Each dispatch covers the FULL image (at full
-    //                      GPU saturation: 1080^2 / (32*32) = 1156
-    //                      threadgroups vs. 48 cores) but only computes
-    //                      one (aaIdx, sample-batch) slice per pass.
-    //                      The output texture acts as a running-sum
-    //                      accumulator; CPU divides by total contribution
-    //                      count at readback. ~2x faster than strip path
-    //                      on Picture-class workloads.
+    //   useAdaptive ON  -> path_trace_pass_adaptive (Welford in a
+    //                      per-pixel device buffer). Same dispatch
+    //                      geometry as above for the same saturation
+    //                      win. Each pass adds its batch into a per-
+    //                      pixel staging slot; at the last batch of an
+    //                      aaIdx, the staging gets divided to produce
+    //                      one AA-iteration mean which feeds Welford,
+    //                      same granularity as the legacy strip path.
+    //                      The kernel writes the running Welford mean
+    //                      (not a sum) to the output texture, and done-
+    //                      flag pixels early-return on subsequent
+    //                      passes so total work shrinks for low-
+    //                      variance regions.
     //
-    // Post-dispatch (wait + audit + readback + tone-map + PNG) is shared.
-    // Multi-pass normalization (divide accumulator by total contributions
-    // and convert XYZ -> sRGB if spectral) happens after readback below.
+    // The strip-path kernel (path_trace, pipeline `pipeline`) stays in
+    // the MSL library as a fallback / reference but is no longer
+    // dispatched: adaptive's multi-pass equivalent now exists and is
+    // ~6x faster on Picture-class workloads on M1 Ultra.
+    //
+    // Post-dispatch (wait + audit + readback + tone-map + PNG) is
+    // shared. Non-adaptive normalization (divide accumulator by total
+    // contributions) and the XYZ -> sRGB conversion for spectral mode
+    // happen after readback below. Adaptive output is already a mean
+    // so the divide is skipped (the kernel writes the running mean
+    // directly).
 
     // Common uniform fields (everything except per-pass / per-strip
     // bounds). Both paths fill in their own y / pass / sample uniforms.
@@ -1893,241 +2186,151 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
 
     NSMutableArray<id<MTLCommandBuffer>> *pending =
         [[NSMutableArray alloc] init];
-    bool multiPassUsed = false;
     int totalContributions = 0;
 
+    // ---- Multi-pass dispatch (adaptive or non-adaptive) ----------
+    //
+    // Each command buffer dispatches the FULL image with one of the
+    // path_trace_pass{,_adaptive} kernels. Total work per pixel is
+    // aaSamples * samples * shadow * depth ops; we split that across
+    // enough passes to keep each dispatch under Apple's compute
+    // watchdog. Watchdog-safe budget is on TOTAL ops per dispatch (not
+    // per pixel): full-image kernel scales total ops with pixel count
+    // and per-pixel work. Calibrated against M1 Ultra's saturated
+    // multi-pass throughput (~3.15 G ops/sec on Picture-class kernels).
+    // 9B ops per dispatch ~= 3 sec, well under the watchdog.
+    //
+    //   1080^2 Picture (1.17M pixels x 192 ops/pixel/sample):
+    //     samplesPerPass = 9B / (1.17M * 192) = 40, ~50 passes/AA
+    //   4K Picture (16.7M pixels):
+    //     samplesPerPass = 9B / (16.7M * 192) = 2, ~1024 passes/AA
+    //   8K Picture (67M pixels):
+    //     samplesPerPass = 9B / (67M * 192) = 0.7 -> floor to 1.
+    //     This dispatches the full 8K image with one sample per
+    //     pixel, ~13B ops/dispatch ~= 4 sec. Borderline vs. the
+    //     watchdog but the cmd-buffer error logging will surface
+    //     anything that fails.
+    //   16K Picture: samplesPerPass = 1 (clamped), but per-dispatch
+    //     work is ~52B ops ~= 16 sec, very likely over watchdog.
+    //     Spatial chopping (multi-pass + multi-strip) would handle
+    //     this cleanly; left for a follow-up.
+
+    long long opsPerPixelPerSample = (long long)_shadowSamples * _maxDepth;
+    if (useSpectral) opsPerPixelPerSample =
+        (long long)((double)opsPerPixelPerSample * 2.5);
+
+    constexpr long long kTargetOpsPerDispatch = 9'000'000'000LL;
+    long long pixelCount = std::max(1LL, (long long)_width * _height);
+    long long opsPerPixelBudget = std::max(
+        1LL, kTargetOpsPerDispatch / pixelCount);
+    int samplesPerPass = std::max(1,
+        (int)(opsPerPixelBudget / std::max(1LL, opsPerPixelPerSample)));
+    samplesPerPass = std::min(samplesPerPass, _samples);
+
+    int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
+    int aaN = std::max(1, aaSamples);
+    int totalPasses = aaN * passesPerAa;
+    totalContributions = aaN * _samples;
+
+    id<MTLComputePipelineState> activePipeline =
+        useAdaptive ? _impl->pipelinePassAdapt : _impl->pipelinePass;
+
+    int tgX = 32, tgY = 32;
+    if (activePipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(tgX * tgY))
+    {
+        tgX = 16;
+        tgY = 16;
+    }
+    MTLSize threadsPerGroup = MTLSizeMake(tgX, tgY, 1);
+
+    // Per-pixel Welford buffer for adaptive multi-pass. Initialized
+    // by the kernel on passIdx==0 (no separate clear kernel needed).
+    // GPU-only private storage so writes stay on-chip.
+    id<MTLBuffer> welfordBuf = nil;
     if (useAdaptive)
     {
-        // ---- Strip path ------------------------------------------
-        //
-        // Adaptive sampling keeps Welford state across AA samples
-        // inside a single kernel invocation, which is incompatible
-        // with the multi-pass accumulator pattern (per-pass kernel
-        // doesn't see the running variance from other passes). Fall
-        // back to the strip dispatch: small spatial tiles, each one
-        // running the legacy path_trace kernel with the full AA +
-        // adaptive loop intact. Doesn't saturate the GPU on heavy
-        // workloads but produces correct adaptive output.
-        //
-        // Strip-height heuristic: ~3 sec per strip on the calibrated
-        // M1 Ultra throughput (~1.1B ops/sec for this kernel),
-        // floored at 32 strips for progress UX, ceilinged at 1 row
-        // per strip for the pathological heavy case.
-        int aaMult = std::max(1, aaSamples);
-        long long workPerPixel =
-            (long long)_samples * _maxDepth * _shadowSamples * aaMult;
-        if (useAdaptive) workPerPixel = (long long)((double)workPerPixel * 1.15);
-        if (useSpectral) workPerPixel = (long long)((double)workPerPixel * 2.5);
-
-        constexpr long long kTargetWorkPerStrip = 3'300'000'000LL;
-        long long pixelsPerStrip = std::max(
-            (long long)_width,
-            kTargetWorkPerStrip / std::max(1LL, workPerPixel));
-        int stripHeight = std::clamp(
-            (int)(pixelsPerStrip / std::max(1, _width)),
-            1, _height);
-
-        constexpr int kMinStrips = 32;
-        int provisionalNumStrips = (_height + stripHeight - 1) / stripHeight;
-        if (provisionalNumStrips < kMinStrips && _height >= kMinStrips)
+        size_t welfordBytes =
+            (size_t)_width * (size_t)_height * sizeof(PCRWelfordState);
+        welfordBuf = [_impl->device newBufferWithLength:welfordBytes
+                                                options:MTLResourceStorageModePrivate];
+        if (!welfordBuf)
         {
-            stripHeight = std::max(1, _height / kMinStrips);
-        }
-        int numStrips = (_height + stripHeight - 1) / stripHeight;
-
-        int tgX = 32, tgY = 32;
-        if (_impl->pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(tgX * tgY))
-        {
-            tgX = 16;
-            tgY = 16;
-        }
-        MTLSize threadsPerGroup = MTLSizeMake(tgX, tgY, 1);
-
-        size_t uniformsStride = sizeof(Uniforms);
-        id<MTLBuffer> uniformsBuf =
-            [_impl->device newBufferWithLength:uniformsStride * (size_t)numStrips
-                                       options:MTLResourceStorageModeShared];
-        Uniforms *uniformsPtr = (Uniforms *)[uniformsBuf contents];
-        for (int i = 0; i < numStrips; i++)
-        {
-            int yStart = i * stripHeight;
-            int yEnd = std::min(yStart + stripHeight, _height);
-            Uniforms u = uBase;
-            u.yOffset = yStart;
-            u.yEnd    = yEnd;
-            uniformsPtr[i] = u;
-        }
-
-        for (int i = 0; i < numStrips; i++)
-        {
-            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-                break;
-
-            int yStart = i * stripHeight;
-            int yEnd = std::min(yStart + stripHeight, _height);
-            int stripH = yEnd - yStart;
-
-            id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:_impl->pipeline];
-            [enc setBuffer:uniformsBuf      offset:(NSUInteger)(i * uniformsStride) atIndex:0];
-            [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
-            [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
-            [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
-            [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
-            [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
-            [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
-            [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
-            [enc setTexture:_impl->outputTex atIndex:0];
-            [enc setTexture:_impl->albedoTex atIndex:1];
-            [enc setTexture:_impl->normalTex atIndex:2];
-
-            MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + tgX - 1) / tgX),
-                                               (NSUInteger)((stripH + tgY - 1) / tgY),
-                                               1);
-            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
-            [enc endEncoding];
-
-            std::atomic<int> *donePtr = &doneCmdBuffers;
-            int totalStrips = numStrips;
-            [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
-                int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
-                if (progressPtr)
-                {
-                    int approxRows = (int)((double)done / totalStrips * height);
-                    progressPtr->store(approxRows, std::memory_order_relaxed);
-                }
-            }];
-
-            [cmdbuf commit];
-            [pending addObject:cmdbuf];
+            std::cerr << "MetalRenderer: failed to allocate "
+                      << welfordBytes
+                      << "-byte Welford buffer for adaptive multi-pass."
+                      << std::endl;
+            return;
         }
     }
-    else
+
+    size_t uniformsStride = sizeof(Uniforms);
+    id<MTLBuffer> uniformsBuf =
+        [_impl->device newBufferWithLength:uniformsStride * (size_t)totalPasses
+                                   options:MTLResourceStorageModeShared];
+    Uniforms *uniformsPtr = (Uniforms *)[uniformsBuf contents];
+    for (int p = 0; p < totalPasses; p++)
     {
-        // ---- Multi-pass path -------------------------------------
-        //
-        // Each command buffer dispatches the FULL image with the
-        // path_trace_pass kernel, which accumulates one (aaIdx,
-        // sample-batch) slice into the output texture as a running
-        // sum. Total work per pixel = aaSamples * samples * shadow *
-        // depth ops; we split that across enough passes to keep each
-        // dispatch under the watchdog budget.
-        //
-        // Watchdog-safe budget is on TOTAL ops per dispatch (not per
-        // pixel): each dispatch is a full-image kernel, so total ops
-        // scale with both pixel count and per-pixel work. Calibrated
-        // against the saturated multi-pass throughput observed on
-        // M1 Ultra (~3.15 G ops/sec on Picture-class kernels). 9B ops
-        // per dispatch ~= 3 sec, well under Apple's compute watchdog.
-        //
-        //   1080^2 Picture (1.17M pixels x 192 ops/pixel/sample):
-        //     samplesPerPass = 9B / (1.17M * 192) = 40, ~50 passes/AA
-        //   4K Picture (16.7M pixels):
-        //     samplesPerPass = 9B / (16.7M * 192) = 2, ~1024 passes/AA
-        //   8K Picture (67M pixels):
-        //     samplesPerPass = 9B / (67M * 192) = 0.7 -> floor to 1.
-        //     This dispatches the full 8K image with one sample per
-        //     pixel, ~13B ops/dispatch ~= 4 sec. Borderline vs. the
-        //     watchdog but the cmd-buffer error logging will surface
-        //     anything that fails.
-        //   16K Picture: samplesPerPass = 1 (clamped), but per-dispatch
-        //     work is ~52B ops ~= 16 sec, very likely over watchdog.
-        //     Spatial chopping (multi-pass + multi-strip) would handle
-        //     this cleanly; left for a follow-up.
-        multiPassUsed = true;
+        int aaIdx       = p / passesPerAa;
+        int batchIdx    = p % passesPerAa;
+        int sampleStart = batchIdx * samplesPerPass;
+        int sampleEnd   = std::min(sampleStart + samplesPerPass, _samples);
 
-        long long opsPerPixelPerSample = (long long)_shadowSamples * _maxDepth;
-        if (useSpectral) opsPerPixelPerSample =
-            (long long)((double)opsPerPixelPerSample * 2.5);
+        Uniforms u = uBase;
+        u.passIdx      = p;
+        u.aaIdx        = aaIdx;
+        u.sampleStart  = sampleStart;
+        u.sampleCount  = sampleEnd - sampleStart;
+        u.batchEndOfAa = (batchIdx == passesPerAa - 1) ? 1 : 0;
+        u.yOffset      = 0;
+        u.yEnd         = _height;
+        // OIDN aux capture happens once, on the first pass only;
+        // every other pass writeAux=0 so it doesn't repeatedly
+        // overwrite the same aux pixels with identical data.
+        u.writeAux     = (useOIDN && p == 0) ? 1 : 0;
+        uniformsPtr[p] = u;
+    }
 
-        constexpr long long kTargetOpsPerDispatch = 9'000'000'000LL;
-        long long pixelCount = std::max(1LL, (long long)_width * _height);
-        long long opsPerPixelBudget = std::max(
-            1LL, kTargetOpsPerDispatch / pixelCount);
-        int samplesPerPass = std::max(1,
-            (int)(opsPerPixelBudget / std::max(1LL, opsPerPixelPerSample)));
-        samplesPerPass = std::min(samplesPerPass, _samples);
+    MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + tgX - 1) / tgX),
+                                       (NSUInteger)((_height + tgY - 1) / tgY),
+                                       1);
+    for (int p = 0; p < totalPasses; p++)
+    {
+        if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+            break;
 
-        int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
-        int aaN = std::max(1, aaSamples);
-        int totalPasses = aaN * passesPerAa;
-        totalContributions = aaN * _samples;
+        id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:activePipeline];
+        [enc setBuffer:uniformsBuf      offset:(NSUInteger)(p * uniformsStride) atIndex:0];
+        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
+        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
+        [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
+        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
+        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
+        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
+        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
+        if (useAdaptive)
+            [enc setBuffer:welfordBuf    offset:0 atIndex:8];
+        [enc setTexture:_impl->outputTex atIndex:0];
+        [enc setTexture:_impl->albedoTex atIndex:1];
+        [enc setTexture:_impl->normalTex atIndex:2];
 
-        int tgX = 32, tgY = 32;
-        if (_impl->pipelinePass.maxTotalThreadsPerThreadgroup < (NSUInteger)(tgX * tgY))
-        {
-            tgX = 16;
-            tgY = 16;
-        }
-        MTLSize threadsPerGroup = MTLSizeMake(tgX, tgY, 1);
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+        [enc endEncoding];
 
-        size_t uniformsStride = sizeof(Uniforms);
-        id<MTLBuffer> uniformsBuf =
-            [_impl->device newBufferWithLength:uniformsStride * (size_t)totalPasses
-                                       options:MTLResourceStorageModeShared];
-        Uniforms *uniformsPtr = (Uniforms *)[uniformsBuf contents];
-        for (int p = 0; p < totalPasses; p++)
-        {
-            int aaIdx       = p / passesPerAa;
-            int batchIdx    = p % passesPerAa;
-            int sampleStart = batchIdx * samplesPerPass;
-            int sampleEnd   = std::min(sampleStart + samplesPerPass, _samples);
+        std::atomic<int> *donePtr = &doneCmdBuffers;
+        int totalP = totalPasses;
+        [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+            int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
+            if (progressPtr)
+            {
+                int approxRows = (int)((double)done / totalP * height);
+                progressPtr->store(approxRows, std::memory_order_relaxed);
+            }
+        }];
 
-            Uniforms u = uBase;
-            u.passIdx     = p;
-            u.aaIdx       = aaIdx;
-            u.sampleStart = sampleStart;
-            u.sampleCount = sampleEnd - sampleStart;
-            u.yOffset     = 0;
-            u.yEnd        = _height;
-            // OIDN aux capture happens once, on the first pass only;
-            // every other pass writeAux=0 so it doesn't repeatedly
-            // overwrite the same aux pixels with identical data.
-            u.writeAux    = (useOIDN && p == 0) ? 1 : 0;
-            uniformsPtr[p] = u;
-        }
-
-        MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + tgX - 1) / tgX),
-                                           (NSUInteger)((_height + tgY - 1) / tgY),
-                                           1);
-        for (int p = 0; p < totalPasses; p++)
-        {
-            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-                break;
-
-            id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:_impl->pipelinePass];
-            [enc setBuffer:uniformsBuf      offset:(NSUInteger)(p * uniformsStride) atIndex:0];
-            [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
-            [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
-            [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
-            [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
-            [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
-            [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
-            [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
-            [enc setTexture:_impl->outputTex atIndex:0];
-            [enc setTexture:_impl->albedoTex atIndex:1];
-            [enc setTexture:_impl->normalTex atIndex:2];
-
-            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
-            [enc endEncoding];
-
-            std::atomic<int> *donePtr = &doneCmdBuffers;
-            int totalP = totalPasses;
-            [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
-                int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
-                if (progressPtr)
-                {
-                    int approxRows = (int)((double)done / totalP * height);
-                    progressPtr->store(approxRows, std::memory_order_relaxed);
-                }
-            }];
-
-            [cmdbuf commit];
-            [pending addObject:cmdbuf];
-        }
+        [cmdbuf commit];
+        [pending addObject:cmdbuf];
     }
 
     // One wait, at the end. All command buffers run pipelined on the
@@ -2140,10 +2343,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // looser-than-Windows-TDR equivalent) shows up here as
     // status=MTLCommandBufferStatusError; the kernel ran out of
     // wallclock and was killed before its writes landed. Visible
-    // in the output as horizontal black bands matching the killed
-    // strips. Surface those failures explicitly rather than letting
-    // them masquerade as "the kernel ran fine, the image just looks
-    // weird."
+    // in the output as black regions matching the killed dispatches.
+    // Surface those failures explicitly rather than letting them
+    // masquerade as "the kernel ran fine, the image just looks weird."
     int erroredCmdBuffers = 0;
     for (id<MTLCommandBuffer> cb in pending)
     {
@@ -2160,9 +2362,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
     if (erroredCmdBuffers > 0)
     {
-        const char *kind = multiPassUsed ? "passes" : "strips";
         std::cerr << "Metal render: " << erroredCmdBuffers << " of "
-                  << [pending count] << " " << kind << " failed (likely "
+                  << [pending count] << " passes failed (likely "
                   << "GPU watchdog timeout). Reduce samples / depth / "
                   << "shadow / AA, or render at a smaller resolution."
                   << std::endl;
@@ -2193,17 +2394,22 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         normalBuf = readbackToVec3(_impl->normalTex);
     }
 
-    // Multi-pass normalization. The kernel accumulates a sum of per-
-    // sample contributions in the output texture; CPU divides by the
-    // total contribution count (aaSamples * samples) to get the mean.
-    // Spectral mode also moves XYZ -> linear sRGB to the CPU here so
-    // the kernel can stay in the more numerically clean XYZ space
-    // across passes (the conversion is linear so this is mathematically
-    // identical to per-pass conversion).
-    if (multiPassUsed && totalContributions > 0)
+    // Multi-pass normalization. For non-adaptive, the kernel accumulates
+    // a sum of per-sample contributions in the output texture and the
+    // CPU divides by total contribution count (aaSamples * samples) to
+    // get the mean. For adaptive multi-pass, the kernel writes the
+    // running Welford mean directly to the texture so the divide is
+    // skipped. Either way, spectral mode moves XYZ -> linear sRGB to
+    // the CPU here so the kernel can stay in the more numerically clean
+    // XYZ space across passes (the conversion is linear so this is
+    // mathematically identical to per-pass conversion).
+    if (totalContributions > 0)
     {
-        float invTotal = 1.0f / (float)totalContributions;
-        for (auto &c : hdr) c *= invTotal;
+        if (!useAdaptive)
+        {
+            float invTotal = 1.0f / (float)totalContributions;
+            for (auto &c : hdr) c *= invTotal;
+        }
         if (useSpectral)
         {
             for (auto &c : hdr)
