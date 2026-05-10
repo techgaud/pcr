@@ -1535,12 +1535,21 @@ int main(int, char **)
                               "the binary to be built with PCR_USE_OIDN=ON.");
 
         ImGui::SeparatorText("Output");
-        pcrSliderInt("Width", &settings.width, 64, 2160, 8, 64);
+        // Cap at 16384 (2^14) - the Apple Silicon MTLTexture max
+        // dimension on every M-series generation, and at or above the
+        // OpenGL GL_MAX_TEXTURE_SIZE most desktop drivers report. Going
+        // any higher would fail texture allocation rather than just
+        // render slowly. RGBA32Float at 16384^2 is ~4.3 GB per texture
+        // x 3 (output + OIDN aux) = ~13 GB peak GPU memory, which is
+        // fine on M1/M2/M3 Ultra (64+ GB unified) but worth knowing
+        // about before pushing the slider all the way right on a
+        // smaller box.
+        pcrSliderInt("Width", &settings.width, 64, 16384, 8, 64);
         ImGui::Checkbox("Square (height matches width)", &settings.square);
         if (settings.square)
             settings.height = settings.width;
         ImGui::BeginDisabled(settings.square);
-        pcrSliderInt("Height", &settings.height, 64, 2160, 8, 64);
+        pcrSliderInt("Height", &settings.height, 64, 16384, 8, 64);
         ImGui::EndDisabled();
 
         // Output dir input + Browse button. ImGui needs a fixed-size buffer.
