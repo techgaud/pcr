@@ -1018,9 +1018,23 @@ int main(int, char **)
     if (!glfwInit())
         return 1;
 
+    // macOS NSGL only exposes legacy 2.1 or Core 3.2+; asking for 3.0
+    // returns "macOS does not support OpenGL 3.0 or 3.1." Use the
+    // standard Apple GL3 incantation (3.2 Core + forward-compat) and
+    // pair it with #version 150 GLSL for ImGui's renderer; everywhere
+    // else, the looser 3.0 hint still produces whatever the driver
+    // hands back (typically 4.x compat) which the existing Win/Linux
+    // ImGui shaders already target.
     const char *glsl_version = "#version 130";
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+#if defined(__APPLE__)
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    glsl_version = "#version 150";
+#else
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#endif
 
     GLFWwindow *window = glfwCreateWindow(1100, 800, PCR_BINARY_NAME, nullptr, nullptr);
     if (!window)
