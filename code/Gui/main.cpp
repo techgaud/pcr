@@ -89,6 +89,52 @@ using PCRRenderer = Renderer;
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+// --- Job queue (ephemeral, in-session only) -----------------------------
+
+// Per-render slice of Settings, captured at "Queue" click time. Global UI
+// state (output dir, theme, presets list, etc.) is NOT part of a JobConfig
+// since it doesn't make sense to vary per job in a batch.
+struct JobConfig
+{
+    std::string sceneName;
+    int  depth = 4;
+    int  samples = 16;
+    int  shadowSamples = 4;
+    int  width = 720;
+    int  height = 720;
+    bool square = true;
+    bool useDenoise = false;
+    bool useMIS = false;
+    bool useRussian = false;
+    bool useStratified = false;
+    bool useACES = false;
+    bool useSpectral = false;
+    bool useAA = false;
+    int  aaSamples = 4;
+    bool useAdaptive = false;
+    bool useOIDN = false;
+    int  heroSamples = 4;
+    std::string lutChoice = "off";
+    int  threadgroupX = 32;
+    int  threadgroupY = 32;
+};
+
+struct JobResult
+{
+    enum Status { Pending, Running, Done, Failed };
+    JobConfig config;
+    Status status = Pending;
+    std::string outputPath;
+    std::string errorMessage;
+};
+
+enum BatchPhase
+{
+    BP_INACTIVE,     // no batch running
+    BP_RUNNING_JOB,  // batch is active, current job's worker is running
+    BP_ADVANCING,    // job just finished, need to record + start next or wrap up
+};
+
 // --- Settings persistence -------------------------------------------------
 
 struct Preset
@@ -237,6 +283,85 @@ struct Settings
     // or doesn't carry presets yet.
     std::vector<Preset> presets = defaultPresets();
 };
+
+// Snapshot the render-relevant subset of Settings into a JobConfig.
+static JobConfig makeJobConfig(const Settings &s)
+{
+    JobConfig j;
+    j.sceneName     = s.sceneName;
+    j.depth         = s.depth;
+    j.samples       = s.samples;
+    j.shadowSamples = s.shadowSamples;
+    j.width         = s.width;
+    j.height        = s.height;
+    j.square        = s.square;
+    j.useDenoise    = s.useDenoise;
+    j.useMIS        = s.useMIS;
+    j.useRussian    = s.useRussian;
+    j.useStratified = s.useStratified;
+    j.useACES       = s.useACES;
+    j.useSpectral   = s.useSpectral;
+    j.useAA         = s.useAA;
+    j.aaSamples     = s.aaSamples;
+    j.useAdaptive   = s.useAdaptive;
+    j.useOIDN       = s.useOIDN;
+    j.heroSamples   = s.heroSamples;
+    j.lutChoice     = s.lutChoice;
+    j.threadgroupX  = s.threadgroupX;
+    j.threadgroupY  = s.threadgroupY;
+    return j;
+}
+
+// Apply a JobConfig over an existing Settings (preserves global UI state
+// like outputDir, theme, presets list, timezone).
+static void applyJobConfig(const JobConfig &j, Settings &s)
+{
+    s.sceneName     = j.sceneName;
+    s.depth         = j.depth;
+    s.samples       = j.samples;
+    s.shadowSamples = j.shadowSamples;
+    s.width         = j.width;
+    s.height        = j.height;
+    s.square        = j.square;
+    s.useDenoise    = j.useDenoise;
+    s.useMIS        = j.useMIS;
+    s.useRussian    = j.useRussian;
+    s.useStratified = j.useStratified;
+    s.useACES       = j.useACES;
+    s.useSpectral   = j.useSpectral;
+    s.useAA         = j.useAA;
+    s.aaSamples     = j.aaSamples;
+    s.useAdaptive   = j.useAdaptive;
+    s.useOIDN       = j.useOIDN;
+    s.heroSamples   = j.heroSamples;
+    s.lutChoice     = j.lutChoice;
+    s.threadgroupX  = j.threadgroupX;
+    s.threadgroupY  = j.threadgroupY;
+}
+
+// Short single-line summary for the queue UI row. "<scene>  WxH  d?/s?/S?
+// [tags] tg?x?" - tags include only flags that are ON to keep it scannable.
+static std::string summarizeJob(const JobConfig &j)
+{
+    char buf[256];
+    std::string tags;
+    if (j.useSpectral)   tags += " spec";
+    if (j.useAA)         { char t[16]; std::snprintf(t, sizeof(t), " aa%d", j.aaSamples); tags += t; }
+    if (j.useAdaptive)   tags += " adapt";
+    if (j.useOIDN)       tags += " oidn";
+    if (j.useACES)       tags += " aces";
+    if (j.useDenoise && !j.useOIDN) tags += " denoise";
+    if (j.useMIS)        tags += " mis";
+    if (j.useRussian)    tags += " rr";
+    if (j.useStratified) tags += " strat";
+    std::snprintf(buf, sizeof(buf),
+                  "%s  %dx%d  d%d/s%d/S%d%s  tg%dx%d",
+                  j.sceneName.c_str(), j.width, j.height,
+                  j.depth, j.samples, j.shadowSamples,
+                  tags.c_str(),
+                  j.threadgroupX, j.threadgroupY);
+    return std::string(buf);
+}
 
 static const char *kTimezones[] = {"local", "EST", "CST", "MST", "PST", "UTC"};
 
@@ -1182,6 +1307,17 @@ int main(int, char **)
     std::string previewLoadedFrom;
     std::vector<std::pair<std::string, std::string>> previewMetadata;
 
+    // Job batching state. Queue is ephemeral (in-memory, in-session only).
+    // Adding to queue snapshots current settings into a JobConfig; "Run
+    // queue" walks the list sequentially, advancing in the per-frame
+    // driver below. Cancel during a batch halts the whole queue; failed
+    // jobs are logged and the batch continues with the next pending one
+    // so a single typo doesn't lose the other queued renders.
+    std::vector<JobResult> jobQueue;
+    BatchPhase batchPhase = BP_INACTIVE;
+    int batchCurrentIdx = -1;
+    bool batchCancelled = false;
+
     struct HistoryEntry
     {
         Settings settings;
@@ -1754,10 +1890,150 @@ int main(int, char **)
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
+        ImGui::BeginDisabled(!sceneLoader);
+        if (ImGui::Button("Queue", ImVec2(80, 0)))
+        {
+            JobResult r;
+            r.config = makeJobConfig(settings);
+            r.status = JobResult::Pending;
+            jobQueue.push_back(std::move(r));
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Snapshot the current settings and add as a "
+                              "pending job to the queue. Use 'Run queue' "
+                              "below to execute all pending jobs sequentially.");
+        ImGui::EndDisabled();
+        ImGui::SameLine();
         ImGui::BeginDisabled(!isRunning);
         if (ImGui::Button("Cancel", ImVec2(120, 0)))
+        {
             job.cancelRequested = true;
+            // If a batch is running, halt it after the current job stops
+            // rather than auto-advancing to the next queued one.
+            if (batchPhase != BP_INACTIVE)
+                batchCancelled = true;
+        }
         ImGui::EndDisabled();
+
+        // Queue panel. Shown whenever the queue has entries; lets the
+        // user review queued configurations before kicking off, see
+        // status during/after a batch, and remove individual entries.
+        // Entries past their first run (Done/Failed) stay until the user
+        // removes or clears them so post-batch comparison is possible.
+        if (!jobQueue.empty())
+        {
+            int pendingCount = 0;
+            for (const auto &r : jobQueue)
+                if (r.status == JobResult::Pending) pendingCount++;
+
+            char qHeader[64];
+            std::snprintf(qHeader, sizeof(qHeader),
+                          "Queue (%d total, %d pending)",
+                          (int)jobQueue.size(), pendingCount);
+            ImGui::SeparatorText(qHeader);
+
+            if (ImGui::BeginTable("queue", 3,
+                                  ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_RowBg |
+                                  ImGuiTableFlags_BordersInnerH))
+            {
+                ImGui::TableSetupColumn("Status",
+                                        ImGuiTableColumnFlags_WidthFixed, 80.f);
+                ImGui::TableSetupColumn("Config",
+                                        ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("",
+                                        ImGuiTableColumnFlags_WidthFixed, 30.f);
+
+                int removeIdx = -1;
+                for (size_t i = 0; i < jobQueue.size(); i++)
+                {
+                    const auto &r = jobQueue[i];
+                    ImGui::PushID((int)i);
+                    ImGui::TableNextRow();
+
+                    ImGui::TableNextColumn();
+                    switch (r.status)
+                    {
+                    case JobResult::Pending:
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1), "pending");
+                        break;
+                    case JobResult::Running:
+                        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1), "running");
+                        break;
+                    case JobResult::Done:
+                        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1), "done");
+                        break;
+                    case JobResult::Failed:
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1), "failed");
+                        break;
+                    }
+
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(summarizeJob(r.config).c_str());
+                    if (r.status == JobResult::Done && !r.outputPath.empty())
+                        ImGui::TextDisabled("  -> %s",
+                            fs::path(r.outputPath).filename().string().c_str());
+                    else if (r.status == JobResult::Failed && !r.errorMessage.empty())
+                        ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1),
+                                           "  %s", r.errorMessage.c_str());
+
+                    ImGui::TableNextColumn();
+                    // Disallow removing the currently-running batch job;
+                    // every other row is fair game.
+                    bool isRunningThisRow = (batchPhase == BP_RUNNING_JOB &&
+                                             (int)i == batchCurrentIdx);
+                    ImGui::BeginDisabled(isRunningThisRow);
+                    if (ImGui::SmallButton("X"))
+                        removeIdx = (int)i;
+                    ImGui::EndDisabled();
+
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+
+                if (removeIdx >= 0)
+                {
+                    // If we're deleting an entry before the currently-
+                    // running job, batchCurrentIdx shifts down by one to
+                    // stay pointing at the right slot.
+                    if (batchPhase == BP_RUNNING_JOB &&
+                        removeIdx < batchCurrentIdx)
+                        batchCurrentIdx--;
+                    jobQueue.erase(jobQueue.begin() + removeIdx);
+                }
+            }
+
+            // Buttons: Run queue (only if pending and no batch active),
+            // Clear queue (always, blocks removing the currently-running
+            // entry which is gated above per-row).
+            bool canRun = (batchPhase == BP_INACTIVE) && (pendingCount > 0)
+                          && !isRunning;
+            ImGui::BeginDisabled(!canRun);
+            char runLabel[64];
+            std::snprintf(runLabel, sizeof(runLabel),
+                          "Run queue (%d)", pendingCount);
+            if (ImGui::Button(runLabel, ImVec2(160, 0)))
+            {
+                // Kick off the state machine; the per-frame driver above
+                // picks up BP_ADVANCING on the next iteration and starts
+                // the first pending job.
+                batchCancelled = false;
+                batchCurrentIdx = -1;
+                batchPhase = BP_ADVANCING;
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(batchPhase != BP_INACTIVE);
+            if (ImGui::Button("Clear queue", ImVec2(120, 0)))
+                jobQueue.clear();
+            ImGui::EndDisabled();
+            if (batchPhase != BP_INACTIVE)
+            {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1),
+                                   "(running batch...)");
+            }
+        }
 
         // Progress block.
         if (isRunning || job.totalRows.load() > 0)
@@ -1793,6 +2069,101 @@ int main(int, char **)
             history.push_front(std::move(entry));
             while (history.size() > kHistoryMax)
                 history.pop_back();
+        }
+
+        // Batch driver. Runs AFTER the completion handler so the just-
+        // finished job's result has already been loaded into the preview
+        // and pushed onto the history deque. Then we record the outcome on
+        // the queue entry and start the next pending job (or wrap up the
+        // batch). Scene-loader lookup is by name from the current scene
+        // registry; if a job's scene was removed between Queue and Run,
+        // we mark it Failed and advance to the next one rather than
+        // wedge the batch.
+        if (batchPhase == BP_RUNNING_JOB && !isRunning)
+        {
+            // The current batch job's worker just exited. Record outcome
+            // on jobQueue[batchCurrentIdx] using the same flags the GUI
+            // already exposes (job.errorMessage / job.finishedPath).
+            if (batchCurrentIdx >= 0 && batchCurrentIdx < (int)jobQueue.size())
+            {
+                auto &slot = jobQueue[batchCurrentIdx];
+                if (!job.errorMessage.empty())
+                {
+                    slot.status = JobResult::Failed;
+                    slot.errorMessage = job.errorMessage;
+                }
+                else if (!job.finishedPath.empty())
+                {
+                    slot.status = JobResult::Done;
+                    slot.outputPath = job.finishedPath;
+                }
+                else
+                {
+                    // Cancelled mid-render: no file, no error. Reset
+                    // the slot back to Pending so a subsequent Run-queue
+                    // re-attempts it rather than treating the user-
+                    // initiated halt as a permanent failure.
+                    slot.status = JobResult::Pending;
+                }
+            }
+            batchPhase = BP_ADVANCING;
+        }
+
+        while (batchPhase == BP_ADVANCING)
+        {
+            if (batchCancelled)
+            {
+                batchPhase = BP_INACTIVE;
+                batchCurrentIdx = -1;
+                batchCancelled = false;
+                break;
+            }
+            int next = -1;
+            for (int i = 0; i < (int)jobQueue.size(); i++)
+            {
+                if (jobQueue[i].status == JobResult::Pending) { next = i; break; }
+            }
+            if (next == -1)
+            {
+                batchPhase = BP_INACTIVE;
+                batchCurrentIdx = -1;
+                break;
+            }
+            // Look up the queued job's scene by name. The registry can
+            // change between Queue-click and Run-queue (user edited a
+            // JSON, scenes refreshed), so we resolve at dispatch time.
+            std::function<Scenes::SceneData()> nextLoader;
+            for (const auto &s : sceneRegistry)
+            {
+                if (s.name == jobQueue[next].config.sceneName)
+                {
+                    nextLoader = s.load;
+                    break;
+                }
+            }
+            if (!nextLoader)
+            {
+                jobQueue[next].status = JobResult::Failed;
+                jobQueue[next].errorMessage = "scene not found: " +
+                    jobQueue[next].config.sceneName;
+                batchCurrentIdx = next;
+                continue;  // try the next pending job
+            }
+            // Kick off this job. Construct a per-job Settings copy by
+            // overlaying the JobConfig on the current settings so global
+            // state (outputDir, timezone, theme) carries through.
+            Settings perJob = settings;
+            applyJobConfig(jobQueue[next].config, perJob);
+            jobQueue[next].status = JobResult::Running;
+            batchCurrentIdx = next;
+            if (job.worker.joinable())
+                job.worker.join();
+            freeImage(previewImg);
+            previewLoadedFrom.clear();
+            job.worker = std::thread(runRender, &job, &live, perJob,
+                                     nextLoader, gpuShared);
+            batchPhase = BP_RUNNING_JOB;
+            break;
         }
 
         // Live preview while rendering: show the in-progress framebuffer.
