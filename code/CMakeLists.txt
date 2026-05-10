@@ -123,7 +123,10 @@ endif()
 # DLL then dlopens its device plugins out of the same dir, also via
 # the SetDllDirectory path.
 #
-# No-op when PCR_USE_OIDN=OFF.
+# No-op when PCR_USE_OIDN=OFF. The actual lib/ deployment happens in
+# the consolidated pcr-deploy-data custom target below; doing it as a
+# POST_BUILD per binary would race because all three binaries share
+# the same TARGET_FILE_DIR/lib destination.
 function(pcr_link_oidn target)
     if(NOT PCR_USE_OIDN)
         return()
@@ -137,29 +140,11 @@ function(pcr_link_oidn target)
             )
             target_link_libraries(${target} PRIVATE delayimp)
         endif()
-        foreach(_dll ${OIDN_RUNTIME_DLLS})
-            get_filename_component(_dll_name ${_dll} NAME)
-            add_custom_command(TARGET ${target} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory
-                        $<TARGET_FILE_DIR:${target}>/lib
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        ${_dll} $<TARGET_FILE_DIR:${target}>/lib/${_dll_name}
-                VERBATIM
-            )
-        endforeach()
     else()
         set_property(TARGET ${target} APPEND PROPERTY
                      BUILD_RPATH "$ORIGIN/lib")
         set_property(TARGET ${target} APPEND PROPERTY
                      INSTALL_RPATH "$ORIGIN/lib")
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                    $<TARGET_FILE_DIR:${target}>/lib
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                    ${oidn_SOURCE_DIR}/lib
-                    $<TARGET_FILE_DIR:${target}>/lib
-            VERBATIM
-        )
     endif()
 endfunction()
 
@@ -185,16 +170,17 @@ set(PCR_RENDERER_SOURCES
     SpdLoader.cpp
 )
 
-# --- Scene file deployment ----------------------------------------------
-# Copy repo-root Scenes/*.json next to each built binary so running the
-# binary by path (with no special cwd) still resolves scenes via the
-# executable-dir fallback in SceneDiscovery. Uses per-file copy_if_different
-# rather than copy_directory because parallel builds otherwise race when
-# multiple targets POST_BUILD into the same destination.
+# --- Data-file deployment -----------------------------------------------
+# Scenes/, models/, luts/, spd/, and (when PCR_USE_OIDN) the OIDN runtime
+# libraries are copied next to the built binaries so running a binary by
+# path (with no special cwd) still resolves scenes via the executable-dir
+# fallback in SceneDiscovery, and so OIDN's RPATH/lib search lands on the
+# right dylib.
 #
-# Mesh files in repo-root models/ are deployed the same way; JSON scenes
-# reference them via relative paths (e.g. "../models/foo.obj") which the
-# CMake post-build resolves by mirroring the layout.
+# Source-of-truth file enumeration here. The deploy target itself is
+# defined at the bottom of this file (after all binary targets exist),
+# because it uses TARGET_FILE_DIR generator expressions that need at
+# least one binary target to be defined.
 set(PCR_SCENES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../Scenes)
 set(PCR_MODELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../models)
 set(PCR_LUTS_DIR   ${CMAKE_CURRENT_SOURCE_DIR}/../luts)
@@ -204,69 +190,6 @@ file(GLOB PCR_MODEL_FILES "${PCR_MODELS_DIR}/*.obj" "${PCR_MODELS_DIR}/*.mtl")
 file(GLOB PCR_LUT_FILES "${PCR_LUTS_DIR}/*.lut")
 # .spd files may live in subdirectories (spd/cornell/, spd/illuminants/, etc.).
 file(GLOB_RECURSE PCR_SPD_FILES RELATIVE "${PCR_SPD_DIR}" "${PCR_SPD_DIR}/*.spd")
-function(pcr_deploy_scenes target)
-    foreach(scene_file ${PCR_SCENE_JSON_FILES})
-        get_filename_component(scene_name ${scene_file} NAME)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                    $<TARGET_FILE_DIR:${target}>/Scenes
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${scene_file}
-                    $<TARGET_FILE_DIR:${target}>/Scenes/${scene_name}
-            VERBATIM
-        )
-    endforeach()
-    foreach(model_file ${PCR_MODEL_FILES})
-        get_filename_component(model_name ${model_file} NAME)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                    $<TARGET_FILE_DIR:${target}>/models
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${model_file}
-                    $<TARGET_FILE_DIR:${target}>/models/${model_name}
-            VERBATIM
-        )
-    endforeach()
-    # luts/ ships shippable LUT files (PLUT binary format). Same deploy
-    # pattern as Scenes/ and models/. The directory may be empty (no
-    # shipped LUTs) but the function still creates the target dir so a
-    # GUI "save built LUT here" path resolves to a real folder.
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-                $<TARGET_FILE_DIR:${target}>/luts
-        VERBATIM
-    )
-    foreach(lut_file ${PCR_LUT_FILES})
-        get_filename_component(lut_name ${lut_file} NAME)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${lut_file}
-                    $<TARGET_FILE_DIR:${target}>/luts/${lut_name}
-            VERBATIM
-        )
-    endforeach()
-    # spd/ ships measured-spectrum data files (PLAIN-TEXT .spd format)
-    # in possibly-nested subdirs. Mirror the tree next to the binary so
-    # albedo_spd: "cornell/white-paint" resolves whether the user runs
-    # from the source tree or from the build/install directory. Always
-    # creates the spd/ root even when no .spd files are shipped.
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory
-                $<TARGET_FILE_DIR:${target}>/spd
-        VERBATIM
-    )
-    foreach(spd_rel ${PCR_SPD_FILES})
-        get_filename_component(spd_subdir ${spd_rel} DIRECTORY)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                    $<TARGET_FILE_DIR:${target}>/spd/${spd_subdir}
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    ${PCR_SPD_DIR}/${spd_rel}
-                    $<TARGET_FILE_DIR:${target}>/spd/${spd_rel}
-            VERBATIM
-        )
-    endforeach()
-endfunction()
 
 # --- CLI: frank-based-rendering-cli ---------------------------------------
 # CPU only, headless. Use this for scripting and homelab servers.
@@ -288,7 +211,6 @@ if(MSVC)
 else()
     target_compile_options(frank-based-rendering-cli PRIVATE -Wall -Wextra)
 endif()
-pcr_deploy_scenes(frank-based-rendering-cli)
 pcr_link_oidn(frank-based-rendering-cli)
 
 # --- GUI dependencies (shared by both GUI binaries) ---------------------
@@ -377,7 +299,6 @@ target_compile_definitions(frank-based-rendering PRIVATE
 )
 pcr_apply_msvc_release_flags(frank-based-rendering)
 pcr_silence_apple_gl_deprecation(frank-based-rendering)
-pcr_deploy_scenes(frank-based-rendering)
 pcr_link_oidn(frank-based-rendering)
 
 # --- GPU GUI: physically-cringe-rendering --------------------------------
@@ -418,8 +339,95 @@ if(APPLE)
 endif()
 pcr_apply_msvc_release_flags(physically-cringe-rendering)
 pcr_silence_apple_gl_deprecation(physically-cringe-rendering)
-pcr_deploy_scenes(physically-cringe-rendering)
 pcr_link_oidn(physically-cringe-rendering)
+
+# --- Single deploy target ------------------------------------------------
+# All three binaries (CLI, CPU GUI, GPU GUI) land in the same
+# TARGET_FILE_DIR. The previous design ran a per-target POST_BUILD
+# copy_if_different for every scene/model/lut/spd/OIDN-runtime file, and
+# with `make -j` the three targets' POST_BUILD invocations would
+# concurrently write to the same destination paths. Most builds got
+# lucky on scheduling; the macOS CI runner at b519a09 didn't, errno'd
+# one of the cornell-spec.json copies with ENOENT, and failed the
+# build.
+#
+# Fix: a single custom target whose COMMANDs run sequentially. Every
+# binary depends on it (so they finish linking before the deploy
+# starts), and the deploy itself is one writer per destination path.
+# No race possible.
+#
+# We use TARGET_FILE_DIR of the CLI as the canonical deploy dir; all
+# three binaries land there so they all pick up the deployed data.
+set(_pcr_deploy_dir $<TARGET_FILE_DIR:frank-based-rendering-cli>)
+set(_pcr_deploy_commands
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_pcr_deploy_dir}/Scenes
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_pcr_deploy_dir}/models
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_pcr_deploy_dir}/luts
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${_pcr_deploy_dir}/spd
+)
+foreach(_scene_file ${PCR_SCENE_JSON_FILES})
+    get_filename_component(_scene_name ${_scene_file} NAME)
+    list(APPEND _pcr_deploy_commands
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_scene_file}
+                ${_pcr_deploy_dir}/Scenes/${_scene_name})
+endforeach()
+foreach(_model_file ${PCR_MODEL_FILES})
+    get_filename_component(_model_name ${_model_file} NAME)
+    list(APPEND _pcr_deploy_commands
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_model_file}
+                ${_pcr_deploy_dir}/models/${_model_name})
+endforeach()
+foreach(_lut_file ${PCR_LUT_FILES})
+    get_filename_component(_lut_name ${_lut_file} NAME)
+    list(APPEND _pcr_deploy_commands
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_lut_file}
+                ${_pcr_deploy_dir}/luts/${_lut_name})
+endforeach()
+foreach(_spd_rel ${PCR_SPD_FILES})
+    get_filename_component(_spd_subdir ${_spd_rel} DIRECTORY)
+    list(APPEND _pcr_deploy_commands
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+                ${_pcr_deploy_dir}/spd/${_spd_subdir}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${PCR_SPD_DIR}/${_spd_rel}
+                ${_pcr_deploy_dir}/spd/${_spd_rel})
+endforeach()
+
+# OIDN runtime libraries. Same shared destination, same race risk on the
+# old POST_BUILD pattern; fold them into the single deploy here.
+if(PCR_USE_OIDN)
+    list(APPEND _pcr_deploy_commands
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${_pcr_deploy_dir}/lib
+    )
+    if(WIN32)
+        foreach(_dll ${OIDN_RUNTIME_DLLS})
+            get_filename_component(_dll_name ${_dll} NAME)
+            list(APPEND _pcr_deploy_commands
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                        ${_dll}
+                        ${_pcr_deploy_dir}/lib/${_dll_name})
+        endforeach()
+    else()
+        list(APPEND _pcr_deploy_commands
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${oidn_SOURCE_DIR}/lib
+                    ${_pcr_deploy_dir}/lib)
+    endif()
+endif()
+
+add_custom_target(pcr-deploy-data ALL
+    ${_pcr_deploy_commands}
+    COMMENT "Deploying scenes, models, luts, spd, and OIDN runtime"
+    VERBATIM
+)
+add_dependencies(pcr-deploy-data
+    frank-based-rendering-cli
+    frank-based-rendering
+    physically-cringe-rendering
+)
 
 # --- Tests (opt-in, off by default) -------------------------------------
 # Enable with -DPCR_BUILD_TESTS=ON. Pulls in the unit-test binaries under
