@@ -140,7 +140,13 @@ static std::vector<Preset> defaultPresets()
     picture.useRussian = 1;
     picture.useStratified = 1;
     picture.useAA = 1;
-    picture.useAdaptive = 1;
+    // Adaptive deliberately OFF: at 2048 hero samples the convergence
+    // early-exit doesn't save meaningful work, and turning it on routes
+    // the Metal renderer to its strip path instead of the saturation-
+    // friendly multi-pass kernel (~2x slower on Picture-class
+    // workloads). User can flip it on manually if they want the older
+    // path.
+    picture.useAdaptive = 0;
     picture.useOIDN = 1;
     return {
         {"Quick",      2, 4,    2},
