@@ -473,6 +473,52 @@ add_dependencies(pcr-deploy-data
     physically-cringe-rendering-cli
 )
 
+# --- Install rules ------------------------------------------------------
+# `cmake --install Build` lands the four binaries under bin/, an OIDN lib
+# sub-dir alongside them (matching the build-tree $ORIGIN/lib RPATH so the
+# install layout works the same way the build layout does), and the four
+# data dirs (Scenes, models, spd, luts) next to the binaries so the
+# SceneDiscovery / LutDiscovery binary-dir fallbacks resolve out of the
+# box. PATH points at bin/, so after install the user can type any of the
+# four binaries from any cwd.
+#
+# Typical use:
+#   cmake --install Build                       # /usr/local (needs sudo)
+#   cmake --install Build --prefix ~/.local     # user-local, no sudo
+#   cmake --install Build --prefix /tmp/pcr-x   # ad-hoc test prefix
+include(GNUInstallDirs)
+install(TARGETS
+    frank-based-rendering-cli
+    frank-based-rendering
+    physically-cringe-rendering
+    physically-cringe-rendering-cli
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+if(PCR_USE_OIDN)
+    if(WIN32)
+        install(FILES ${OIDN_RUNTIME_DLLS}
+                DESTINATION ${CMAKE_INSTALL_BINDIR}/lib)
+    else()
+        file(GLOB PCR_OIDN_LIBS
+            "${oidn_SOURCE_DIR}/lib/*.so*"
+            "${oidn_SOURCE_DIR}/lib/*.dylib")
+        install(FILES ${PCR_OIDN_LIBS}
+                DESTINATION ${CMAKE_INSTALL_BINDIR}/lib)
+    endif()
+endif()
+install(DIRECTORY ${PCR_SCENES_DIR}/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/Scenes
+        FILES_MATCHING PATTERN "*.json")
+install(DIRECTORY ${PCR_MODELS_DIR}/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/models
+        FILES_MATCHING PATTERN "*.obj" PATTERN "*.mtl")
+install(DIRECTORY ${PCR_SPD_DIR}/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/spd
+        FILES_MATCHING PATTERN "*.spd")
+install(DIRECTORY ${PCR_LUTS_DIR}/
+        DESTINATION ${CMAKE_INSTALL_BINDIR}/luts
+        FILES_MATCHING PATTERN "*.lut")
+
 # --- Tests (opt-in, off by default) -------------------------------------
 # Enable with -DPCR_BUILD_TESTS=ON. Pulls in the unit-test binaries under
 # tests/unit and registers them with CTest. Render tests are shell-driven
