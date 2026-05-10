@@ -49,6 +49,7 @@
 
 #include "Gpu/Metal/MetalRenderer.h"
 #include "Includes/lodepng.h"
+#include "Includes/PngText.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
 #include "Includes/ToneMap.h"
@@ -2277,10 +2278,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     state.info_raw.bitdepth = 8;
     state.info_png.color.colortype = LCT_RGB;
     state.info_png.color.bitdepth = 8;
-    state.encoder.text_compression = 0;
 
     auto addText = [&](const char *key, const std::string &val) {
-        lodepng_add_text(&state.info_png, key, val.c_str());
+        pngAddTextBeforeIdat(&state.info_png, key, val);
     };
     addText("Software",      "physically-cringe-rendering");
     addText("Backend",       "GPU Metal compute");

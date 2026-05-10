@@ -14,6 +14,7 @@
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
+#include "Includes/PngText.h"
 #include "Includes/CIE.h"
 #include "Includes/Denoise.h"
 #include "Includes/NumGen.h"
@@ -414,17 +415,16 @@ void Renderer::render(const Scenes::SceneData &scene,
     std::filesystem::create_directories(outputPath.parent_path());
 
     // Encode PNG via lodepng so we can attach tEXt metadata chunks.
+    // Chunks are written BEFORE IDAT via the unknown-chunks-slot route in
+    // PngText.h so ExifTool doesn't warn about late text chunks.
     lodepng::State state;
     state.info_raw.colortype = LCT_RGB;
     state.info_raw.bitdepth = 8;
     state.info_png.color.colortype = LCT_RGB;
     state.info_png.color.bitdepth = 8;
-    // 0 = write uncompressed tEXt chunks (lodepng default writes zTXt). For
-    // short metadata strings tEXt is simpler and more universally readable.
-    state.encoder.text_compression = 0;
 
     auto addText = [&](const char *key, const std::string &val) {
-        lodepng_add_text(&state.info_png, key, val.c_str());
+        pngAddTextBeforeIdat(&state.info_png, key, val);
     };
     addText("Software", PCR_BINARY_NAME);
     addText("Scene", scene.name);
