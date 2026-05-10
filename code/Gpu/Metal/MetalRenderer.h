@@ -66,12 +66,15 @@ public:
 
     std::string lastOutputPath;
 
+    // Opaque pImpl. Forward-declared here, defined inside MetalRenderer.mm
+    // so this header stays Obj-C-free and includable from plain C++.
+    // Public only so file-local helpers in the .mm can take Impl& without
+    // tripping access control; the actual definition is .mm-local, so
+    // nothing outside the .mm can do anything with it.
+    struct Impl;
+
 private:
     int _width, _height;
     int _maxDepth, _samples, _shadowSamples;
-
-    // Opaque pImpl holds Objective-C state. Defined inside MetalRenderer.mm
-    // so this header stays Obj-C-free and includable from plain C++.
-    struct Impl;
     Impl *_impl = nullptr;
 };

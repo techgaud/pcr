@@ -351,6 +351,18 @@ function(pcr_apply_msvc_release_flags target)
     endif()
 endfunction()
 
+# Apple silences the OpenGL deprecation cascade. macOS 10.14 marked the
+# legacy GL entry points (glGenTextures, glBindTexture, glTexImage2D, ...)
+# deprecated, but ImGui's imgui_impl_opengl3 backend and Gui/main.cpp's
+# live-preview texture upload still use them. We're not migrating those
+# off GL on macOS - the path tracer uses Metal, the ImGui host UI uses
+# the legacy GL on macOS like every other GLFW + ImGui app does.
+function(pcr_silence_apple_gl_deprecation target)
+    if(APPLE)
+        target_compile_definitions(${target} PRIVATE GL_SILENCE_DEPRECATION)
+    endif()
+endfunction()
+
 # --- CPU GUI: frank-based-rendering --------------------------------------
 add_executable(frank-based-rendering
     Gui/main.cpp
@@ -364,6 +376,7 @@ target_compile_definitions(frank-based-rendering PRIVATE
     PCR_USE_GPU=0
 )
 pcr_apply_msvc_release_flags(frank-based-rendering)
+pcr_silence_apple_gl_deprecation(frank-based-rendering)
 pcr_deploy_scenes(frank-based-rendering)
 pcr_link_oidn(frank-based-rendering)
 
@@ -404,6 +417,7 @@ if(APPLE)
     )
 endif()
 pcr_apply_msvc_release_flags(physically-cringe-rendering)
+pcr_silence_apple_gl_deprecation(physically-cringe-rendering)
 pcr_deploy_scenes(physically-cringe-rendering)
 pcr_link_oidn(physically-cringe-rendering)
 

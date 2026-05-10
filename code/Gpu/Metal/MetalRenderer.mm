@@ -1350,7 +1350,12 @@ namespace
             return false;
         }
 
-        auto allocFloatTex = [&](id<MTLTexture> &tex) {
+        // Return-by-value here, not a reference-out parameter: ARC
+        // reference parameters default to __autoreleasing ownership,
+        // which clashes with the __strong id<MTLTexture> struct fields.
+        // Returning by value sidesteps the ownership-annotation
+        // gymnastics; ARC inserts the right retain/release on assignment.
+        auto makeFloatTex = [&]() -> id<MTLTexture> {
             MTLTextureDescriptor *desc = [MTLTextureDescriptor
                 texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
                                              width:(NSUInteger)width
@@ -1358,11 +1363,11 @@ namespace
                                          mipmapped:NO];
             desc.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
             desc.storageMode = MTLStorageModeShared;
-            tex = [im.device newTextureWithDescriptor:desc];
+            return [im.device newTextureWithDescriptor:desc];
         };
-        allocFloatTex(im.outputTex);
-        allocFloatTex(im.albedoTex);
-        allocFloatTex(im.normalTex);
+        im.outputTex = makeFloatTex();
+        im.albedoTex = makeFloatTex();
+        im.normalTex = makeFloatTex();
 
         im.uniformBuf = [im.device newBufferWithLength:sizeof(Uniforms)
                                                options:MTLResourceStorageModeShared];
