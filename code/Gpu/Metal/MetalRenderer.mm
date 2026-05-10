@@ -2013,19 +2013,39 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         // depth ops; we split that across enough passes to keep each
         // dispatch under the watchdog budget.
         //
-        // Per-pass per-pixel budget: ~2900 ops on the calibrated
-        // M1 Ultra throughput (~1.1B ops/sec) gives ~3 sec per
-        // dispatch on a 1080^2 image. Picture preset ends up at
-        // ~548 passes; Production at ~12 passes; Quick at 4.
+        // Watchdog-safe budget is on TOTAL ops per dispatch (not per
+        // pixel): each dispatch is a full-image kernel, so total ops
+        // scale with both pixel count and per-pixel work. Calibrated
+        // against the saturated multi-pass throughput observed on
+        // M1 Ultra (~3.15 G ops/sec on Picture-class kernels). 9B ops
+        // per dispatch ~= 3 sec, well under Apple's compute watchdog.
+        //
+        //   1080^2 Picture (1.17M pixels x 192 ops/pixel/sample):
+        //     samplesPerPass = 9B / (1.17M * 192) = 40, ~50 passes/AA
+        //   4K Picture (16.7M pixels):
+        //     samplesPerPass = 9B / (16.7M * 192) = 2, ~1024 passes/AA
+        //   8K Picture (67M pixels):
+        //     samplesPerPass = 9B / (67M * 192) = 0.7 -> floor to 1.
+        //     This dispatches the full 8K image with one sample per
+        //     pixel, ~13B ops/dispatch ~= 4 sec. Borderline vs. the
+        //     watchdog but the cmd-buffer error logging will surface
+        //     anything that fails.
+        //   16K Picture: samplesPerPass = 1 (clamped), but per-dispatch
+        //     work is ~52B ops ~= 16 sec, very likely over watchdog.
+        //     Spatial chopping (multi-pass + multi-strip) would handle
+        //     this cleanly; left for a follow-up.
         multiPassUsed = true;
 
         long long opsPerPixelPerSample = (long long)_shadowSamples * _maxDepth;
         if (useSpectral) opsPerPixelPerSample =
             (long long)((double)opsPerPixelPerSample * 2.5);
 
-        constexpr long long kTargetWorkPerPixelPerPass = 2900;
+        constexpr long long kTargetOpsPerDispatch = 9'000'000'000LL;
+        long long pixelCount = std::max(1LL, (long long)_width * _height);
+        long long opsPerPixelBudget = std::max(
+            1LL, kTargetOpsPerDispatch / pixelCount);
         int samplesPerPass = std::max(1,
-            (int)(kTargetWorkPerPixelPerPass / std::max(1LL, opsPerPixelPerSample)));
+            (int)(opsPerPixelBudget / std::max(1LL, opsPerPixelPerSample)));
         samplesPerPass = std::min(samplesPerPass, _samples);
 
         int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
