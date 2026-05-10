@@ -1674,9 +1674,23 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
 
-    constexpr int kTgX = 16;
-    constexpr int kTgY = 16;
-    MTLSize threadsPerGroup = MTLSizeMake(kTgX, kTgY, 1);
+    // Threadgroup size: prefer 32x32 (1024 threads = max for Apple
+    // Silicon GPUs), falls back to 16x16 if the compiled pipeline
+    // reports a smaller max. Bigger threadgroups give the GPU more
+    // simdgroups in flight per shader core, which hides memory
+    // latency on this kernel (BVH traversal + spectrum / material
+    // gathers are memory-bound). The kernel doesn't use threadgroup
+    // memory and has modest register pressure, so the compiler
+    // shouldn't shrink the max below 1024 - but check, because if
+    // it does the dispatch will fail at runtime.
+    int tgX = 32, tgY = 32;
+    NSUInteger maxTg = _impl->pipeline.maxTotalThreadsPerThreadgroup;
+    if (maxTg < (NSUInteger)(tgX * tgY))
+    {
+        tgX = 16;
+        tgY = 16;
+    }
+    MTLSize threadsPerGroup = MTLSizeMake(tgX, tgY, 1);
 
     // Atomic counter bumped from each command buffer's completion
     // handler. The handlers fire on a Metal-internal thread; the
@@ -1716,8 +1730,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         [enc setTexture:_impl->albedoTex atIndex:1];
         [enc setTexture:_impl->normalTex atIndex:2];
 
-        MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + kTgX - 1) / kTgX),
-                                           (NSUInteger)((stripH + kTgY - 1) / kTgY),
+        MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + tgX - 1) / tgX),
+                                           (NSUInteger)((stripH + tgY - 1) / tgY),
                                            1);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
         [enc endEncoding];
