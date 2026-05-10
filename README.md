@@ -51,13 +51,41 @@ Windows and macOS need no additional packages beyond Visual Studio / Xcode CLT.
 
 ### Don't want to install a toolchain?
 
-GitHub Actions builds Windows, Linux, and macOS binaries on every push. Just grab the artifact:
+Tagged releases at `github.com/techgaud/pcr/releases` ship pre-built binaries for all three platforms. Each release carries a per-OS bundle (`pcr-vX.Y.Z-<os>-<arch>.zip`) plus individual binary downloads for users who already have the data folders from a previous version.
 
-1. Open `github.com/techgaud/pcr/actions`, pick the latest run
-2. Scroll to "Artifacts", download the one for your OS
-3. Extract the ZIP, double-click the binary
+**Recommended:** download the per-OS bundle ZIP — it's the binary plus the `Scenes/`, `models/`, `spd/`, `luts/`, and `lib/` (OIDN runtime) folders pre-arranged next to it, which the binary needs to find at startup.
 
-Or push a tag (`git tag v1.0.0 && git push origin v1.0.0`) and the workflow auto-publishes a GitHub Release with all three OS binaries attached at `github.com/techgaud/pcr/releases`.
+#### Windows
+
+1. Download `pcr-vX.Y.Z-windows-x64.zip`, extract anywhere
+2. Open the extracted folder, double-click `physically-cringe-rendering.exe` (GPU GUI), `frank-based-rendering.exe` (CPU GUI), or run `frank-based-rendering-cli.exe` from a terminal
+3. Windows SmartScreen will warn that the binary is unsigned the first time. Click *More info* → *Run anyway*. (Or right-click the .exe → Properties → check *Unblock* → OK before launching.)
+
+#### macOS (Apple Silicon)
+
+1. Download `pcr-vX.Y.Z-macos-arm64.zip`, extract anywhere
+2. macOS Gatekeeper will block downloaded unsigned binaries. Easiest fix from a terminal in the extracted folder:
+   ```bash
+   xattr -dr com.apple.quarantine .
+   ```
+   (Or right-click each binary → *Open* → *Open* in the Gatekeeper dialog, individually.)
+3. Double-click `physically-cringe-rendering` (GPU GUI, uses Metal) or `frank-based-rendering` (CPU GUI). Or run `./frank-based-rendering-cli` from terminal.
+
+Apple Silicon GPU rendering shipped in v1.4.0; pre-1.4.0 macOS builds are CPU-only.
+
+#### Linux
+
+1. Download `pcr-vX.Y.Z-linux-x64.zip`, extract anywhere
+2. From a terminal in the extracted folder:
+   ```bash
+   chmod +x physically-cringe-rendering frank-based-rendering frank-based-rendering-cli  # if needed
+   ./physically-cringe-rendering
+   ```
+3. The GPU binary needs an OpenGL 4.3 driver (most recent Intel/AMD/NVIDIA setups have this). The CPU binaries have no graphics requirement.
+
+### Building releases yourself
+
+Push a tag (`git tag v1.0.0 && git push origin v1.0.0`) and the workflow auto-publishes a GitHub Release with all three OS bundles + individual binaries attached.
 
 ## Run (GUI)
 

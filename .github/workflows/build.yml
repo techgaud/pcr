@@ -383,3 +383,42 @@ jobs:
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          body: |
+            ## Install
+
+            Download the **bundled per-OS zip** for your platform — it
+            contains the binary plus `Scenes/`, `models/`, `spd/`,
+            `luts/`, and `lib/` (OIDN runtime), all pre-arranged. The
+            binary needs those folders next to it at startup.
+
+            - **Windows:** `pcr-${{ github.ref_name }}-windows-x64.zip` →
+              extract → double-click `physically-cringe-rendering.exe`
+              (GPU GUI), `frank-based-rendering.exe` (CPU GUI), or run
+              `frank-based-rendering-cli.exe` from a terminal. SmartScreen
+              warns the first time; click *More info* → *Run anyway*.
+            - **macOS (Apple Silicon):**
+              `pcr-${{ github.ref_name }}-macos-arm64.zip` → extract →
+              from a terminal in the extracted folder, run
+              `xattr -dr com.apple.quarantine .` to clear the Gatekeeper
+              quarantine flag, then double-click
+              `physically-cringe-rendering` (Metal-backed GPU GUI) or
+              run `./frank-based-rendering-cli` from terminal.
+            - **Linux:** `pcr-${{ github.ref_name }}-linux-x64.zip` →
+              extract → `chmod +x` if needed → `./physically-cringe-rendering`.
+              GPU GUI needs OpenGL 4.3.
+
+            ### Standalone binary downloads
+
+            Individual binaries are also published (no bundled folders).
+            They're useful when you already have the data folders from a
+            previous version and just want to swap the executable. For
+            first-time install, prefer the bundled zip above.
+
+            ## Verify a render
+
+            Each PNG carries embedded tEXt metadata (Software, Backend,
+            Scene, all render parameters, render time). Read it with
+            `exiftool yourimage.png` (or any tool that handles PNG tEXt
+            chunks) to confirm provenance after the fact.
+
+            ## Changes
