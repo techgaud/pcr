@@ -1245,8 +1245,12 @@ kernel void path_trace_pass(
         }
     }
 
-    if (u.passIdx == 0) {
-        // First pass clobbers the texture's prior contents.
+    // First-touch detection: when spatial chopping is enabled different
+    // tiles have different `passIdx` for their first touch, so we use
+    // the (aaIdx, sampleStart) tuple instead. For the non-chopped case
+    // this is true exactly when passIdx == 0, so behavior is unchanged
+    // when there's no spatial chop.
+    if (u.aaIdx == 0 && u.sampleStart == 0) {
         output.write(float4(accum, 0.0f), uint2(pix.x, pix.y));
     } else {
         float4 prev = output.read(uint2(pix.x, pix.y));
@@ -1267,7 +1271,11 @@ kernel void path_trace_pass(
 //   - done: 1 if relative variance < threshold after >=4 aaIdx taken
 //
 // Per pass:
-//   - On passIdx == 0, the kernel clobbers the per-pixel state to zero.
+//   - On the first dispatch that touches a given pixel (aaIdx == 0 and
+//     sampleStart == 0), the kernel clobbers the per-pixel state to
+//     zero. Spatial chopping is detected via (aaIdx, sampleStart) rather
+//     than passIdx so each tile's first dispatch initializes its own
+//     pixels; without spatial chopping that's exactly passIdx == 0.
 //   - If done==1, the kernel returns immediately and the pixel's
 //     prior output-texture write (the running Welford mean) stands.
 //   - Otherwise: same sampling loop as path_trace_pass adds to staging.
@@ -1309,9 +1317,11 @@ kernel void path_trace_pass_adaptive(
 
     int wfIdx = pix.y * u.width + pix.x;
 
-    // On passIdx==0 clobber the per-pixel state. Avoids needing a
-    // separate clear kernel before the run.
-    if (u.passIdx == 0) {
+    // First-touch detection for this pixel. Spatial chopping makes
+    // different tiles' first passes have different passIdx values, so
+    // we key off (aaIdx, sampleStart) which is (0, 0) for every tile's
+    // first dispatch. For the non-chopped case this matches passIdx==0.
+    if (u.aaIdx == 0 && u.sampleStart == 0) {
         welford[wfIdx].stagingR = 0.0f;
         welford[wfIdx].stagingG = 0.0f;
         welford[wfIdx].stagingB = 0.0f;
@@ -2190,30 +2200,39 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
 
     // ---- Multi-pass dispatch (adaptive or non-adaptive) ----------
     //
-    // Each command buffer dispatches the FULL image with one of the
-    // path_trace_pass{,_adaptive} kernels. Total work per pixel is
+    // Each command buffer dispatches one tile of the image with one of
+    // the path_trace_pass{,_adaptive} kernels. Total work per pixel is
     // aaSamples * samples * shadow * depth ops; we split that across
-    // enough passes to keep each dispatch under Apple's compute
-    // watchdog. Watchdog-safe budget is on TOTAL ops per dispatch (not
-    // per pixel): full-image kernel scales total ops with pixel count
-    // and per-pixel work. Calibrated against M1 Ultra's saturated
-    // multi-pass throughput (~3.15 G ops/sec on Picture-class kernels).
-    // 9B ops per dispatch ~= 3 sec, well under the watchdog.
+    // enough passes (and, when the full image at samplesPerPass=1 still
+    // exceeds the dispatch budget, enough spatial tiles) to keep each
+    // dispatch under Apple's compute watchdog.
+    //
+    // Watchdog-safe budget is on TOTAL ops per dispatch (not per pixel).
+    // Calibrated against M1 Ultra's saturated multi-pass throughput
+    // (~3.15 G ops/sec on Picture-class kernels). 9B ops per dispatch
+    // ~= 3 sec, well under the watchdog.
+    //
+    // Two-axis budgeting:
+    //   1. Try to fit a full-image dispatch by picking samplesPerPass <=
+    //      _samples that keeps width*height*samplesPerPass*opsPerPixel
+    //      <= budget.
+    //   2. If samplesPerPass clamps to 1 and we still exceed budget,
+    //      tile the image into row strips. tileH = budget /
+    //      (width * opsPerPixel). Each tile dispatches one
+    //      (aaIdx, batch, tileIdx) at samplesPerPass=1.
     //
     //   1080^2 Picture (1.17M pixels x 192 ops/pixel/sample):
-    //     samplesPerPass = 9B / (1.17M * 192) = 40, ~50 passes/AA
+    //     samplesPerPass = 9B / (1.17M * 192) = 40, ~50 passes/AA, 1 tile
     //   4K Picture (16.7M pixels):
-    //     samplesPerPass = 9B / (16.7M * 192) = 2, ~1024 passes/AA
+    //     samplesPerPass = 9B / (16.7M * 192) = 2, ~1024 passes/AA, 1 tile
     //   8K Picture (67M pixels):
-    //     samplesPerPass = 9B / (67M * 192) = 0.7 -> floor to 1.
-    //     This dispatches the full 8K image with one sample per
-    //     pixel, ~13B ops/dispatch ~= 4 sec. Borderline vs. the
-    //     watchdog but the cmd-buffer error logging will surface
-    //     anything that fails.
-    //   16K Picture: samplesPerPass = 1 (clamped), but per-dispatch
-    //     work is ~52B ops ~= 16 sec, very likely over watchdog.
-    //     Spatial chopping (multi-pass + multi-strip) would handle
-    //     this cleanly; left for a follow-up.
+    //     samplesPerPass = 9B / (67M * 192) = 0.7 -> floor to 1, 1 tile.
+    //     ~13B ops/dispatch ~= 4 sec, borderline vs. watchdog.
+    //   16K Picture (268M pixels):
+    //     samplesPerPass = 1 (clamped). Full-image dispatch is
+    //     ~52B ops ~= 16 sec, would be killed. Spatial chop kicks
+    //     in: tileH = 9B / (16384 * 192) = 2860 rows, 6 tiles total.
+    //     Each tile = 16384 * 2860 * 192 = 9B ops, on budget.
 
     long long opsPerPixelPerSample = (long long)_shadowSamples * _maxDepth;
     if (useSpectral) opsPerPixelPerSample =
@@ -2227,9 +2246,23 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         (int)(opsPerPixelBudget / std::max(1LL, opsPerPixelPerSample)));
     samplesPerPass = std::min(samplesPerPass, _samples);
 
+    // Spatial chopping kicks in only when samplesPerPass is already
+    // clamped to 1 and the full-image dispatch still exceeds budget.
+    // Otherwise tileH defaults to the full image height (one tile).
+    int tileH = _height;
+    if (samplesPerPass == 1)
+    {
+        long long opsPerFullRow = (long long)_width * opsPerPixelPerSample;
+        long long rowsPerDispatch = std::max(
+            1LL, kTargetOpsPerDispatch / std::max(1LL, opsPerFullRow));
+        if (rowsPerDispatch < _height)
+            tileH = (int)rowsPerDispatch;
+    }
+    int tilesY = (_height + tileH - 1) / tileH;
+
     int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
     int aaN = std::max(1, aaSamples);
-    int totalPasses = aaN * passesPerAa;
+    int totalPasses = aaN * passesPerAa * tilesY;
     totalContributions = aaN * _samples;
 
     id<MTLComputePipelineState> activePipeline =
@@ -2263,17 +2296,27 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         }
     }
 
+    // Per-pass uniforms. Pass ordering is (aaIdx outer, batchIdx middle,
+    // tileIdx innermost). That keeps each pixel's batch sequence in
+    // (0,0), (0,1), ..., (0,passesPerAa-1), (1,0), ... order for its
+    // single tile, which is what the adaptive Welford accumulator and
+    // the OIDN-aux first-touch logic both expect.
     size_t uniformsStride = sizeof(Uniforms);
     id<MTLBuffer> uniformsBuf =
         [_impl->device newBufferWithLength:uniformsStride * (size_t)totalPasses
                                    options:MTLResourceStorageModeShared];
     Uniforms *uniformsPtr = (Uniforms *)[uniformsBuf contents];
+    int passesPerAaTotal = passesPerAa * tilesY;
     for (int p = 0; p < totalPasses; p++)
     {
-        int aaIdx       = p / passesPerAa;
-        int batchIdx    = p % passesPerAa;
+        int aaIdx       = p / passesPerAaTotal;
+        int withinAa    = p % passesPerAaTotal;
+        int batchIdx    = withinAa / tilesY;
+        int tileIdx     = withinAa % tilesY;
         int sampleStart = batchIdx * samplesPerPass;
         int sampleEnd   = std::min(sampleStart + samplesPerPass, _samples);
+        int yStart      = tileIdx * tileH;
+        int yEnd        = std::min(yStart + tileH, _height);
 
         Uniforms u = uBase;
         u.passIdx      = p;
@@ -2281,22 +2324,27 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         u.sampleStart  = sampleStart;
         u.sampleCount  = sampleEnd - sampleStart;
         u.batchEndOfAa = (batchIdx == passesPerAa - 1) ? 1 : 0;
-        u.yOffset      = 0;
-        u.yEnd         = _height;
-        // OIDN aux capture happens once, on the first pass only;
-        // every other pass writeAux=0 so it doesn't repeatedly
-        // overwrite the same aux pixels with identical data.
-        u.writeAux     = (useOIDN && p == 0) ? 1 : 0;
+        u.yOffset      = yStart;
+        u.yEnd         = yEnd;
+        // OIDN aux capture: once per pixel only. With spatial chop the
+        // aux must run on every tile's first dispatch (aaIdx==0,
+        // sampleStart==0) so each pixel gets its albedo+normal written
+        // exactly once.
+        u.writeAux     = (useOIDN && aaIdx == 0 && sampleStart == 0) ? 1 : 0;
         uniformsPtr[p] = u;
     }
 
-    MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + tgX - 1) / tgX),
-                                       (NSUInteger)((_height + tgY - 1) / tgY),
-                                       1);
     for (int p = 0; p < totalPasses; p++)
     {
         if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
             break;
+
+        const Uniforms &u = uniformsPtr[p];
+        int tileH_p = u.yEnd - u.yOffset;
+        MTLSize threadgroups = MTLSizeMake(
+            (NSUInteger)((_width + tgX - 1) / tgX),
+            (NSUInteger)((tileH_p + tgY - 1) / tgY),
+            1);
 
         id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
