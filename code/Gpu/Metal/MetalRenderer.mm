@@ -1283,7 +1283,10 @@ struct MetalRenderer::Impl
     id<MTLBuffer>               bvhBuf         = nil;
     id<MTLBuffer>               lightBuf       = nil;
     id<MTLBuffer>               lightTriBuf    = nil;
-    id<MTLBuffer>               uniformBuf     = nil;
+    // Uniforms are pushed inline per-dispatch via setBytes:length:atIndex:
+    // (~100 bytes, well under the 4 KB inline limit). No persistent
+    // uniform MTLBuffer needed; that pattern would alias across pipelined
+    // command buffers on the same queue.
 
     bool                        initialized    = false;
 };
@@ -1368,9 +1371,6 @@ namespace
         im.outputTex = makeFloatTex();
         im.albedoTex = makeFloatTex();
         im.normalTex = makeFloatTex();
-
-        im.uniformBuf = [im.device newBufferWithLength:sizeof(Uniforms)
-                                               options:MTLResourceStorageModeShared];
 
         im.initialized = true;
         return true;
@@ -1617,125 +1617,138 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     for (const auto &L : scene.areaLights)
         if (L.kind == Scenes::AreaLightKind::Plane) planeLightCount++;
 
-    // Tile sizing mirrors the OpenGL backend's heuristic so render
-    // wall-clocks scale predictably across backends. Apple Silicon
-    // doesn't have a Windows-style TDR cliff, but per-tile dispatch
-    // still helps cancel + progress responsiveness on big renders.
-    int aaMult = std::max(1, aaSamples);
-    int workPerPixel = std::max(1, _samples * _maxDepth * _shadowSamples * aaMult);
+    // Apple Silicon dispatch model: horizontal strips, all command
+    // buffers committed back-to-back without waiting between them.
+    //
+    // The OpenGL backend uses 16x16 tiles + glFinish() per tile because
+    // Windows kills any single shader invocation that runs longer than
+    // ~2 sec (TDR watchdog). Apple has no equivalent. Per-tile waits
+    // here serialized CPU encoding and GPU execution: GPU drained, CPU
+    // re-encoded, GPU drained again, ad nauseam. coarse samplers like
+    // `asitop` saw "100% GPU utilization" while the actual duty cycle
+    // was a fraction of that. Killing the wait lets the command queue
+    // pipeline strips - while strip N is computing on the GPU, the CPU
+    // is encoding strip N+1.
+    //
+    // Strip count target: 32 strips, each at least 16 rows tall. Why
+    // strips at all instead of one image-wide dispatch: progress UX.
+    // 32 strips gives a progress bar that updates ~3% at a time on a
+    // 1080-row render, which feels live without wasting overhead on
+    // dispatch micro-management. Tiny renders collapse to a single
+    // strip.
+    constexpr int kTargetStrips = 32;
+    int stripHeight = std::max(16, (_height + kTargetStrips - 1) / kTargetStrips);
+    int numStrips = (_height + stripHeight - 1) / stripHeight;
 
-    constexpr double kBaselinePrimitives = 7.0;
-    int primCount = (int)scene.spheres.size() + (int)scene.walls.size() + planeLightCount;
-    double primMult = std::max(1.0, (double)primCount / kBaselinePrimitives);
-    double bvhMult = 0.0;
-    if ((int)scene.triangles.size() > 4)
+    // Common uniform fields (everything except per-strip y bounds).
+    Uniforms uBase{};
+    uBase.width            = _width;
+    uBase.height           = _height;
+    uBase.fov              = scene.camera.fov;
+    uBase.originX          = scene.camera.position[0];
+    uBase.originY          = scene.camera.position[1];
+    uBase.originZ          = scene.camera.position[2];
+    uBase.depth            = _maxDepth;
+    uBase.samples          = _samples;
+    uBase.shadowSamples    = _shadowSamples;
+    uBase.sphereCount      = (int)scene.spheres.size();
+    uBase.planeCount       = (int)scene.walls.size() + planeLightCount;
+    uBase.triangleCount    = (int)scene.triangles.size();
+    uBase.bvhNodeCount     = (int)scene.triangleBvh.size();
+    uBase.lightCount       = (int)scene.areaLights.size();
+    uBase.totalLightArea   = totalLightArea;
+    uBase.frameSeed        = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count() & 0x7FFFFFFF);
+    uBase.useMIS           = useMIS ? 1 : 0;
+    uBase.useRussian       = useRussian ? 1 : 0;
+    uBase.useStratified    = useStratified ? 1 : 0;
+    uBase.strata           = useStratified
+                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
+                             : 0;
+    uBase.aaSamples        = std::max(1, aaSamples);
+    uBase.useAdaptive      = useAdaptive ? 1 : 0;
+    uBase.writeAux         = useOIDN ? 1 : 0;
+    uBase.useSpectral      = useSpectral ? 1 : 0;
+    uBase.heroSamples      = std::clamp(heroSamples, 1, 4);
+    uBase.xOffset          = 0;
+    uBase.xEnd             = _width;
+
+    constexpr int kTgX = 16;
+    constexpr int kTgY = 16;
+    MTLSize threadsPerGroup = MTLSizeMake(kTgX, kTgY, 1);
+
+    // Atomic counter bumped from each command buffer's completion
+    // handler. The handlers fire on a Metal-internal thread; the
+    // counter lives on this stack frame and stays alive until the
+    // final waitUntilCompleted below returns.
+    std::atomic<int> doneStrips{0};
+    std::atomic<int> *progressPtr = progressRows;
+    int height = _height;
+
+    NSMutableArray<id<MTLCommandBuffer>> *pending =
+        [[NSMutableArray alloc] initWithCapacity:numStrips];
+
+    for (int yStart = 0; yStart < _height; yStart += stripHeight)
     {
-        double depth = std::log2((double)scene.triangles.size() / 4.0);
-        bvhMult = depth * 0.25;
-    }
-    double effectivePerPixel = (double)workPerPixel * (primMult + bvhMult);
-    if (useAdaptive) effectivePerPixel *= 1.15;
-    if (useOIDN)     effectivePerPixel += (primMult + bvhMult);
-    if (useSpectral) effectivePerPixel *= 2.5;
+        if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+            break;
 
-    constexpr double kTargetWorkPerDispatch = 1.5e8;
-    double maxPixelsD = kTargetWorkPerDispatch / effectivePerPixel;
-    int maxPixelsPerDispatch = std::max(64, (int)maxPixelsD);
-    int tileSide = (int)std::sqrt((double)maxPixelsPerDispatch);
-    int minTileSide;
-    if (effectivePerPixel >= 2e6)      minTileSide = 4;
-    else if (effectivePerPixel > 5e5)  minTileSide = 8;
-    else                               minTileSide = 16;
-    tileSide = std::clamp(tileSide, minTileSide, 256);
+        int yEnd = std::min(yStart + stripHeight, _height);
+        int stripH = yEnd - yStart;
 
-    int tilesX = (_width  + tileSide - 1) / tileSide;
-    int tilesY = (_height + tileSide - 1) / tileSide;
-    int totalTiles = tilesX * tilesY;
-    int doneTiles = 0;
+        Uniforms u = uBase;
+        u.yOffset = yStart;
+        u.yEnd    = yEnd;
 
-    Uniforms *uHost = (Uniforms *)[_impl->uniformBuf contents];
-    uHost->width            = _width;
-    uHost->height           = _height;
-    uHost->fov              = scene.camera.fov;
-    uHost->originX          = scene.camera.position[0];
-    uHost->originY          = scene.camera.position[1];
-    uHost->originZ          = scene.camera.position[2];
-    uHost->depth            = _maxDepth;
-    uHost->samples          = _samples;
-    uHost->shadowSamples    = _shadowSamples;
-    uHost->sphereCount      = (int)scene.spheres.size();
-    uHost->planeCount       = (int)scene.walls.size() + planeLightCount;
-    uHost->triangleCount    = (int)scene.triangles.size();
-    uHost->bvhNodeCount     = (int)scene.triangleBvh.size();
-    uHost->lightCount       = (int)scene.areaLights.size();
-    uHost->totalLightArea   = totalLightArea;
-    uHost->frameSeed        = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now().time_since_epoch())
-                                        .count() & 0x7FFFFFFF);
-    uHost->useMIS           = useMIS ? 1 : 0;
-    uHost->useRussian       = useRussian ? 1 : 0;
-    uHost->useStratified    = useStratified ? 1 : 0;
-    uHost->strata           = useStratified
-                              ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
-                              : 0;
-    uHost->aaSamples        = std::max(1, aaSamples);
-    uHost->useAdaptive      = useAdaptive ? 1 : 0;
-    uHost->writeAux         = useOIDN ? 1 : 0;
-    uHost->useSpectral      = useSpectral ? 1 : 0;
-    uHost->heroSamples      = std::clamp(heroSamples, 1, 4);
+        id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+        [enc setComputePipelineState:_impl->pipeline];
+        [enc setBytes:&u length:sizeof(u) atIndex:0];
+        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
+        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
+        [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
+        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
+        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
+        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
+        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
+        [enc setTexture:_impl->outputTex atIndex:0];
+        [enc setTexture:_impl->albedoTex atIndex:1];
+        [enc setTexture:_impl->normalTex atIndex:2];
 
-    MTLSize threadsPerGroup = MTLSizeMake(16, 16, 1);
+        MTLSize threadgroups = MTLSizeMake((NSUInteger)((_width + kTgX - 1) / kTgX),
+                                           (NSUInteger)((stripH + kTgY - 1) / kTgY),
+                                           1);
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+        [enc endEncoding];
 
-    for (int yStart = 0; yStart < _height; yStart += tileSide)
-    {
-        for (int xStart = 0; xStart < _width; xStart += tileSide)
-        {
-            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+        // Capture-by-value: progressPtr (raw atomic*), height (int),
+        // numStrips (int), and the address of doneStrips (atomic lives
+        // on this stack frame, alive until waitUntilCompleted below).
+        std::atomic<int> *donePtr = &doneStrips;
+        int totalStrips = numStrips;
+        [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+            int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
+            if (progressPtr)
             {
-                std::cout << "Metal render cancelled." << std::endl;
-                return;
+                int approxRows = (int)((double)done / totalStrips * height);
+                progressPtr->store(approxRows, std::memory_order_relaxed);
             }
-            int xEnd = std::min(xStart + tileSide, _width);
-            int yEnd = std::min(yStart + tileSide, _height);
-            int tileW = xEnd - xStart;
-            int tileH = yEnd - yStart;
+        }];
 
-            uHost->xOffset = xStart;
-            uHost->xEnd    = xEnd;
-            uHost->yOffset = yStart;
-            uHost->yEnd    = yEnd;
-
-            id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
-            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-            [enc setComputePipelineState:_impl->pipeline];
-            [enc setBuffer:_impl->uniformBuf  offset:0 atIndex:0];
-            [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
-            [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
-            [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
-            [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
-            [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
-            [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
-            [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
-            [enc setTexture:_impl->outputTex atIndex:0];
-            [enc setTexture:_impl->albedoTex atIndex:1];
-            [enc setTexture:_impl->normalTex atIndex:2];
-
-            MTLSize threadgroups = MTLSizeMake((NSUInteger)((tileW + 15) / 16),
-                                               (NSUInteger)((tileH + 15) / 16),
-                                               1);
-            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
-            [enc endEncoding];
-            [cmdbuf commit];
-            [cmdbuf waitUntilCompleted];
-
-            doneTiles++;
-            if (progressRows)
-            {
-                int approxRows = (int)((double)doneTiles / totalTiles * _height);
-                progressRows->store(approxRows, std::memory_order_relaxed);
-            }
-        }
+        [cmdbuf commit];
+        [pending addObject:cmdbuf];
     }
+
+    // One wait, at the end. All strips run pipelined on the GPU; the
+    // CPU only blocks here for whatever's still in flight after the
+    // encoding loop completes (which is almost everything for big
+    // renders, since encoding is much faster than execution).
+    if ([pending count] > 0)
+        [[pending lastObject] waitUntilCompleted];
+
+    if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+        std::cout << "Metal render cancelled." << std::endl;
 
     // Readback. RGBA32Float textures: getBytes is a memcpy on Apple
     // Silicon's unified memory. Strip into Vec3f for downstream
