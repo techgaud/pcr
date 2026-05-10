@@ -10,7 +10,7 @@ Three binaries ship from one codebase:
 |--------|---------|-----|
 | `frank-based-rendering-cli` | CPU | CLI for headless / scripting / homelab servers |
 | `frank-based-rendering` | CPU | Desktop GUI (sliders, render button, preview, history) |
-| `physically-cringe-rendering` | GPU (OpenGL 4.3 compute) | Same GUI, on the GPU. Fast. Needs OpenGL 4.3+. |
+| `physically-cringe-rendering` | GPU | Same GUI, on the GPU. **OpenGL 4.3 compute** on Windows/Linux, **Metal compute** on Apple Silicon Macs. |
 
 ## Requirements
 
@@ -37,7 +37,7 @@ This produces three executables:
 
 - **`frank-based-rendering-cli`** — CLI, CPU only (headless, scriptable)
 - **`frank-based-rendering`** — desktop GUI, CPU
-- **`physically-cringe-rendering`** — desktop GUI, GPU (OpenGL 4.3 compute)
+- **`physically-cringe-rendering`** — desktop GUI, GPU. OpenGL 4.3 compute on Windows/Linux, Metal compute on Apple Silicon.
 
 On Windows with Visual Studio they land at `code/Build/Release/<name>.exe`. On Linux and macOS they're at `code/Build/<name>`.
 
@@ -65,7 +65,7 @@ Double-click whichever GUI binary you want, or from a shell:
 
 ```bash
 ./code/Build/frank-based-rendering        # CPU
-./code/Build/physically-cringe-rendering  # GPU (OpenGL 4.3 compute)
+./code/Build/physically-cringe-rendering  # GPU (OpenGL 4.3 on Win/Linux, Metal on macOS)
 ```
 
 Both share the same UI; only the path-tracing backend differs. Settings persist to `<binary-name>.json` next to the executable, so the two GUIs keep separate state.

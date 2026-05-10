@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, gui, gpu, dev, spectral, test-suite]
+    branches: [main, gui, gpu, dev, mac, spectral, test-suite]
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -194,12 +194,15 @@ jobs:
       - name: Smoke test (CLI)
         run: ./code/Build/frank-based-rendering-cli -d 2 -s 4 -S 2
 
-      # macOS skips physically-cringe-rendering (OpenGL 4.1 cap; needs Metal).
+      # All three binaries now build on macOS: physically-cringe-rendering
+      # uses the Metal backend (Gpu/Metal/MetalRenderer.mm) selected by
+      # CMake on Apple platforms.
       - name: Stage flat artifacts
         run: |
           mkdir -p stage
           cp code/Build/frank-based-rendering-cli stage/
           cp code/Build/frank-based-rendering stage/
+          cp code/Build/physically-cringe-rendering stage/
           [ -d code/Build/lib ] && cp -r code/Build/lib stage/ || true
           cp -r Scenes stage/
           cp -r models stage/
@@ -210,6 +213,26 @@ jobs:
         with:
           name: pcr-macos-arm64
           path: stage/
+          if-no-files-found: error
+          retention-days: 90
+
+      # Standalone GPU bundle for macOS, mirroring the Windows + Linux
+      # GPU-only artifacts.
+      - name: Stage GPU bundle
+        run: |
+          mkdir -p stage-gpu/physically-cringe-rendering
+          cp code/Build/physically-cringe-rendering \
+             stage-gpu/physically-cringe-rendering/
+          [ -d code/Build/lib ] && cp -r code/Build/lib stage-gpu/physically-cringe-rendering/ || true
+          cp -r Scenes stage-gpu/physically-cringe-rendering/
+          cp -r models stage-gpu/physically-cringe-rendering/
+          cp -r spd    stage-gpu/physically-cringe-rendering/
+          [ -d luts ] && cp -r luts stage-gpu/physically-cringe-rendering/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: physically-cringe-rendering-macos-arm64
+          path: stage-gpu/
           if-no-files-found: error
           retention-days: 90
 
@@ -306,18 +329,21 @@ jobs:
           cp pcr-macos-arm64/frank-based-rendering \
              "release/frank-based-rendering-${VER}-macos-arm64"
 
-          # GPU GUI (Windows + Linux only)
+          # GPU GUI (all 3 OSes; macOS uses Metal backend, Win/Linux OpenGL)
           cp pcr-windows-x64/physically-cringe-rendering.exe \
              "release/physically-cringe-rendering-${VER}-windows-x64.exe"
           cp pcr-linux-x64/physically-cringe-rendering \
              "release/physically-cringe-rendering-${VER}-linux-x64"
+          cp pcr-macos-arm64/physically-cringe-rendering \
+             "release/physically-cringe-rendering-${VER}-macos-arm64"
 
           # download-artifact strips +x on Unix; restore.
           chmod +x release/frank-based-rendering-cli-${VER}-linux-x64 \
                    release/frank-based-rendering-cli-${VER}-macos-arm64 \
                    release/frank-based-rendering-${VER}-linux-x64 \
                    release/frank-based-rendering-${VER}-macos-arm64 \
-                   release/physically-cringe-rendering-${VER}-linux-x64
+                   release/physically-cringe-rendering-${VER}-linux-x64 \
+                   release/physically-cringe-rendering-${VER}-macos-arm64
 
           # JSON scenes are OS-agnostic. Ship them as a single archive so
           # users grabbing standalone binaries can drop a matching Scenes/

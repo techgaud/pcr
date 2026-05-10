@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Apple-only: enable Objective-C++. The Metal backend
+# (Gpu/Metal/MetalRenderer.mm) is .mm so it can hold id<MTL...>
+# Foundation/Metal objects in its pImpl. ARC is set per-source-file
+# below on the .mm only, since the rest of the codebase is plain C++.
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -360,26 +368,44 @@ pcr_deploy_scenes(frank-based-rendering)
 pcr_link_oidn(frank-based-rendering)
 
 # --- GPU GUI: physically-cringe-rendering --------------------------------
-# Skipped on Apple platforms: macOS caps OpenGL at 4.1, but the compute
-# shader requires 4.3. The right path forward there is a Metal or Vulkan
-# backend; until then, the macOS GPU build is omitted from CI releases.
-if(NOT APPLE)
-    add_executable(physically-cringe-rendering
-        Gui/main.cpp
-        Gpu/GpuRenderer.cpp
-        ${IMGUI_SOURCES}
-        ${PCR_RENDERER_SOURCES}
-    )
-    target_include_directories(physically-cringe-rendering PRIVATE ${PCR_GUI_INCLUDES})
-    target_link_libraries(physically-cringe-rendering PRIVATE ${PCR_GUI_LIBS})
-    target_compile_definitions(physically-cringe-rendering PRIVATE
-        PCR_BINARY_NAME="physically-cringe-rendering"
-        PCR_USE_GPU=1
-    )
-    pcr_apply_msvc_release_flags(physically-cringe-rendering)
-    pcr_deploy_scenes(physically-cringe-rendering)
-    pcr_link_oidn(physically-cringe-rendering)
+# Two backends, one binary. CMake picks the source file based on
+# platform:
+#   Apple    -> Gpu/Metal/MetalRenderer.mm   (Metal compute, M1+)
+#   else     -> Gpu/Opengl/OpenglRenderer.cpp (OpenGL 4.3 compute)
+# Gui/main.cpp includes Gpu/GpuRenderer.h, which is a typedef shim
+# that resolves to whichever class the chosen backend exposes.
+if(APPLE)
+    set(PCR_GPU_BACKEND_SRC Gpu/Metal/MetalRenderer.mm)
+else()
+    set(PCR_GPU_BACKEND_SRC Gpu/Opengl/OpenglRenderer.cpp)
 endif()
+
+add_executable(physically-cringe-rendering
+    Gui/main.cpp
+    ${PCR_GPU_BACKEND_SRC}
+    ${IMGUI_SOURCES}
+    ${PCR_RENDERER_SOURCES}
+)
+target_include_directories(physically-cringe-rendering PRIVATE ${PCR_GUI_INCLUDES})
+target_link_libraries(physically-cringe-rendering PRIVATE ${PCR_GUI_LIBS})
+target_compile_definitions(physically-cringe-rendering PRIVATE
+    PCR_BINARY_NAME="physically-cringe-rendering"
+    PCR_USE_GPU=1
+)
+if(APPLE)
+    # ARC on the .mm file (the rest of the codebase is plain C++ and
+    # doesn't need it, and -fobjc-arc on .cpp is rejected by clang).
+    set_source_files_properties(Gpu/Metal/MetalRenderer.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    target_link_libraries(physically-cringe-rendering PRIVATE
+        "-framework Foundation"
+        "-framework Metal"
+    )
+endif()
+pcr_apply_msvc_release_flags(physically-cringe-rendering)
+pcr_deploy_scenes(physically-cringe-rendering)
+pcr_link_oidn(physically-cringe-rendering)
 
 # --- Tests (opt-in, off by default) -------------------------------------
 # Enable with -DPCR_BUILD_TESTS=ON. Pulls in the unit-test binaries under

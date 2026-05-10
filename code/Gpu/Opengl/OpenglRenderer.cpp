@@ -1,4 +1,4 @@
-// GpuRenderer. OpenGL 4.3 compute shader path tracer.
+// OpenglRenderer. OpenGL 4.3 compute shader path tracer.
 //
 // Architecture:
 //   - Scene -> SSBOs (one each for spheres, planes, materials)
@@ -35,7 +35,7 @@
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 
-#include "Gpu/GpuRenderer.h"
+#include "Gpu/Opengl/OpenglRenderer.h"
 #include "Includes/lodepng.h"
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
@@ -1591,31 +1591,31 @@ namespace
     }
 }
 
-// ---------- GpuRenderer ---------------------------------------------------
+// ---------- OpenglRenderer ---------------------------------------------------
 
-GpuRenderer::GpuRenderer(int width, int height,
-                         int depth, int samples, int shadowSamples,
-                         GLFWwindow *sharedContext)
+OpenglRenderer::OpenglRenderer(int width, int height,
+                               int depth, int samples, int shadowSamples,
+                               GLFWwindow *sharedContext)
     : _width{width}, _height{height},
       _maxDepth{depth}, _samples{samples}, _shadowSamples{shadowSamples},
       _sharedContext{sharedContext}
 {
 }
 
-GpuRenderer::~GpuRenderer()
+OpenglRenderer::~OpenglRenderer()
 {
     // We don't tear down GL state in the destructor because the GL context
     // probably isn't current on the calling thread. The OS reclaims it on
     // process exit; the cost is negligible for a single-render lifetime.
 }
 
-bool GpuRenderer::initGL()
+bool OpenglRenderer::initGL()
 {
     if (_initialized) return true;
 
     if (!loadGlFunctions())
     {
-        std::cerr << "GpuRenderer: failed to load GL functions" << std::endl;
+        std::cerr << "OpenglRenderer: failed to load GL functions" << std::endl;
         return false;
     }
 
@@ -1653,7 +1653,7 @@ bool GpuRenderer::initGL()
     return true;
 }
 
-void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLightArea)
+void OpenglRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLightArea)
 {
     // Material upload: one-to-one with scene.materials. The CPU side
     // already dedupes (every primitive carries a matIdx into the
@@ -1910,7 +1910,7 @@ void GpuRenderer::uploadScene(const Scenes::SceneData &scene, float &outTotalLig
                   &ltDummy, sizeof(ltDummy));
 }
 
-void GpuRenderer::render(const Scenes::SceneData &scene,
+void OpenglRenderer::render(const Scenes::SceneData &scene,
                          std::chrono::steady_clock::time_point start,
                          const std::string &outputDir)
 {
@@ -1918,7 +1918,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
 
     if (!_sharedContext)
     {
-        std::cerr << "GpuRenderer: no shared OpenGL context" << std::endl;
+        std::cerr << "OpenglRenderer: no shared OpenGL context" << std::endl;
         return;
     }
 
@@ -2401,7 +2401,7 @@ void GpuRenderer::render(const Scenes::SceneData &scene,
     lastOutputPath = outputPath.string();
 }
 
-void GpuRenderer::destroyGL()
+void OpenglRenderer::destroyGL()
 {
     if (_program) { glDeleteProgram(_program); _program = 0; }
     if (_outputTex) { glDeleteTextures(1, &_outputTex); _outputTex = 0; }
