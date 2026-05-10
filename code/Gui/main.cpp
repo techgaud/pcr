@@ -97,20 +97,56 @@ struct Preset
     int depth = 4;
     int samples = 16;
     int shadowSamples = 4;
+
+    // Optional snaps. When clicked, a preset always applies depth /
+    // samples / shadow above; the fields below are applied only if
+    // non-default sentinel values, so most presets stay minimal and
+    // only "Picture" pulls its weight as a one-click hero render
+    // configuration.
+    //
+    // width/height: 0 = leave settings.width / settings.height alone.
+    // technique flags: -1 = leave unchanged, 0 = off, 1 = on.
+    int width = 0;
+    int height = 0;
+    int snapSquare = -1;
+    int useDenoise = -1;
+    int useMIS = -1;
+    int useRussian = -1;
+    int useStratified = -1;
+    int useAA = -1;
+    int useAdaptive = -1;
+    int useOIDN = -1;
 };
 
 // Per-binary defaults. The GPU is fast enough that "Picture" can sensibly
-// crank to 6 bounces / 2048 samples / 32 shadow rays. that takes ~4 min on
-// a Threadripper-class GPU. The CPU "Picture" stays at 4/256/8 because the
-// same settings on CPU would take many hours.
+// crank to 6 bounces / 2048 samples / 32 shadow rays AND turn on every
+// quality technique AND snap to 1080 square - the post-Metal-port M1
+// Ultra finishes that hero configuration in minutes, not hours. CPU
+// "Picture" stays at 4/256/8 with no extra snaps because the same
+// settings on CPU would take many hours.
 static std::vector<Preset> defaultPresets()
 {
 #if PCR_USE_GPU
+    Preset picture;
+    picture.name = "Picture";
+    picture.depth = 6;
+    picture.samples = 2048;
+    picture.shadowSamples = 32;
+    picture.width = 1080;
+    picture.height = 1080;
+    picture.snapSquare = 1;
+    picture.useDenoise = 1;
+    picture.useMIS = 1;
+    picture.useRussian = 1;
+    picture.useStratified = 1;
+    picture.useAA = 1;
+    picture.useAdaptive = 1;
+    picture.useOIDN = 1;
     return {
         {"Quick",      2, 4,    2},
         {"Decent",     4, 16,   4},
         {"Production", 4, 256,  8},
-        {"Picture",    6, 2048, 32},
+        picture,
     };
 #else
     return {
@@ -249,6 +285,18 @@ static void loadSettings(Settings &s)
                 p.depth = pj.value("depth", 4);
                 p.samples = pj.value("samples", 16);
                 p.shadowSamples = pj.value("shadow", 4);
+                // Optional snaps. Defaults to "don't change" sentinels
+                // when missing, so older settings files migrate cleanly.
+                p.width         = pj.value("width",         0);
+                p.height        = pj.value("height",        0);
+                p.snapSquare    = pj.value("snapSquare",    -1);
+                p.useDenoise    = pj.value("useDenoise",    -1);
+                p.useMIS        = pj.value("useMIS",        -1);
+                p.useRussian    = pj.value("useRussian",    -1);
+                p.useStratified = pj.value("useStratified", -1);
+                p.useAA         = pj.value("useAA",         -1);
+                p.useAdaptive   = pj.value("useAdaptive",   -1);
+                p.useOIDN       = pj.value("useOIDN",       -1);
                 if (p.name.empty()) continue;
                 loaded.push_back(std::move(p));
             }
@@ -300,6 +348,19 @@ static json buildSettingsJson(const Settings &s)
         pj["depth"] = p.depth;
         pj["samples"] = p.samples;
         pj["shadow"] = p.shadowSamples;
+        // Optional snaps. Always serialize so round-tripping doesn't
+        // silently lose them; loaders treat the sentinel values
+        // (0 / -1) as "no snap."
+        pj["width"]         = p.width;
+        pj["height"]        = p.height;
+        pj["snapSquare"]    = p.snapSquare;
+        pj["useDenoise"]    = p.useDenoise;
+        pj["useMIS"]        = p.useMIS;
+        pj["useRussian"]    = p.useRussian;
+        pj["useStratified"] = p.useStratified;
+        pj["useAA"]         = p.useAA;
+        pj["useAdaptive"]   = p.useAdaptive;
+        pj["useOIDN"]       = p.useOIDN;
         arr.push_back(std::move(pj));
     }
     j["presets"] = std::move(arr);
@@ -1255,9 +1316,11 @@ int main(int, char **)
 
         ImGui::SeparatorText("Quality");
 
-        // Preset buttons snap depth/samples/shadow. Width/height are
-        // intentionally not touched so resolution is independent of preset.
-        // Presets are editable via the Edit button, persisted in settings.
+        // Preset buttons always snap depth/samples/shadow. Optional
+        // per-preset fields (width/height/square + technique flags)
+        // also apply if set; that's how "Picture" doubles as a
+        // one-click hero render configuration without forcing every
+        // preset to carry the same surface area.
         for (size_t i = 0; i < settings.presets.size(); i++)
         {
             if (i > 0) ImGui::SameLine();
@@ -1267,6 +1330,17 @@ int main(int, char **)
                 settings.depth = p.depth;
                 settings.samples = p.samples;
                 settings.shadowSamples = p.shadowSamples;
+                if (p.width > 0)         settings.width = p.width;
+                if (p.height > 0)        settings.height = p.height;
+                if (p.snapSquare >= 0)   settings.square = (p.snapSquare != 0);
+                if (settings.square)     settings.height = settings.width;
+                if (p.useDenoise >= 0)   settings.useDenoise   = (p.useDenoise   != 0);
+                if (p.useMIS >= 0)       settings.useMIS       = (p.useMIS       != 0);
+                if (p.useRussian >= 0)   settings.useRussian   = (p.useRussian   != 0);
+                if (p.useStratified >= 0) settings.useStratified = (p.useStratified != 0);
+                if (p.useAA >= 0)        settings.useAA        = (p.useAA        != 0);
+                if (p.useAdaptive >= 0)  settings.useAdaptive  = (p.useAdaptive  != 0);
+                if (p.useOIDN >= 0)      settings.useOIDN      = (p.useOIDN      != 0);
             }
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("d=%d s=%d S=%d", p.depth, p.samples, p.shadowSamples);
