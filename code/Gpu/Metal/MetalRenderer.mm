@@ -3360,7 +3360,7 @@ namespace
         // all bounces complete, before writeback. Adds each fork ray's
         // color contribution to a per-pixel atomic-CAS accumulator
         // keyed on the fork's pixelIdx.
-        id<MTLFunction> fnWfScatterForks = [im.library newFunctionWithName:@"wf_scatter_forks"];
+        id<MTLFunction> fnWfScatterForks = [lib newFunctionWithName:@"wf_scatter_forks"];
         if (!fnWfScatterForks)
         {
             std::cerr << "MetalRenderer: MSL kernel 'wf_scatter_forks' not found"
