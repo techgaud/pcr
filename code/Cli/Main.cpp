@@ -105,6 +105,7 @@ int main(int argc, char *argv[])
     int threadgroupY = pcr::kDefaultThreadgroupY;
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
+    bool spectralFork = pcr::kDefaultSpectralFork;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -266,6 +267,14 @@ int main(int argc, char *argv[])
                  "the early A/B by ~2-3%, so this flag mostly exists for "
                  "re-measuring at different resolutions / sample counts. "
                  "Ignored when wavefront is off.");
+    options->add_flag("--spectral-fork", spectralFork,
+                 "In wavefront-spectral mode, fork into four monochromatic "
+                 "sub-paths at each dispersive glass refraction (matches "
+                 "megakernel's tracePathSpectral) instead of the default "
+                 "terminate-secondaries-and-amplify strategy. Better "
+                 "dispersion convergence on glass-heavy scenes at the cost "
+                 "of 4x SoA buffer footprint. Ignored when wavefront or "
+                 "spectral is off.");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -448,11 +457,13 @@ int main(int argc, char *argv[])
     renderer.threadgroupY = threadgroupY;
     renderer.useWavefront = useWavefront;
     renderer.wavefrontMultiSample = wavefrontMultiSample;
+    renderer.spectralFork = spectralFork;
 #else
     (void)threadgroupX;
     (void)threadgroupY;
     (void)useWavefront;
     (void)wavefrontMultiSample;
+    (void)spectralFork;
 #endif
     renderer.render(sceneData, start, outputDir);
 

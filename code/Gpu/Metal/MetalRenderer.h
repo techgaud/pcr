@@ -81,6 +81,10 @@ public:
     // = true since v1.4.2 (wavefront beat megakernel ~25% in A/B).
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
+    // Glass dispersion strategy in wavefront-spectral mode. See
+    // GpuDefaults.h for the terminate-vs-fork trade-off. Only consulted
+    // when useWavefront && useSpectral are both true; ignored otherwise.
+    bool spectralFork = pcr::kDefaultSpectralFork;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

@@ -212,7 +212,8 @@ struct Uniforms {
     int   sampleStart;
     int   sampleCount;
     int   batchEndOfAa;
-    int   _pad1, _pad2;
+    int   spectralFork;
+    int   _pad2;
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -2616,7 +2617,13 @@ namespace
         // it into per-pixel Welford). 0 otherwise. Non-adaptive
         // multi-pass and legacy path_trace ignore this field.
         int   batchEndOfAa;
-        int   _pad1, _pad2;
+        // 1 if the glass shading kernel should fork into four monochromatic
+        // sub-paths at a dispersive refraction; 0 if it should terminate
+        // secondaries and continue scalar with a 4x compensation. See
+        // GpuDefaults.h kDefaultSpectralFork for the trade-off. Only
+        // consulted in useWavefront + useSpectral mode.
+        int   spectralFork;
+        int   _pad2;
     };
     static_assert(sizeof(Uniforms) == 144,
                   "Uniforms must be 144 bytes (multiple of 16) so per-pass "
@@ -3528,6 +3535,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.writeAux         = useOIDN ? 1 : 0;
     uBase.useSpectral      = useSpectral ? 1 : 0;
     uBase.heroSamples      = std::clamp(heroSamples, 1, 4);
+    uBase.spectralFork     = spectralFork ? 1 : 0;
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
 
@@ -4212,6 +4220,13 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     if (effectiveWavefront)
         addText("WavefrontMode",
                 wavefrontMultiSample ? "multi-spp" : "1spp");
+    // Glass dispersion strategy in wavefront-spectral renders. Recorded
+    // unconditionally when wavefront+spectral both ran so A/B comparisons
+    // stay unambiguous in retrospect; for RGB / megakernel renders the
+    // setting is meaningless and we skip the key entirely.
+    if (effectiveWavefront && useSpectral)
+        addText("WavefrontDispersion",
+                spectralFork ? "fork" : "terminate");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

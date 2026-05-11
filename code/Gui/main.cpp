@@ -125,6 +125,7 @@ struct JobConfig
     // switching; CLI exposes --no-wavefront for the same.
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
+    bool spectralFork = pcr::kDefaultSpectralFork;
 };
 
 struct JobResult
@@ -293,6 +294,7 @@ struct Settings
     // the GUI radio don't lose state across launches.
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
+    bool spectralFork = pcr::kDefaultSpectralFork;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -347,6 +349,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.threadgroupY  = s.threadgroupY;
     j.useWavefront  = s.useWavefront;
     j.wavefrontMultiSample = s.wavefrontMultiSample;
+    j.spectralFork  = s.spectralFork;
     return j;
 }
 
@@ -377,6 +380,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.threadgroupY  = j.threadgroupY;
     s.useWavefront  = j.useWavefront;
     s.wavefrontMultiSample = j.wavefrontMultiSample;
+    s.spectralFork  = j.spectralFork;
 }
 
 // Returns nullptr if the job will run with its requested architecture,
@@ -525,6 +529,7 @@ static void loadSettings(Settings &s)
         s.threadgroupY  = j.value("threadgroupY",  s.threadgroupY);
         s.useWavefront  = j.value("useWavefront",  s.useWavefront);
         s.wavefrontMultiSample = j.value("wavefrontMultiSample", s.wavefrontMultiSample);
+        s.spectralFork  = j.value("spectralFork",  s.spectralFork);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -595,6 +600,7 @@ static json buildSettingsJson(const Settings &s)
     j["threadgroupY"]  = s.threadgroupY;
     j["useWavefront"]  = s.useWavefront;
     j["wavefrontMultiSample"] = s.wavefrontMultiSample;
+    j["spectralFork"]  = s.spectralFork;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -877,6 +883,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.threadgroupY  = settings.threadgroupY;
         renderer.useWavefront  = settings.useWavefront;
         renderer.wavefrontMultiSample = settings.wavefrontMultiSample;
+        renderer.spectralFork  = settings.spectralFork;
 #endif
         if (live)
         {
@@ -1756,6 +1763,35 @@ int main(int, char **)
                                   "memory bandwidth pressure may eat the "
                                   "dispatch-overhead savings, or it may "
                                   "stack on top of them.");
+
+            // Glass dispersion strategy. Only meaningful when wavefront +
+            // spectral are both on; disabled and grayed out otherwise, but
+            // the setting persists across mode flips.
+            bool glassRowActive = settings.useWavefront && settings.useSpectral;
+            ImGui::BeginDisabled(!glassRowActive);
+            ImGui::TextUnformatted("Glass:");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Terminate", !settings.spectralFork))
+                settings.spectralFork = false;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("At a dispersive refraction, kill the three "
+                                  "secondary hero wavelengths and continue the "
+                                  "hero scalar with a 4x energy compensation. "
+                                  "Cheap (1x SoA buffers, no append queue) "
+                                  "but noisier dispersive caustics since "
+                                  "post-glass paths sample one wavelength.");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Fork", settings.spectralFork))
+                settings.spectralFork = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("At a dispersive refraction, fork into four "
+                                  "monochromatic sub-paths each refracting at "
+                                  "its own wavelength's Cauchy IOR. Matches "
+                                  "megakernel's tracePathSpectral. Cleaner "
+                                  "dispersive caustics at the cost of 4x SoA "
+                                  "footprint and a variable-output append "
+                                  "queue in the glass kernel.");
+            ImGui::EndDisabled();
 
             ImGui::TextUnformatted("Threadgroup:");
             // Presets ordered by total threads. Three are below Apple's

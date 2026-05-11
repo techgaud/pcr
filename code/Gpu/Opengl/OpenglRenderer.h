@@ -80,6 +80,10 @@ public:
     // isn't planned). The Metal backend honors the field.
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
+    // Wavefront-only setting; OpenGL has no wavefront kernels. Carried
+    // here for source compatibility with the Metal backend so the GUI
+    // and CLI can set it unconditionally. Value is ignored.
+    bool spectralFork = pcr::kDefaultSpectralFork;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
