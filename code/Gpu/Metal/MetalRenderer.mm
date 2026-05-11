@@ -1479,6 +1479,132 @@ kernel void path_trace_pass_adaptive(
     // early-return above.
     output.write(float4(mean, 1.0f), uint2(pix.x, pix.y));
 }
+
+// ============================================================
+// ==== Wavefront path tracer kernels =========================
+// ============================================================
+//
+// Architecturally distinct from the megakernel path_trace_* family
+// above. The megakernel runs the WHOLE path-tracing loop for a pixel
+// in one kernel invocation (one bounce, two bounces, ..., output);
+// divergence within a SIMD group when different pixels' rays take
+// different code paths is the dominant ALU stall source.
+//
+// Wavefront splits the loop across multiple specialized kernels:
+//
+//   1. wf_generate_primary_rays  -- camera unprojection, one ray per
+//      pixel, write to RayState SoA buffers (commit #2, this one).
+//   2. wf_intersect              -- BVH traversal, one ray per thread,
+//      write hit info to HitInfo SoA buffers (commit #3).
+//   3. wf_compact_by_material    -- SIMD-group-batched scatter of
+//      hit records into per-material queues using
+//      simd_prefix_exclusive_sum() and one atomic per SIMD group
+//      (commit #4).
+//   4. wf_shade_diffuse / _mirror / _glass / _emissive -- one shading
+//      kernel per material type; each is divergence-free internally
+//      since all rays in its queue share the same material (commit
+//      #5). New bounce rays land back in the ray queue.
+//   5. Host driver loops 2 -> 3 -> 4 for `depth` bounces, then writes
+//      accumulated colors to the output texture (commit #6).
+//
+// Output should be statistically equivalent to megakernel (same rays,
+// same bounces, same math, just rebatched per material for ALU
+// coherence) but not bit-identical because the RNG seeding scheme
+// has to be redone (rays interleave through phases instead of
+// running sequentially per thread).
+//
+// Buffer-binding convention: kernel uniforms at buffer(0); RayState
+// SoA at buffers(1..16) in the order originX, originY, originZ, dirX,
+// dirY, dirZ, throughputR, throughputG, throughputB, colorR, colorG,
+// colorB, pixelIdx, rngState, bounceDepth, alive. HitInfo SoA at
+// buffers(17..23) in order matIdx, hitX, hitY, hitZ, normalX, normalY,
+// normalZ. Scene data starts at buffer(24) when kernels need it.
+// Wavefront kernels never use textures - output writeback happens
+// in the post-pipeline driver kernel.
+
+kernel void wf_generate_primary_rays(
+    constant Uniforms          &u            [[buffer(0)]],
+    device float               *originX      [[buffer(1)]],
+    device float               *originY      [[buffer(2)]],
+    device float               *originZ      [[buffer(3)]],
+    device float               *dirX         [[buffer(4)]],
+    device float               *dirY         [[buffer(5)]],
+    device float               *dirZ         [[buffer(6)]],
+    device float               *throughputR  [[buffer(7)]],
+    device float               *throughputG  [[buffer(8)]],
+    device float               *throughputB  [[buffer(9)]],
+    device float               *colorR       [[buffer(10)]],
+    device float               *colorG       [[buffer(11)]],
+    device float               *colorB       [[buffer(12)]],
+    device uint                *pixelIdx     [[buffer(13)]],
+    device uint                *rngState     [[buffer(14)]],
+    device uint                *bounceDepth  [[buffer(15)]],
+    device uint                *alive        [[buffer(16)]],
+    uint2                       gid          [[thread_position_in_grid]])
+{
+    int2 pix = int2(int(gid.x), int(gid.y));
+    if (pix.x >= u.width || pix.y >= u.height) return;
+
+    uint idx = uint(pix.y) * uint(u.width) + uint(pix.x);
+
+    // RNG seed: same scheme as the megakernel's path_trace_pass so
+    // future wavefront/megakernel A/B tests at the same (frameSeed,
+    // aaIdx, sampleStart) produce comparable noise patterns (not
+    // bit-identical because the per-ray sample loop is structurally
+    // different, but statistically equivalent).
+    uint jitterSeed = uint(pix.x) * 1973u + uint(pix.y) * 9277u
+                    + uint(u.frameSeed) * 26699u
+                    + uint(u.aaIdx) * 16127u;
+
+    // AA jitter: same sub-pixel offset across every sample-batch
+    // within a single aaIdx (depends on aaIdx + pix, not on
+    // sampleStart). Matches megakernel.
+    int aaN = max(1, u.aaSamples);
+    float2 jpix = float2(pix);
+    if (aaN > 1) {
+        jpix.x += rand(jitterSeed) - 0.5f;
+        jpix.y += rand(jitterSeed) - 0.5f;
+    }
+
+    // Camera unprojection: same math as the megakernel's primary-ray
+    // setup. NDC -> view space, focal-length scale baked into the FOV
+    // tangent, image axes are right/up but Metal output texture is
+    // top-down so the y component is flipped.
+    float aspect = float(u.width) / float(u.height);
+    float scale  = tan(u.fov * 0.5f);
+    float2 nd = (jpix * 2.0f - float2(u.width, u.height)) /
+                float2(u.width, u.height);
+    float3 dir = normalize(float3(nd.x * scale * aspect,
+                                  -nd.y * scale,
+                                  -1.0f));
+    float3 origin = float3(u.originX, u.originY, u.originZ);
+
+    // Write the RayState SoA. Each buffer index is the linear pixel
+    // index; SIMD group of 32 adjacent threads writes 32 contiguous
+    // floats (one cache line per field, perfect coalescing).
+    originX[idx]     = origin.x;
+    originY[idx]     = origin.y;
+    originZ[idx]     = origin.z;
+    dirX[idx]        = dir.x;
+    dirY[idx]        = dir.y;
+    dirZ[idx]        = dir.z;
+    throughputR[idx] = 1.0f;
+    throughputG[idx] = 1.0f;
+    throughputB[idx] = 1.0f;
+    colorR[idx]      = 0.0f;
+    colorG[idx]      = 0.0f;
+    colorB[idx]      = 0.0f;
+    pixelIdx[idx]    = idx;
+
+    // Per-ray RNG state: includes sampleStart so different sample
+    // batches use decorrelated sequences (matches megakernel). Seed
+    // gets advanced by individual rand() calls during shading later.
+    rngState[idx]    = jitterSeed
+                     + uint(u.sampleStart) * 7919u
+                     + 0x9e3779b9u;
+    bounceDepth[idx] = 0;
+    alive[idx]       = 1;
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -1865,6 +1991,13 @@ struct MetalRenderer::Impl
     id<MTLComputePipelineState> pipelinePass       = nil;
     id<MTLComputePipelineState> pipelinePassAdapt  = nil;
 
+    // Wavefront pipeline states (compiled in initMetal alongside
+    // megakernel pipelines, dispatched by the host driver when
+    // useWavefront=true). Currently only the primary-ray-generation
+    // kernel exists; intersect / shading kernels arrive in subsequent
+    // commits per the wavefront commit sequence.
+    id<MTLComputePipelineState> pipelineWfRayGen   = nil;
+
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
     // texture readback to host CPU bytes is more awkward than RGBA32F;
@@ -1978,6 +2111,28 @@ namespace
         if (!im.pipelinePassAdapt)
         {
             std::cerr << "MetalRenderer: adaptive multi-pass compute pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        // Wavefront pipelines. Currently only the primary-ray-generation
+        // kernel ships; intersect / shading / driver kernels arrive in
+        // commits #3-#6. Each kernel is independently compiled here so
+        // the pipeline list is build-time visible and missing kernels
+        // surface as a clear MSL-not-found error rather than at first
+        // dispatch.
+        id<MTLFunction> fnWfRayGen = [lib newFunctionWithName:@"wf_generate_primary_rays"];
+        if (!fnWfRayGen)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'wf_generate_primary_rays' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineWfRayGen = [im.device newComputePipelineStateWithFunction:fnWfRayGen error:&err];
+        if (!im.pipelineWfRayGen)
+        {
+            std::cerr << "MetalRenderer: wavefront primary-ray pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
