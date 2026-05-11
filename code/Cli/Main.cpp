@@ -105,7 +105,10 @@ int main(int argc, char *argv[])
     int threadgroupY = pcr::kDefaultThreadgroupY;
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
-    bool spectralFork = pcr::kDefaultSpectralFork;
+    // Default behavior is fork; the flag opts into the cheaper-but-
+    // noisier terminate strategy. CLI variable inverted from the
+    // renderer's spectralFork field for naming-matches-flag clarity.
+    bool spectralTerminate = false;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -267,14 +270,16 @@ int main(int argc, char *argv[])
                  "the early A/B by ~2-3%, so this flag mostly exists for "
                  "re-measuring at different resolutions / sample counts. "
                  "Ignored when wavefront is off.");
-    options->add_flag("--spectral-fork", spectralFork,
-                 "In wavefront-spectral mode, fork into four monochromatic "
-                 "sub-paths at each dispersive glass refraction (matches "
-                 "megakernel's tracePathSpectral) instead of the default "
-                 "terminate-secondaries-and-amplify strategy. Better "
-                 "dispersion convergence on glass-heavy scenes at the cost "
-                 "of 4x SoA buffer footprint. Ignored when wavefront or "
-                 "spectral is off.");
+    options->add_flag("--spectral-terminate", spectralTerminate,
+                 "In wavefront-spectral mode, fall back from the default "
+                 "fork-into-four-monochromatic-sub-paths strategy at a "
+                 "dispersive glass refraction to the cheaper "
+                 "terminate-secondaries-and-amplify strategy: kill the "
+                 "three secondary hero wavelengths and continue the hero "
+                 "scalar with a 4x energy compensation. 1x SoA buffer "
+                 "footprint vs fork's 4x, at the cost of noisier "
+                 "dispersive caustics. Ignored when wavefront or spectral "
+                 "is off.");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -457,13 +462,13 @@ int main(int argc, char *argv[])
     renderer.threadgroupY = threadgroupY;
     renderer.useWavefront = useWavefront;
     renderer.wavefrontMultiSample = wavefrontMultiSample;
-    renderer.spectralFork = spectralFork;
+    renderer.spectralFork = !spectralTerminate;
 #else
     (void)threadgroupX;
     (void)threadgroupY;
     (void)useWavefront;
     (void)wavefrontMultiSample;
-    (void)spectralFork;
+    (void)spectralTerminate;
 #endif
     renderer.render(sceneData, start, outputDir);
 

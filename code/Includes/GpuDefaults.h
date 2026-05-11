@@ -51,20 +51,23 @@ constexpr bool kDefaultWavefrontMultiSample = false;
 
 // When useWavefront=true AND useSpectral=true, controls how the glass
 // shading kernel handles a dispersive refraction (cauchyB > 0):
-//   false (default): terminate the three secondary hero wavelengths
-//     at the first dispersive refraction and continue the hero
-//     wavelength scalar, with a 4x energy compensation on the survivor
-//     so heroLambdasXYZ's 1/N normalization stays unbiased. Cheaper
-//     per-bounce but post-glass paths sample one wavelength instead of
-//     four, so dispersive caustics (e.g. cornell-glass) converge slower.
-//   true: fork the ray into four monochromatic sub-paths, each carrying
-//     its own wavelength's IOR and refraction direction. Matches what
-//     megakernel's tracePathSpectral does for cauchyB > 0. 4x more
-//     post-glass rays per primary ray, ~4x the SoA buffer footprint,
-//     better dispersion convergence at the cost of implementation
-//     complexity (variable-output append queue + writeback rework).
-// Default off so existing renders keep their wallclock profile until
-// the fork mode is dialed in via A/B.
-constexpr bool kDefaultSpectralFork = false;
+//   true (default since the post-A/B flip): fork the ray into four
+//     monochromatic sub-paths at the first dispersive refraction, each
+//     carrying its own wavelength's IOR and refraction direction.
+//     Matches what megakernel's tracePathSpectral does for cauchyB > 0.
+//     4x more post-glass rays per primary, ~4x the SoA buffer footprint,
+//     cleaner dispersive caustics. Was an opt-in setting until A/B
+//     against terminate showed fork winning visually on cornell-glass-
+//     class scenes; promoted to default once visual wins were
+//     confirmed.
+//   false: terminate the three secondary hero wavelengths at the first
+//     dispersive refraction and continue the hero wavelength scalar,
+//     with a 4x energy compensation on the survivor so heroLambdasXYZ's
+//     1/N normalization stays unbiased. Cheaper per-bounce, narrower
+//     working set, but noisier dispersive caustics since post-glass
+//     paths sample one wavelength instead of four. Available via the
+//     CLI's --spectral-terminate flag and the GUI's Glass radio for
+//     re-running the A/B or for low-memory environments.
+constexpr bool kDefaultSpectralFork = true;
 
 } // namespace pcr
