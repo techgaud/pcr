@@ -1562,8 +1562,13 @@ kernel void wf_generate_primary_rays(
     // setup. NDC -> view space, focal-length scale baked into the FOV
     // tangent, image axes are right/up but Metal output texture is
     // top-down so the y component is flipped.
+    // FOV is in DEGREES on the host side. Megakernel's tracePath wraps
+    // it with `tan(PI / 180.0 * 0.5 * fov)`; an earlier copy of this
+    // ray-gen forgot the degree-to-radian conversion and was producing
+    // a wildly-wide-FOV camera (the "zoomed in to a corner" wavefront
+    // output you reported). Match megakernel exactly.
     float aspect = float(u.width) / float(u.height);
-    float scale  = tan(u.fov * 0.5f);
+    float scale  = tan(PI / 180.0f * 0.5f * u.fov);
     float2 nd = (jpix * 2.0f - float2(u.width, u.height)) /
                 float2(u.width, u.height);
     float3 rayDir = normalize(float3(nd.x * scale * aspect,
