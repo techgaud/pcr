@@ -72,6 +72,38 @@ For multi-spp: `sumThisPass` is already a multi-sample sum (sampleCount > 1). Th
 
 When multi-spp wavefront becomes worth tuning. Current numbers (~2-3% win for multi-spp over 1-spp) suggest 1-spp+adaptive may be the natural daily-driver anyway, since adaptive's early-exit savings stack on top of wavefront's divergence elimination and 1-spp+adaptive has the smaller working set.
 
+## Spectral wavefront: per-wavelength dispersion forking on glass
+
+**Status:** partial. Wavefront-spectral ships with Wilkie 2014 hero
+wavelength sampling (4 wavelengths/ray) and the "terminate secondaries
+on dispersion" strategy, matching PBRT-v4 and Mitsuba 3. On a dispersive
+glass hit (`cauchyB > 0`), the kernel refracts using the hero
+wavelength's Cauchy IOR and zeroes the other three wavelengths'
+throughput so only the hero continues past the glass surface.
+
+Megakernel's `tracePathSpectral` takes a stronger approach: it forks
+four independent sub-paths at every dispersive hit, each refracting
+through its own per-wavelength IOR via `tracePathSpectralSingle`. This
+gives strictly better dispersion convergence: cornell-glass caustics
+look cleaner at the same spp because all four wavelengths complete
+their paths from the glass surface.
+
+### Why deferred
+
+Wavefront-incompatible variable output. A "fork four rays out of one"
+shading kernel would need an append-queue with dynamic length, which
+breaks the simple 1-input-slot, 1-output-slot SoA compactor. Doable but
+~3x more code and possibly slower than the terminate-secondaries
+default in non-dispersive scenes.
+
+### When to revisit
+
+If cornell-glass-style scenes become a daily-driver workflow and the
+megakernel-vs-wavefront caustic quality gap shows up in renders. The
+fix is a separate "glass dispersion path" that overflows from one
+shading queue slot into 1-4 output ray slots in the next bounce's
+RayState SoA, then proceeds with the existing per-material compaction.
+
 ## A/B test multi-level prefix-sum vs SIMD-group-batched atomic for queue compaction
 
 **Status:** wavefront ships with SIMD-group-batched atomic queue compaction (per AMD GPUOpen "Fast Compaction with mbcnt", adapted to Metal's `simd_prefix_exclusive_sum()` intrinsic). One atomic per SIMD group instead of per thread, ~32x reduction in atomic traffic. Apple's WWDC22 "Scale compute workloads across Apple GPUs" specifically flags global atomics as a bottleneck on multi-core M-series GPUs, which makes the SIMD-group-batched pattern the safe-and-simple default.
