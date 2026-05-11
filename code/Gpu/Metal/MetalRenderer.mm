@@ -2081,7 +2081,11 @@ kernel void wf_shade_glass(
     if (!entering) N = -N;
 
     int mi = matIdx[gid];
-    GpuMaterial mat = materials[mi];
+    // Reference (not a copy) so albedoAt4's `device const GpuMaterial &`
+    // overload resolves, and so the 560-byte GpuMaterial struct doesn't
+    // get spilled into a thread-local register block. Reads of mat.ior,
+    // mat.cauchyB, etc. stay as device loads either way.
+    device const GpuMaterial &mat = materials[mi];
     uint seed = rngState[gid];
 
     // Refraction. RGB mode uses the base IOR. Spectral uses the Cauchy
