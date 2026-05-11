@@ -213,7 +213,12 @@ struct Uniforms {
     int   sampleCount;
     int   batchEndOfAa;
     int   spectralFork;
-    int   _pad2;
+    // Number of "natural" ray slots per pass (pixelCount * sampleCount).
+    // In fork mode the SoA buffers are allocated at 4*baseRayCount and
+    // fork sub-rays live at slot indices >= baseRayCount; the glass
+    // kernel atomically claims slots starting at this offset. Equal to
+    // bufferSlots in non-fork mode.
+    int   baseRayCount;
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -2058,6 +2063,8 @@ kernel void wf_shade_glass(
     device packed_float3                       *origin             [[buffer(1)]],
     device packed_float3                       *dir                [[buffer(2)]],
     device packed_float3                       *throughput         [[buffer(3)]],
+    device packed_float3                       *color              [[buffer(4)]],
+    device uint                                *pixelIdx           [[buffer(5)]],
     device uint                                *rngState           [[buffer(6)]],
     device uint                                *bounceDepth        [[buffer(7)]],
     device uint                                *alive              [[buffer(8)]],
@@ -2067,8 +2074,9 @@ kernel void wf_shade_glass(
     device const GpuMaterial                   *materials          [[buffer(14)]],
     device const uint                          *queue              [[buffer(24)]],
     constant uint                              &queueLen           [[buffer(25)]],
-    device const float4                        *lambdas            [[buffer(27)]],
+    device float4                              *lambdas            [[buffer(27)]],
     device float4                              *spectralThroughput [[buffer(28)]],
+    device atomic_uint                         *rayCountAtomic     [[buffer(29)]],
     uint                                        tid                [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
@@ -2137,7 +2145,81 @@ kernel void wf_shade_glass(
             bool firstTermination = (spThru.y != 0.0f ||
                                      spThru.z != 0.0f ||
                                      spThru.w != 0.0f);
-            if (firstTermination) spThru.x *= 4.0f;
+            if (firstTermination) {
+                if (u.spectralFork != 0) {
+                    // FORK PATH. Claim three slots above the base ray
+                    // range and write one monochromatic sub-ray per
+                    // secondary wavelength. Each sub-ray refracts at
+                    // its own Cauchy IOR via an independent
+                    // dielectricBounce call (might reflect or refract
+                    // per its own Fresnel coin flip, matching what
+                    // megakernel does inside its per-wavelength fork
+                    // loop), gets a decorrelated RNG seed, and inherits
+                    // its current per-wavelength throughput from
+                    // spThru.y/z/w captured before the zeroing below.
+                    //
+                    // Commit 3: keep the primary's *= 4 amplification.
+                    // Writeback still gathers only the base ray range
+                    // here, so the primary needs the boost to match
+                    // terminate-mode brightness while we smoke-test
+                    // the fork machinery. Commit 4 will gather forks
+                    // in writeback and drop the *= 4.
+                    uint slotBase = atomic_fetch_add_explicit(
+                        rayCountAtomic, 3u, memory_order_relaxed);
+                    uint forkBase = uint(u.baseRayCount) + slotBase;
+                    uint parentPixel = pixelIdx[gid];
+                    uint forkAlive   = (depth >= uint(u.depth)) ? 0u : 1u;
+
+                    float ior_y = cauchyIor(mat.ior, mat.cauchyB, lams.y);
+                    DielectricOut by = dielectricBounce(rd, N, h, entering, ior_y, rand(seed));
+                    {
+                        uint slot = forkBase + 0u;
+                        origin[slot]             = float3(by.origin);
+                        dir[slot]                = float3(by.dir);
+                        throughput[slot]         = float3(1.0f);
+                        color[slot]              = float3(0.0f);
+                        pixelIdx[slot]           = parentPixel;
+                        rngState[slot]           = seed ^ 0xA5A5A5A5u;
+                        bounceDepth[slot]        = depth;
+                        alive[slot]              = forkAlive;
+                        lambdas[slot]            = float4(lams.y, 0.0f, 0.0f, 0.0f);
+                        spectralThroughput[slot] = float4(spThru.y, 0.0f, 0.0f, 0.0f);
+                    }
+
+                    float ior_z = cauchyIor(mat.ior, mat.cauchyB, lams.z);
+                    DielectricOut bz = dielectricBounce(rd, N, h, entering, ior_z, rand(seed));
+                    {
+                        uint slot = forkBase + 1u;
+                        origin[slot]             = float3(bz.origin);
+                        dir[slot]                = float3(bz.dir);
+                        throughput[slot]         = float3(1.0f);
+                        color[slot]              = float3(0.0f);
+                        pixelIdx[slot]           = parentPixel;
+                        rngState[slot]           = seed ^ 0x5A5A5A5Au;
+                        bounceDepth[slot]        = depth;
+                        alive[slot]              = forkAlive;
+                        lambdas[slot]            = float4(lams.z, 0.0f, 0.0f, 0.0f);
+                        spectralThroughput[slot] = float4(spThru.z, 0.0f, 0.0f, 0.0f);
+                    }
+
+                    float ior_w = cauchyIor(mat.ior, mat.cauchyB, lams.w);
+                    DielectricOut bw = dielectricBounce(rd, N, h, entering, ior_w, rand(seed));
+                    {
+                        uint slot = forkBase + 2u;
+                        origin[slot]             = float3(bw.origin);
+                        dir[slot]                = float3(bw.dir);
+                        throughput[slot]         = float3(1.0f);
+                        color[slot]              = float3(0.0f);
+                        pixelIdx[slot]           = parentPixel;
+                        rngState[slot]           = seed ^ 0x3C3C3C3Cu;
+                        bounceDepth[slot]        = depth;
+                        alive[slot]              = forkAlive;
+                        lambdas[slot]            = float4(lams.w, 0.0f, 0.0f, 0.0f);
+                        spectralThroughput[slot] = float4(spThru.w, 0.0f, 0.0f, 0.0f);
+                    }
+                }
+                spThru.x *= 4.0f;
+            }
             spThru.y = 0.0f;
             spThru.z = 0.0f;
             spThru.w = 0.0f;
@@ -2623,7 +2705,10 @@ namespace
         // GpuDefaults.h kDefaultSpectralFork for the trade-off. Only
         // consulted in useWavefront + useSpectral mode.
         int   spectralFork;
-        int   _pad2;
+        // pixelCount * samplesPerPass. Glass-fork code computes fork
+        // slot indices as baseRayCount + atomic_offset, since fork
+        // sub-rays live above the base ray range in the SoA buffers.
+        int   baseRayCount;
     };
     static_assert(sizeof(Uniforms) == 144,
                   "Uniforms must be 144 bytes (multiple of 16) so per-pass "
@@ -2759,6 +2844,16 @@ namespace
         id<MTLBuffer> lambdas;            // float4
         id<MTLBuffer> spectralThroughput; // float4
 
+        // Atomic uint counter that the glass kernel atomic-increments
+        // when it forks at a dispersive refraction (spectralFork mode).
+        // Subsequent kernels compute "live ray count" as
+        // baseRayCount + atomic_load(rayCountAtomic). Zeroed by the
+        // host (blit fillBuffer) before each pipeline pass. Allocated
+        // unconditionally so kernels can bind it without per-mode
+        // branching in the dispatch driver; in terminate mode it stays
+        // at zero and is harmless.
+        id<MTLBuffer> rayCountAtomic;
+
         NSUInteger rayCount = 0;
         bool valid = false;
     };
@@ -2826,13 +2921,18 @@ namespace
         wf.lambdas            = alloc(float4Bytes);
         wf.spectralThroughput = alloc(float4Bytes);
 
+        // Atomic counter for spectralFork mode. Single uint, zeroed
+        // by the host per pass.
+        wf.rayCountAtomic = alloc(sizeof(uint32_t));
+
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
                     wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
                     wf.queueCounters && wf.pixelWelford &&
-                    wf.lambdas && wf.spectralThroughput);
+                    wf.lambdas && wf.spectralThroughput &&
+                    wf.rayCountAtomic);
         return wf;
     }
 
@@ -3632,6 +3732,12 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         tilesY = 1;
     }
 
+    // baseRayCount is needed both in the wavefront fork-mode allocator
+    // (to size the 4x SoA expansion) and in the glass kernel (to offset
+    // fork-slot indices off the base ray range). Compute it once here
+    // so it can flow into both the uniforms struct and the allocator.
+    uBase.baseRayCount = (int)((long long)_width * (long long)_height * (long long)samplesPerPass);
+
     int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
     int aaN = std::max(1, aaSamples);
     int totalPasses = aaN * passesPerAa * tilesY;
@@ -3823,6 +3929,19 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
 
             id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
 
+            // Reset the spectralFork atomic counter at the start of
+            // every pipeline pass. Forks claimed during this pass live
+            // at slots [baseRayCount, baseRayCount + counter); resetting
+            // means subsequent passes start clean. In terminate mode the
+            // counter stays at zero throughout and the fill is a no-op.
+            {
+                id<MTLBlitCommandEncoder> blit = [cmdbuf blitCommandEncoder];
+                [blit fillBuffer:wfBufs.rayCountAtomic
+                           range:NSMakeRange(0, sizeof(uint32_t))
+                           value:0];
+                [blit endEncoding];
+            }
+
             // ---- Ray-gen ----
             // Buffer layout (packed_float3 SoA, MSL hard-caps buffer
             // index at 30):
@@ -3834,7 +3953,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             //   26 pixelWelford (PCRWelfordState[]);
             //   27 lambdas (float4, hero wavelengths, spectral-only);
             //   28 spectralThroughput (float4, per-wavelength scalar
-            //      throughput, spectral-only).
+            //      throughput, spectral-only);
+            //   29 rayCountAtomic (atomic uint, spectral-fork-only).
             // Dispatched 1D over rayCount (= pixelCount * samplesPerPass)
             // so multi-sample-per-pass mode lights up one ray per pixel
             // per sample concurrently.
@@ -3948,6 +4068,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
                     [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
                     [enc setBuffer:wfBufs.spectralThroughput offset:0 atIndex:28];
+                    // pixelIdx and rayCountAtomic only the glass kernel
+                    // actually declares (for spectralFork). Other shading
+                    // kernels silently ignore the extra bindings.
+                    [enc setBuffer:wfBufs.pixelIdx           offset:0 atIndex:5];
+                    [enc setBuffer:wfBufs.rayCountAtomic     offset:0 atIndex:29];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 };
