@@ -1605,6 +1605,94 @@ kernel void wf_generate_primary_rays(
     bounceDepth[idx] = 0;
     alive[idx]       = 1;
 }
+
+// Wavefront intersect kernel. Reads each ray's origin/direction from the
+// RayState SoA, runs the existing sceneIntersect helper (which checks
+// spheres, planes, and the triangle BVH in a fixed priority order), and
+// writes the resulting matIdx + hit position + surface normal into the
+// HitInfo SoA. Dead rays (alive == 0) skip the work and get matIdx = -1
+// written as sentinel so subsequent compaction sees them as "no hit /
+// terminated"; rays that intersected nothing also get matIdx = -1 and
+// will terminate at compaction time.
+//
+// Buffer-binding layout (per the convention established by ray-gen):
+//   buffer(0)         = uniforms
+//   buffer(1..6)      = origin xyz, dir xyz (read)
+//   buffer(16)        = alive (read)
+//   buffer(17..23)    = matIdx + hitPos xyz + normal xyz (write)
+//   buffer(24..30)    = scene buffers (read; spheres, planes, materials,
+//                       triangles, bvh, lights, lightTris)
+// The other RayState fields (throughput, color, pixelIdx, rngState,
+// bounceDepth) aren't accessed here and intentionally aren't bound.
+//
+// Dispatch geometry: 1D over the linear ray-buffer length
+// (width * height). Threadgroup size is the same threadgroup knob from
+// commit-184a7cf (configurable via GUI debug panel / CLI --threadgroup-x
+// --threadgroup-y, default 8x8 = 64 threads). The 1D dispatch uses x =
+// threadgroupX * threadgroupY, y = 1, z = 1; the kernel reads
+// thread_position_in_grid as a uint and bounds-checks against the
+// ray count.
+
+kernel void wf_intersect(
+    constant Uniforms                          &u            [[buffer(0)]],
+    device const float                         *originX      [[buffer(1)]],
+    device const float                         *originY      [[buffer(2)]],
+    device const float                         *originZ      [[buffer(3)]],
+    device const float                         *dirX         [[buffer(4)]],
+    device const float                         *dirY         [[buffer(5)]],
+    device const float                         *dirZ         [[buffer(6)]],
+    device const uint                          *alive        [[buffer(16)]],
+    device int                                 *matIdxOut    [[buffer(17)]],
+    device float                               *hitX         [[buffer(18)]],
+    device float                               *hitY         [[buffer(19)]],
+    device float                               *hitZ         [[buffer(20)]],
+    device float                               *normalX      [[buffer(21)]],
+    device float                               *normalY      [[buffer(22)]],
+    device float                               *normalZ      [[buffer(23)]],
+    device const GpuSphere                     *spheres      [[buffer(24)]],
+    device const GpuPlane                      *planes       [[buffer(25)]],
+    device const GpuMaterial                   *materials    [[buffer(26)]],
+    device const GpuTriangle                   *triangles    [[buffer(27)]],
+    device const GpuBvhNode                    *bvhNodes     [[buffer(28)]],
+    device const GpuLight                      *lights       [[buffer(29)]],
+    device const GpuLightTriangle              *lightTris    [[buffer(30)]],
+    uint                                        gid          [[thread_position_in_grid]])
+{
+    uint rayCount = uint(u.width) * uint(u.height);
+    if (gid >= rayCount) return;
+
+    // Dead-ray skip. Writing -1 lets the compaction kernel treat the
+    // slot as "terminated" without needing a separate alive check on
+    // the read side.
+    if (alive[gid] == 0u) {
+        matIdxOut[gid] = -1;
+        return;
+    }
+
+    float3 ro = float3(originX[gid], originY[gid], originZ[gid]);
+    float3 rd = float3(dirX[gid],    dirY[gid],    dirZ[gid]);
+
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
+                lights, lightTris };
+
+    float3 hit, N;
+    int matIdx;
+    if (sceneIntersect(S, ro, rd, hit, N, matIdx)) {
+        matIdxOut[gid] = matIdx;
+        hitX[gid]      = hit.x;
+        hitY[gid]      = hit.y;
+        hitZ[gid]      = hit.z;
+        normalX[gid]   = N.x;
+        normalY[gid]   = N.y;
+        normalZ[gid]   = N.z;
+    } else {
+        // Ray escaped (no hit). matIdx = -1 sentinel; compaction sees
+        // this as "terminate" and the ray won't appear in any shading
+        // queue. Its accumulated color stays at whatever the previous
+        // bounce left.
+        matIdxOut[gid] = -1;
+    }
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -1996,7 +2084,8 @@ struct MetalRenderer::Impl
     // useWavefront=true). Currently only the primary-ray-generation
     // kernel exists; intersect / shading kernels arrive in subsequent
     // commits per the wavefront commit sequence.
-    id<MTLComputePipelineState> pipelineWfRayGen   = nil;
+    id<MTLComputePipelineState> pipelineWfRayGen     = nil;
+    id<MTLComputePipelineState> pipelineWfIntersect  = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -2133,6 +2222,22 @@ namespace
         if (!im.pipelineWfRayGen)
         {
             std::cerr << "MetalRenderer: wavefront primary-ray pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        id<MTLFunction> fnWfIntersect = [lib newFunctionWithName:@"wf_intersect"];
+        if (!fnWfIntersect)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'wf_intersect' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineWfIntersect = [im.device newComputePipelineStateWithFunction:fnWfIntersect error:&err];
+        if (!im.pipelineWfIntersect)
+        {
+            std::cerr << "MetalRenderer: wavefront intersect pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
