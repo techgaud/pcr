@@ -2053,20 +2053,22 @@ kernel void wf_shade_mirror(
 // material branch in tracePath.
 
 kernel void wf_shade_glass(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device packed_float3                       *origin        [[buffer(1)]],
-    device packed_float3                       *dir           [[buffer(2)]],
-    device packed_float3                       *throughput    [[buffer(3)]],
-    device uint                                *rngState      [[buffer(6)]],
-    device uint                                *bounceDepth   [[buffer(7)]],
-    device uint                                *alive         [[buffer(8)]],
-    device const int                           *matIdx        [[buffer(9)]],
-    device const packed_float3                 *hit           [[buffer(10)]],
-    device const packed_float3                 *normalIn      [[buffer(11)]],
-    device const GpuMaterial                   *materials     [[buffer(14)]],
-    device const uint                          *queue         [[buffer(24)]],
-    constant uint                              &queueLen      [[buffer(25)]],
-    uint                                        tid           [[thread_position_in_grid]])
+    constant Uniforms                          &u                  [[buffer(0)]],
+    device packed_float3                       *origin             [[buffer(1)]],
+    device packed_float3                       *dir                [[buffer(2)]],
+    device packed_float3                       *throughput         [[buffer(3)]],
+    device uint                                *rngState           [[buffer(6)]],
+    device uint                                *bounceDepth        [[buffer(7)]],
+    device uint                                *alive              [[buffer(8)]],
+    device const int                           *matIdx             [[buffer(9)]],
+    device const packed_float3                 *hit                [[buffer(10)]],
+    device const packed_float3                 *normalIn           [[buffer(11)]],
+    device const GpuMaterial                   *materials          [[buffer(14)]],
+    device const uint                          *queue              [[buffer(24)]],
+    constant uint                              &queueLen           [[buffer(25)]],
+    device const float4                        *lambdas            [[buffer(27)]],
+    device float4                              *spectralThroughput [[buffer(28)]],
+    uint                                        tid                [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
@@ -2080,25 +2082,57 @@ kernel void wf_shade_glass(
 
     int mi = matIdx[gid];
     GpuMaterial mat = materials[mi];
-    float3 albedo = mat.albedo.rgb;
-    float3 t = throughput[gid];
     uint seed = rngState[gid];
 
-    DielectricOut b = dielectricBounce(rd, N, h, entering, mat.ior, rand(seed));
-    t *= albedo;
+    // Refraction. RGB mode uses the base IOR. Spectral uses the Cauchy
+    // IOR at the hero wavelength (lambdas.x), and on a dispersive
+    // material (cauchyB > 0) the secondaries (lambdas.y/z/w) have their
+    // throughput zeroed -- only the hero wavelength carries radiance
+    // past this glass hit. This is "terminate secondaries on dispersion"
+    // from Wilkie 2014, matching what PBRT-v4 and Mitsuba 3 do for hero
+    // wavelength sampling. Megakernel's tracePathSpectral instead forks
+    // four independent sub-paths per glass hit, which gives strictly
+    // better dispersion convergence at the cost of wavefront-incompatible
+    // variable-output ray generation. Cornell-glass caustics will look
+    // a touch cleaner in megakernel hero=4 at the same spp for that
+    // reason; wavefront recovers by sampling more frames.
+    float refractIor = mat.ior;
+    if (u.useSpectral != 0 && mat.cauchyB != 0.0f) {
+        refractIor = cauchyIor(mat.ior, mat.cauchyB, lambdas[gid].x);
+    }
+    DielectricOut b = dielectricBounce(rd, N, h, entering, refractIor, rand(seed));
 
     uint depth = bounceDepth[gid] + 1u;
     bool alive_after = true;
-    if (u.useRussian != 0 && depth >= 2u) {
-        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
-        if (rand(seed) > p) alive_after = false;
-        else t /= p;
+    if (u.useSpectral != 0) {
+        float4 lams      = lambdas[gid];
+        float4 albedoLam = albedoAt4(mat, lams);
+        float4 spThru    = spectralThroughput[gid] * albedoLam;
+        if (mat.cauchyB != 0.0f) {
+            spThru.y = 0.0f;
+            spThru.z = 0.0f;
+            spThru.w = 0.0f;
+        }
+        if (u.useRussian != 0 && depth >= 2u) {
+            float p = clamp(albedoLam.x, 0.05f, 0.95f);
+            if (rand(seed) > p) alive_after = false;
+            else spThru /= p;
+        }
+        spectralThroughput[gid] = spThru;
+    } else {
+        float3 albedo = mat.albedo.rgb;
+        float3 t      = throughput[gid] * albedo;
+        if (u.useRussian != 0 && depth >= 2u) {
+            float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
+            if (rand(seed) > p) alive_after = false;
+            else t /= p;
+        }
+        throughput[gid] = t;
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
     origin[gid]      = b.origin;
     dir[gid]         = b.dir;
-    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
@@ -2118,27 +2152,29 @@ kernel void wf_shade_glass(
 //      cosTheta in the throughput update.)
 
 kernel void wf_shade_diffuse(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device packed_float3                       *origin        [[buffer(1)]],
-    device packed_float3                       *dir           [[buffer(2)]],
-    device packed_float3                       *throughput    [[buffer(3)]],
-    device packed_float3                       *color         [[buffer(4)]],
-    device uint                                *rngState      [[buffer(6)]],
-    device uint                                *bounceDepth   [[buffer(7)]],
-    device uint                                *alive         [[buffer(8)]],
-    device const int                           *matIdx        [[buffer(9)]],
-    device const packed_float3                 *hit           [[buffer(10)]],
-    device const packed_float3                 *normalIn      [[buffer(11)]],
-    device const GpuSphere                     *spheres       [[buffer(12)]],
-    device const GpuPlane                      *planes        [[buffer(13)]],
-    device const GpuMaterial                   *materials     [[buffer(14)]],
-    device const GpuTriangle                   *triangles     [[buffer(15)]],
-    device const GpuBvhNode                    *bvhNodes      [[buffer(16)]],
-    device const GpuLight                      *lights        [[buffer(17)]],
-    device const GpuLightTriangle              *lightTris     [[buffer(18)]],
-    device const uint                          *queue         [[buffer(24)]],
-    constant uint                              &queueLen      [[buffer(25)]],
-    uint                                        tid           [[thread_position_in_grid]])
+    constant Uniforms                          &u                  [[buffer(0)]],
+    device packed_float3                       *origin             [[buffer(1)]],
+    device packed_float3                       *dir                [[buffer(2)]],
+    device packed_float3                       *throughput         [[buffer(3)]],
+    device packed_float3                       *color              [[buffer(4)]],
+    device uint                                *rngState           [[buffer(6)]],
+    device uint                                *bounceDepth        [[buffer(7)]],
+    device uint                                *alive              [[buffer(8)]],
+    device const int                           *matIdx             [[buffer(9)]],
+    device const packed_float3                 *hit                [[buffer(10)]],
+    device const packed_float3                 *normalIn           [[buffer(11)]],
+    device const GpuSphere                     *spheres            [[buffer(12)]],
+    device const GpuPlane                      *planes             [[buffer(13)]],
+    device const GpuMaterial                   *materials          [[buffer(14)]],
+    device const GpuTriangle                   *triangles          [[buffer(15)]],
+    device const GpuBvhNode                    *bvhNodes           [[buffer(16)]],
+    device const GpuLight                      *lights             [[buffer(17)]],
+    device const GpuLightTriangle              *lightTris          [[buffer(18)]],
+    device const uint                          *queue              [[buffer(24)]],
+    constant uint                              &queueLen           [[buffer(25)]],
+    device const float4                        *lambdas            [[buffer(27)]],
+    device float4                              *spectralThroughput [[buffer(28)]],
+    uint                                        tid                [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
@@ -2151,15 +2187,28 @@ kernel void wf_shade_diffuse(
     if (!entering) N = -N;
 
     int mi = matIdx[gid];
-    float3 albedo = materials[mi].albedo.rgb;
-    float3 t = throughput[gid];
     uint seed = rngState[gid];
 
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
                 lights, lightTris };
 
+    // Cached per-wavelength albedo for spectral mode. Used for both
+    // NEE BSDF terms and the indirect throughput update so we only
+    // pay the four albedoAt() lookups once per shading.
+    float4 lams      = (u.useSpectral != 0) ? lambdas[gid] : float4(0.0f);
+    float4 albedoLam = (u.useSpectral != 0) ? albedoAt4(materials[mi], lams)
+                                            : float4(0.0f);
+    float3 albedo    = materials[mi].albedo.rgb;
+    float3 t         = throughput[gid];
+    float4 spThru    = (u.useSpectral != 0) ? spectralThroughput[gid] : float4(0.0f);
+
     // Direct lighting via NEE: average u.shadowSamples shadow rays.
-    float3 directLo = float3(0.0f);
+    // BSDF kernel and emit term are per-wavelength in spectral mode;
+    // the geometry term (cosTheta, cosLight, G) is wavelength-
+    // independent and shared. MIS weight is also wavelength-
+    // independent (depends only on geometry).
+    float3 directLoRGB  = float3(0.0f);
+    float4 directLoSpec = float4(0.0f);
     if (u.totalLightArea > 0.0f) {
         for (int s = 0; s < u.shadowSamples; s++) {
             float3 sampleP, sampleN, sampleEmissive;
@@ -2187,29 +2236,67 @@ kernel void wf_shade_diffuse(
             if (!occluded) {
                 float cosLight = max(0.0f, dot(sampleN, -wi));
                 float G = (cosTheta * cosLight) / lightDist2;
-                float3 directContrib = (albedo / PI) * sampleEmissive * G * u.totalLightArea;
+                float misWeight = 1.0f;
                 if (u.useMIS != 0 && cosLight > 1e-6f) {
                     float pdfLight = lightDist2 / (cosLight * u.totalLightArea);
                     float pdfBrdf  = cosTheta / PI;
-                    float w = (pdfLight * pdfLight) /
-                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
-                    directContrib *= w;
+                    misWeight = (pdfLight * pdfLight) /
+                                (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
                 }
-                directLo += directContrib;
+                if (u.useSpectral != 0) {
+                    // Per-wavelength emit term. If the light's material
+                    // has a spectrum, read it; otherwise fall back to
+                    // luminance-weighted RGB (graybody) as megakernel
+                    // does in tracePathSpectral.
+                    float4 emitLam;
+                    if (sampleMatIdx >= 0) {
+                        emitLam = emissiveAt4(materials[sampleMatIdx], lams);
+                    } else {
+                        float emitL0 = sampleEmissive.x * 0.30f
+                                     + sampleEmissive.y * 0.59f
+                                     + sampleEmissive.z * 0.11f;
+                        emitLam = float4(emitL0);
+                    }
+                    directLoSpec += (albedoLam / PI) * emitLam * G
+                                  * u.totalLightArea * misWeight;
+                } else {
+                    directLoRGB += (albedo / PI) * sampleEmissive * G
+                                 * u.totalLightArea * misWeight;
+                }
             }
         }
-        directLo /= float(u.shadowSamples);
+        float invShadow = 1.0f / float(u.shadowSamples);
+        directLoRGB  *= invShadow;
+        directLoSpec *= invShadow;
     }
-    // Accumulate direct lighting into the color buffer.
-    color[gid] = float3(color[gid]) + t * directLo;
+
+    // Accumulate direct lighting into the color buffer. Spectral mode
+    // collapses the float4 per-wavelength radiance into XYZ via the
+    // Wilkie hero normalization, matching what megakernel's hero=4
+    // does for the same (lambdas, perWavelengthRadiance) tuple.
+    if (u.useSpectral != 0) {
+        float4 specRad = spThru * directLoSpec;
+        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, specRad);
+    } else {
+        color[gid] = float3(color[gid]) + t * directLoRGB;
+    }
 
     // Russian roulette: same conditions as megakernel (after bounce 0).
+    // RR survival probability uses max(albedo) for RGB and albedoLam.x
+    // for spectral (hero wavelength), matching megakernel.
     uint depth = bounceDepth[gid] + 1u;
     bool alive_after = true;
     if (u.useRussian != 0 && depth >= 2u) {
-        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
-        if (rand(seed) > p) alive_after = false;
-        else t /= p;
+        float p;
+        if (u.useSpectral != 0) p = clamp(albedoLam.x, 0.05f, 0.95f);
+        else                    p = clamp(max(max(albedo.r, albedo.g), albedo.b),
+                                          0.05f, 0.95f);
+        if (rand(seed) > p) {
+            alive_after = false;
+        } else {
+            if (u.useSpectral != 0) spThru /= p;
+            else                    t      /= p;
+        }
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
@@ -2217,11 +2304,15 @@ kernel void wf_shade_diffuse(
     // supported in wavefront v1.
     float3 newDir = sampleHemisphere(N, seed);
     float3 newOrigin = h + N * 1e-3f;
-    t *= albedo;
+
+    if (u.useSpectral != 0) {
+        spectralThroughput[gid] = spThru * albedoLam;
+    } else {
+        throughput[gid] = t * albedo;
+    }
 
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
-    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
