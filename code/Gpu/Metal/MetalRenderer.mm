@@ -2105,6 +2105,11 @@ kernel void wf_shade_glass(
         refractIor = cauchyIor(mat.ior, mat.cauchyB, lambdas[gid].x);
     }
     DielectricOut b = dielectricBounce(rd, N, h, entering, refractIor, rand(seed));
+    // dielectricBounce nudges origin +N on reflection and -N on
+    // refraction. Reflection direction is wavelength-independent, so
+    // only a refraction event triggers dispersion termination of the
+    // spectral secondaries.
+    bool wasRefraction = (dot(float3(b.origin) - h, N) < 0.0f);
 
     uint depth = bounceDepth[gid] + 1u;
     bool alive_after = true;
@@ -2112,7 +2117,26 @@ kernel void wf_shade_glass(
         float4 lams      = lambdas[gid];
         float4 albedoLam = albedoAt4(mat, lams);
         float4 spThru    = spectralThroughput[gid] * albedoLam;
-        if (mat.cauchyB != 0.0f) {
+        if (mat.cauchyB != 0.0f && wasRefraction) {
+            // First refraction-based termination on this path: the
+            // hero wavelength now represents 1/N of the spectral
+            // integral that previously had all N=4 hero samples
+            // contributing. heroLambdasXYZ keeps applying its 1/N
+            // (= 0.25) normalization across all four lanes, so a
+            // surviving lane with the original throughput would only
+            // contribute 1/N of the radiance the path "should" carry.
+            // Multiply the survivor by N=4 to keep the estimator
+            // unbiased -- this is the energy compensation that PBRT-v4
+            // applies in SampledWavelengths::TerminateSecondary.
+            //
+            // Gate on "any secondary still alive" so a second
+            // dispersive refraction on an already-terminated path
+            // doesn't double-amplify. Once secondaries are 0, there's
+            // nothing more to compensate for.
+            bool firstTermination = (spThru.y != 0.0f ||
+                                     spThru.z != 0.0f ||
+                                     spThru.w != 0.0f);
+            if (firstTermination) spThru.x *= 4.0f;
             spThru.y = 0.0f;
             spThru.z = 0.0f;
             spThru.w = 0.0f;
