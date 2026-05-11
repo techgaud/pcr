@@ -2458,8 +2458,10 @@ namespace
     //
     // Sizing per ray: 16 float fields + 4 uint fields = 80 bytes ray state
     // + 7 float fields + 1 int field = 32 bytes hit info = 112 bytes/ray.
-    // 1080^2 = 132 MB; 4K = 1.87 GB; 8K = 7.5 GB. M1 Ultra's 64 GB
-    // unified memory comfortable up through 8K.
+    // Spectral mode adds 8 more floats per ray (lambdas + spectralThroughput,
+    // two float4 buffers) for a total of 144 bytes/ray. 1080^2 = 132 MB
+    // RGB, 168 MB spectral; 4K = 1.87 GB / 2.4 GB; 8K = 7.5 GB / 9.6 GB.
+    // M1 Ultra's 64 GB unified memory comfortable up through 8K either way.
     //
     // These structs are populated by allocateWavefrontBuffers() and live
     // for the duration of a single render() call. Buffers self-release
@@ -2513,6 +2515,27 @@ namespace
         // in queue<t>; the shading-kernel dispatch reads this to size
         // its grid.
         id<MTLBuffer> queueCounters;
+
+        // Spectral-mode-only ray state. The wavefront shading kernels
+        // use Wilkie 2014 hero wavelength sampling with N=4 stratified
+        // wavelengths per ray (same scheme as megakernel hero=4). On a
+        // dispersive glass hit, the kernel terminates secondaries by
+        // zeroing spectralThroughput.yzw and lets lambdas.x continue
+        // alone (PBRT-v4 / Mitsuba 3 convention). Both buffers are
+        // allocated unconditionally so the kernels can declare them as
+        // bound parameters; in RGB mode they're dead memory.
+        //   lambdas:            float4 per ray (16 B). The four hero
+        //                       wavelengths assigned at ray-gen.
+        //   spectralThroughput: float4 per ray (16 B). Per-wavelength
+        //                       scalar throughput, replaces the
+        //                       packed_float3 throughput buffer in
+        //                       spectral mode. RGB mode keeps using
+        //                       the packed_float3 throughput; the two
+        //                       are mutually exclusive at any given
+        //                       render. Cost ~35 MB at 1080^2, ~537 MB
+        //                       at 4K. Acceptable.
+        id<MTLBuffer> lambdas;            // float4
+        id<MTLBuffer> spectralThroughput; // float4
 
         NSUInteger rayCount = 0;
         bool valid = false;
@@ -2572,12 +2595,22 @@ namespace
         // so it's dead memory in non-adaptive renders.
         wf.pixelWelford = alloc(pixelCount * 48);  // 48 = sizeof(PCRWelfordState)
 
+        // Spectral-mode-only ray state (lambdas + spectralThroughput).
+        // Always allocated so the kernels can declare these as bound
+        // parameters and the dispatch driver can bind them
+        // unconditionally; the kernel signatures branch on u.useSpectral
+        // before reading. Each is float4 = 16 B per ray.
+        const size_t float4Bytes = rayCount * 4 * sizeof(float);
+        wf.lambdas            = alloc(float4Bytes);
+        wf.spectralThroughput = alloc(float4Bytes);
+
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
                     wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
-                    wf.queueCounters && wf.pixelWelford);
+                    wf.queueCounters && wf.pixelWelford &&
+                    wf.lambdas && wf.spectralThroughput);
         return wf;
     }
 
