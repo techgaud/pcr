@@ -1599,9 +1599,8 @@ int main(int, char **)
         // renderer runs (not what it computes). Gated behind the Debug-
         // mode toggle because the day-to-day defaults are A/B-locked and
         // the selectors only matter when re-running A/Bs or testing new
-        // architectures. Currently houses the threadgroup-shape preset
-        // row; the megakernel/wavefront radio joins this section once
-        // the wavefront kernels ship.
+        // architectures. Houses both the megakernel/wavefront radio and
+        // the threadgroup-shape preset row.
         //
         // Metal backend only - OpenGL bakes local_size into the GLSL
         // string and ignores these fields. Read ThreadgroupX/Y and
@@ -1610,6 +1609,35 @@ int main(int, char **)
         if (settings.debugMode)
         {
             ImGui::SeparatorText("Architecture (debug)");
+
+            // Backend / dispatch architecture radio. Same radio-button
+            // style as the Mode section's Reinhard/ACES + RGB/Spectral.
+            // megakernel is the proven default; wavefront ships as of
+            // v1.4.2 but adaptive sampling isn't supported in wavefront
+            // mode (renderInternal falls back to megakernel with a
+            // stderr warning when useWavefront + useAdaptive collide).
+            ImGui::TextUnformatted("Backend:");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Megakernel", !settings.useWavefront))
+                settings.useWavefront = false;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Single MSL kernel runs the full path-"
+                                  "tracing loop per pixel (one bounce, two, "
+                                  "..., output). The v1.4.0+ default; well-"
+                                  "tuned, supports adaptive sampling.");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Wavefront", settings.useWavefront))
+                settings.useWavefront = true;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Rays split across multiple specialized "
+                                  "kernels per material type (ray-gen, "
+                                  "intersect, compact, shade-by-material x4, "
+                                  "writeback). Eliminates intra-SIMD "
+                                  "divergence at the cost of extra dispatch "
+                                  "overhead. Doesn't support adaptive yet "
+                                  "(falls back to megakernel if --adaptive "
+                                  "is also on).");
+
             ImGui::TextUnformatted("Threadgroup:");
             // Presets ordered by total threads. Three are below Apple's
             // SIMD width of 32 (2x2, 4x4, 8x4) so they partially or fully
