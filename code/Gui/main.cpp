@@ -1721,11 +1721,12 @@ int main(int, char **)
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Single MSL kernel runs the full path-"
                                   "tracing loop per pixel. The v1.4.0 "
-                                  "baseline; well-tuned, supports adaptive "
-                                  "and spectral. Pick this for spectral "
-                                  "renders (wavefront falls back to "
-                                  "megakernel for spectral anyway) or "
-                                  "if you suspect a wavefront regression.");
+                                  "baseline; well-tuned, supports every "
+                                  "rendering feature. Pick this if you "
+                                  "suspect a wavefront regression, or for "
+                                  "dispersive-glass renders where its per-"
+                                  "wavelength forking beats wavefront's "
+                                  "terminate-secondaries strategy.");
             ImGui::SameLine();
             bool isWf1spp = settings.useWavefront && !settings.wavefrontMultiSample;
             bool isWfMspp = settings.useWavefront &&  settings.wavefrontMultiSample;
