@@ -3135,27 +3135,21 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    // Wavefront architecture fallback. The kernels haven't been written
-    // yet; the flag exists in the renderer / CLI / GUI surface so the
-    // plumbing is real and stable, but selecting wavefront today falls
-    // back to megakernel with a one-time stderr warning per render so
-    // the user is never silently surprised by getting megakernel when
-    // they asked for wavefront. The TODO.md "wavefront baseline" item
-    // is what flips this from fallback to real dispatch.
+    // Architecture selection. Wavefront baseline ships as of this
+    // commit and runs whenever useWavefront=true AND useAdaptive=false.
+    // Adaptive sampling is not yet supported in wavefront mode (per
+    // TODO.md item #1) - useWavefront + useAdaptive falls back to
+    // megakernel with a stderr warning so the user isn't silently
+    // surprised by getting one mode when they asked for another.
     bool effectiveWavefront = useWavefront;
-    if (useWavefront)
+    if (useWavefront && useAdaptive)
     {
-        std::cerr << "MetalRenderer: --wavefront / useWavefront=true was "
-                  << "requested but the wavefront kernels are not yet "
-                  << "implemented. Falling back to megakernel for this "
-                  << "render. See TODO.md for status." << std::endl;
-        if (useAdaptive)
-        {
-            std::cerr << "MetalRenderer: note that adaptive sampling will "
-                      << "be unavailable in wavefront mode when the "
-                      << "wavefront kernels ship; see TODO.md item #1."
-                      << std::endl;
-        }
+        std::cerr << "MetalRenderer: --wavefront + --adaptive isn't "
+                  << "supported yet. Falling back to megakernel for "
+                  << "this render so adaptive sampling stays active. "
+                  << "See TODO.md item #1 for the design that brings "
+                  << "adaptive into wavefront mode."
+                  << std::endl;
         effectiveWavefront = false;
     }
 
@@ -3316,6 +3310,26 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
     int tilesY = (_height + tileH - 1) / tileH;
 
+    // Wavefront v1 override: dispatch one sample per pipeline run
+    // (samplesPerPass = 1) and skip spatial chopping (each wavefront
+    // kernel is small relative to the watchdog budget so tile splits
+    // aren't needed). Multi-sample-per-pass wavefront would amortize
+    // dispatch overhead and is a follow-up TODO; the megakernel
+    // samplesPerPass = ~40 produces ~50x more rays per dispatch.
+    if (effectiveWavefront)
+    {
+        if (samplesPerPass != 1 || tilesY != 1)
+        {
+            std::cerr << "MetalRenderer: wavefront v1 runs one sample per "
+                      << "pipeline run (megakernel uses " << samplesPerPass
+                      << " samples per pass at this resolution). Higher "
+                      << "dispatch overhead expected; multi-sample-per-pass "
+                      << "wavefront is a follow-up TODO." << std::endl;
+        }
+        samplesPerPass = 1;
+        tilesY = 1;
+    }
+
     int passesPerAa = (_samples + samplesPerPass - 1) / samplesPerPass;
     int aaN = std::max(1, aaSamples);
     int totalPasses = aaN * passesPerAa * tilesY;
@@ -3403,51 +3417,287 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         uniformsPtr[p] = u;
     }
 
-    for (int p = 0; p < totalPasses; p++)
+    // Wavefront allocation: per-render, GPU-only ray-state buffers.
+    // Sized for one ray per pixel per pass (wavefront v1 runs
+    // samplesPerPass=1 effectively - one sample per pipeline run, so
+    // totalPasses = aaSamples * samples * tilesY which is more than
+    // megakernel's totalPasses but each is a small atomic-coherent
+    // pipeline). Multi-sample-per-pass would cut dispatch overhead
+    // and is a follow-up optimization once the baseline ships.
+    WavefrontRayBuffers wfBufs;
+    if (effectiveWavefront)
     {
-        if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-            break;
+        NSUInteger rayCount = NSUInteger(_width) * NSUInteger(_height);
+        wfBufs = allocateWavefrontBuffers(_impl->device, rayCount);
+        if (!wfBufs.valid)
+        {
+            std::cerr << "MetalRenderer: failed to allocate wavefront SoA "
+                      << "buffers for " << rayCount << " rays; falling "
+                      << "back to megakernel for this render." << std::endl;
+            effectiveWavefront = false;
+        }
+    }
 
-        const Uniforms &u = uniformsPtr[p];
-        int tileH_p = u.yEnd - u.yOffset;
-        MTLSize threadgroups = MTLSizeMake(
-            (NSUInteger)((_width + tgX - 1) / tgX),
-            (NSUInteger)((tileH_p + tgY - 1) / tgY),
-            1);
+    if (effectiveWavefront)
+    {
+        // Wavefront dispatch path. One command buffer per pass. Each
+        // command buffer encodes: ray-gen -> (intersect, compact, four
+        // shading kernels) x depth -> output writeback. queueCounters
+        // are zeroed via blit-encoder fillBuffer at the start of each
+        // bounce; Metal command-buffer ordering serializes the blit
+        // ahead of subsequent compute dispatches, no explicit barriers
+        // needed.
+        //
+        // Each shading kernel is dispatched at rayCount threads (with
+        // a bounds-check against queueLen inside the kernel) rather
+        // than indirectly with the actual queue length. Indirect
+        // dispatch via MTLDispatchThreadgroupsIndirectArguments would
+        // avoid the wasted lane launches at the cost of more host
+        // code; deferred until profiling shows it matters.
 
-        id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:activePipeline];
-        [enc setBuffer:uniformsBuf      offset:(NSUInteger)(p * uniformsStride) atIndex:0];
-        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
-        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
-        [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
-        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
-        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
-        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
-        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
-        if (useAdaptive)
-            [enc setBuffer:welfordBuf    offset:0 atIndex:8];
-        [enc setTexture:_impl->outputTex atIndex:0];
-        [enc setTexture:_impl->albedoTex atIndex:1];
-        [enc setTexture:_impl->normalTex atIndex:2];
+        NSUInteger rayCount = NSUInteger(_width) * NSUInteger(_height);
+        MTLSize threadgroups2D = MTLSizeMake(
+            (NSUInteger)((_width  + tgX - 1) / tgX),
+            (NSUInteger)((_height + tgY - 1) / tgY), 1);
+        NSUInteger linearThreadsPerGroup = NSUInteger(tgX) * NSUInteger(tgY);
+        MTLSize threadgroups1D = MTLSizeMake(
+            (rayCount + linearThreadsPerGroup - 1) / linearThreadsPerGroup, 1, 1);
+        MTLSize threadsPerGroup1D = MTLSizeMake(linearThreadsPerGroup, 1, 1);
 
-        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
-        [enc endEncoding];
+        for (int p = 0; p < totalPasses; p++)
+        {
+            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+                break;
 
-        std::atomic<int> *donePtr = &doneCmdBuffers;
-        int totalP = totalPasses;
-        [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
-            int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
-            if (progressPtr)
+            id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
+
+            // ---- Ray-gen ----
             {
-                int approxRows = (int)((double)done / totalP * height);
-                progressPtr->store(approxRows, std::memory_order_relaxed);
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                [enc setComputePipelineState:_impl->pipelineWfRayGen];
+                [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
+                [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
+                [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
+                [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
+                [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
+                [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
+                [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
+                [enc setBuffer:wfBufs.throughputR offset:0 atIndex:7];
+                [enc setBuffer:wfBufs.throughputG offset:0 atIndex:8];
+                [enc setBuffer:wfBufs.throughputB offset:0 atIndex:9];
+                [enc setBuffer:wfBufs.colorR      offset:0 atIndex:10];
+                [enc setBuffer:wfBufs.colorG      offset:0 atIndex:11];
+                [enc setBuffer:wfBufs.colorB      offset:0 atIndex:12];
+                [enc setBuffer:wfBufs.pixelIdx    offset:0 atIndex:13];
+                [enc setBuffer:wfBufs.rngState    offset:0 atIndex:14];
+                [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:15];
+                [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
+                [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
+                [enc endEncoding];
             }
-        }];
 
-        [cmdbuf commit];
-        [pending addObject:cmdbuf];
+            // ---- (intersect, compact, shade*4) x depth ----
+            for (int bounce = 0; bounce < _maxDepth; bounce++)
+            {
+                // Zero the per-bounce queue counters.
+                {
+                    id<MTLBlitCommandEncoder> blit = [cmdbuf blitCommandEncoder];
+                    [blit fillBuffer:wfBufs.queueCounters
+                              range:NSMakeRange(0, 4 * sizeof(uint32_t))
+                              value:0];
+                    [blit endEncoding];
+                }
+
+                // Intersect.
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                    [enc setComputePipelineState:_impl->pipelineWfIntersect];
+                    [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
+                    [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
+                    [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
+                    [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
+                    [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
+                    [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
+                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
+                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:17];
+                    [enc setBuffer:wfBufs.hitX        offset:0 atIndex:18];
+                    [enc setBuffer:wfBufs.hitY        offset:0 atIndex:19];
+                    [enc setBuffer:wfBufs.hitZ        offset:0 atIndex:20];
+                    [enc setBuffer:wfBufs.normalX     offset:0 atIndex:21];
+                    [enc setBuffer:wfBufs.normalY     offset:0 atIndex:22];
+                    [enc setBuffer:wfBufs.normalZ     offset:0 atIndex:23];
+                    [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:24];
+                    [enc setBuffer:_impl->planeBuf    offset:0 atIndex:25];
+                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:26];
+                    [enc setBuffer:_impl->triangleBuf offset:0 atIndex:27];
+                    [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:28];
+                    [enc setBuffer:_impl->lightBuf    offset:0 atIndex:29];
+                    [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:30];
+                    [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
+                    [enc endEncoding];
+                }
+
+                // Compact by material.
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                    [enc setComputePipelineState:_impl->pipelineWfCompact];
+                    [enc setBuffer:uniformsBuf            offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.matIdx            offset:0 atIndex:17];
+                    [enc setBuffer:_impl->materialBuf       offset:0 atIndex:26];
+                    [enc setBuffer:wfBufs.queueCounters     offset:0 atIndex:31];
+                    [enc setBuffer:wfBufs.queueDiffuse      offset:0 atIndex:32];
+                    [enc setBuffer:wfBufs.queueMirror       offset:0 atIndex:33];
+                    [enc setBuffer:wfBufs.queueGlass        offset:0 atIndex:34];
+                    [enc setBuffer:wfBufs.queueEmissive     offset:0 atIndex:35];
+                    [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
+                    [enc endEncoding];
+                }
+
+                // Four shading kernels. queueLen is read from
+                // queueCounters[t] by binding the counter buffer at the
+                // queueLen slot with offset t*4 - the kernel sees this
+                // as a 4-byte uint via its `constant uint &queueLen`
+                // binding, which performs a non-atomic load. Metal's
+                // command-buffer ordering guarantees compaction's
+                // atomic writes are visible to subsequent shading
+                // kernels in the same cmdbuf.
+                auto encodeShading = [&](id<MTLComputePipelineState> pipeline,
+                                         id<MTLBuffer> queueBuf,
+                                         NSUInteger counterOffset,
+                                         bool needsFullScene) {
+                    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                    [enc setComputePipelineState:pipeline];
+                    [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
+                    [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
+                    [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
+                    [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
+                    [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
+                    [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
+                    [enc setBuffer:wfBufs.throughputR offset:0 atIndex:7];
+                    [enc setBuffer:wfBufs.throughputG offset:0 atIndex:8];
+                    [enc setBuffer:wfBufs.throughputB offset:0 atIndex:9];
+                    [enc setBuffer:wfBufs.colorR      offset:0 atIndex:10];
+                    [enc setBuffer:wfBufs.colorG      offset:0 atIndex:11];
+                    [enc setBuffer:wfBufs.colorB      offset:0 atIndex:12];
+                    [enc setBuffer:wfBufs.rngState    offset:0 atIndex:14];
+                    [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:15];
+                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
+                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:17];
+                    [enc setBuffer:wfBufs.hitX        offset:0 atIndex:18];
+                    [enc setBuffer:wfBufs.hitY        offset:0 atIndex:19];
+                    [enc setBuffer:wfBufs.hitZ        offset:0 atIndex:20];
+                    [enc setBuffer:wfBufs.normalX     offset:0 atIndex:21];
+                    [enc setBuffer:wfBufs.normalY     offset:0 atIndex:22];
+                    [enc setBuffer:wfBufs.normalZ     offset:0 atIndex:23];
+                    if (needsFullScene)
+                    {
+                        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:24];
+                        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:25];
+                        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:27];
+                        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:28];
+                        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:29];
+                        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:30];
+                    }
+                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:26];
+                    [enc setBuffer:queueBuf            offset:0 atIndex:36];
+                    [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:37];
+                    [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
+                    [enc endEncoding];
+                };
+                encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
+                              0 * sizeof(uint32_t), /*fullScene=*/true);
+                encodeShading(_impl->pipelineWfShadeMirror,   wfBufs.queueMirror,
+                              1 * sizeof(uint32_t), /*fullScene=*/false);
+                encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
+                              2 * sizeof(uint32_t), /*fullScene=*/false);
+                encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
+                              3 * sizeof(uint32_t), /*fullScene=*/false);
+            }
+
+            // ---- Output writeback ----
+            // Per-pixel reduction over the samplesPerPass rays for this
+            // pixel, summing colors into the output texture with the
+            // first-touch / accumulate convention.
+            {
+                id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                [enc setComputePipelineState:_impl->pipelineWfWriteback];
+                [enc setBuffer:uniformsBuf  offset:p * uniformsStride atIndex:0];
+                [enc setBuffer:wfBufs.colorR offset:0 atIndex:10];
+                [enc setBuffer:wfBufs.colorG offset:0 atIndex:11];
+                [enc setBuffer:wfBufs.colorB offset:0 atIndex:12];
+                [enc setTexture:_impl->outputTex atIndex:0];
+                [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
+                [enc endEncoding];
+            }
+
+            std::atomic<int> *donePtr = &doneCmdBuffers;
+            int totalP = totalPasses;
+            [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
+                if (progressPtr)
+                {
+                    int approxRows = (int)((double)done / totalP * height);
+                    progressPtr->store(approxRows, std::memory_order_relaxed);
+                }
+            }];
+
+            [cmdbuf commit];
+            [pending addObject:cmdbuf];
+        }
+    }
+    else
+    {
+        // Megakernel dispatch path: existing single-kernel-per-pass
+        // loop. Kept unchanged from v1.4.1 so wavefront vs megakernel
+        // is a clean A/B at runtime.
+        for (int p = 0; p < totalPasses; p++)
+        {
+            if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+                break;
+
+            const Uniforms &u = uniformsPtr[p];
+            int tileH_p = u.yEnd - u.yOffset;
+            MTLSize threadgroups = MTLSizeMake(
+                (NSUInteger)((_width + tgX - 1) / tgX),
+                (NSUInteger)((tileH_p + tgY - 1) / tgY),
+                1);
+
+            id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+            [enc setComputePipelineState:activePipeline];
+            [enc setBuffer:uniformsBuf      offset:(NSUInteger)(p * uniformsStride) atIndex:0];
+            [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:1];
+            [enc setBuffer:_impl->planeBuf    offset:0 atIndex:2];
+            [enc setBuffer:_impl->materialBuf offset:0 atIndex:3];
+            [enc setBuffer:_impl->triangleBuf offset:0 atIndex:4];
+            [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:5];
+            [enc setBuffer:_impl->lightBuf    offset:0 atIndex:6];
+            [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
+            if (useAdaptive)
+                [enc setBuffer:welfordBuf    offset:0 atIndex:8];
+            [enc setTexture:_impl->outputTex atIndex:0];
+            [enc setTexture:_impl->albedoTex atIndex:1];
+            [enc setTexture:_impl->normalTex atIndex:2];
+
+            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threadsPerGroup];
+            [enc endEncoding];
+
+            std::atomic<int> *donePtr = &doneCmdBuffers;
+            int totalP = totalPasses;
+            [cmdbuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull) {
+                int done = donePtr->fetch_add(1, std::memory_order_relaxed) + 1;
+                if (progressPtr)
+                {
+                    int approxRows = (int)((double)done / totalP * height);
+                    progressPtr->store(approxRows, std::memory_order_relaxed);
+                }
+            }];
+
+            [cmdbuf commit];
+            [pending addObject:cmdbuf];
+        }
     }
 
     // One wait, at the end. All command buffers run pipelined on the
