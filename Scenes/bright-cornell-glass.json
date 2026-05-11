@@ -1,17 +1,20 @@
 {
   "schema": "1.0",
   "name": "bright-cornell-glass",
-  "version": "1.0.0",
+  "version": "1.1.0",
 
-  // cornell-glass with the entire ceiling promoted to the light
-  // source. The cream ceiling plane is gone; in its place is one
-  // emissive plane covering the same 4x7 area at y=2. Everything else
-  // (walls, spheres, materials, camera) matches cornell-glass exactly.
+  // cornell-glass with the entire ceiling promoted to the light source
+  // AND the box closed by a fourth wall behind the camera. The cream
+  // ceiling plane is gone; in its place is one emissive plane covering
+  // the same 4x7 area at y=2 with half the per-unit emissive of v1.0.0
+  // (since the full-ceiling light at the original intensity blew the
+  // tonemap into a wash). Walls, spheres, materials, and camera match
+  // cornell-glass / closed-cornell-glass exactly.
   //
-  // Note: this brightens the scene by ~90x compared to cornell-glass
-  // (4*7 = 28 light-area units vs the original 0.75*0.4 = 0.3 units,
-  // same per-unit emissive). Tonemap (Reinhard or ACES) will compress
-  // the high luminance but the scene reads as a much brighter room.
+  // Fourth wall at z = +0.5 catches specular-bounce rays that would
+  // otherwise escape +Z into the void -- same trick closed-cornell-
+  // glass uses to keep mirror reflections of the camera-facing void
+  // from rendering as dark patches.
 
   "camera": { "position": [0, 0, 0], "fov": 65 },
 
@@ -19,7 +22,7 @@
     "cream":     { "albedo": [0.74, 0.74, 0.64] },
     "red":       { "albedo": [0.63, 0.06, 0.05] },
     "green":     { "albedo": [0.13, 0.45, 0.10] },
-    "warmlight": { "emissive": [80.0, 68.0, 48.0] },
+    "warmlight": { "emissive": [40.0, 34.0, 24.0] },
     "mirror":    { "albedo": [0.95, 0.95, 0.95], "metallic": true },
     "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5, "cauchyB": 0.013 }
   },
@@ -35,6 +38,12 @@
       "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6], "material": "green" },
     { "type": "plane", "name": "left-wall",
       "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
+
+    // Fourth wall: 6x6 parallelogram at z = +0.5, normal -Z (into the
+    // box). u and v ordered so u x v points -Z. Oversized like the
+    // back-wall.
+    { "type": "plane", "name": "fourth-wall",
+      "origin": [3, 3, 0.5], "u": [0, -6, 0], "v": [-6, 0, 0], "material": "cream" },
 
     { "type": "sphere", "center": [-0.7, -1.2, -4.0], "radius": 0.8, "material": "mirror" },
     { "type": "sphere", "center": [0.8, -1.3, -3.0], "radius": 0.7, "material": "glass" }
