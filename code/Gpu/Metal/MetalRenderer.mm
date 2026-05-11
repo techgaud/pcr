@@ -1693,6 +1693,119 @@ kernel void wf_intersect(
         matIdxOut[gid] = -1;
     }
 }
+
+// Wavefront compaction: scatter rays into per-material queues using
+// SIMD-group-batched atomic counter increments.
+//
+// Apple's WWDC22 'Scale compute workloads' explicitly flags global
+// atomics as a primary bottleneck on multi-core M-series GPUs, and
+// recommends SIMD-group / threadgroup-level batching to reduce atomic
+// pressure. AMD's GPUOpen 'Fast Compaction with mbcnt' converges on
+// the same pattern from the AMD side. Per-thread atomic-append at
+// pcr's 1080^2 = 1.17M rays scale would hit 1.17M atomic_inc against
+// 4 hot counters; this batched pattern hits ~36K (one per SIMD group)
+// for the same scatter, a 32x reduction in atomic traffic.
+//
+// Algorithm per SIMD group of 32 threads:
+//   For each bucket b in {0,1,2,3}:
+//     1. pred = (this thread's matType == b) ? 1 : 0
+//     2. prefix = simd_prefix_exclusive_sum(pred)  // 0..N within group
+//     3. count  = simd_sum(pred)                   // 0..32 total active
+//     4. if count > 0:
+//        lane-0 does atomic_fetch_add(queueCounter[b], count) -> base
+//        broadcast base to all lanes
+//        if pred: queue[b][base + prefix] = my_gid
+//
+// Material classification reads the GpuMaterial struct at matIdx:
+//   emissive surface (any rgb > 0)  -> bucket 3
+//   metallic (mirror)               -> bucket 1
+//   transparent (glass)             -> bucket 2
+//   else (diffuse)                  -> bucket 0
+// Dead rays (matIdx == -1, set by wf_intersect on no-hit / dead-ray
+// passthrough) get matType=-1 and skip all buckets, terminating the
+// path. Their accumulated color stays as written at the last shading
+// step (or initial zero for primary-ray escapees).
+//
+// Buffer layout:
+//   buffer(0)         uniforms
+//   buffer(17)        matIdx (input from HitInfo SoA)
+//   buffer(26)        materials (scene buffer, read for classification)
+//   buffer(31)        queueCounters (atomic_uint[4])
+//   buffer(32..35)    queue[diffuse|mirror|glass|emissive]
+//
+// queueCounters must be zeroed by the host (blit-encoder fill) before
+// each compaction dispatch. The driver in commit #6 handles that.
+
+kernel void wf_compact_by_material(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device const int                           *matIdx        [[buffer(17)]],
+    device const GpuMaterial                   *materials     [[buffer(26)]],
+    device atomic_uint                         *queueCounters [[buffer(31)]],
+    device uint                                *queueDiffuse  [[buffer(32)]],
+    device uint                                *queueMirror   [[buffer(33)]],
+    device uint                                *queueGlass    [[buffer(34)]],
+    device uint                                *queueEmissive [[buffer(35)]],
+    uint                                        gid           [[thread_position_in_grid]])
+{
+    uint rayCount = uint(u.width) * uint(u.height);
+    bool inBounds = (gid < rayCount);
+
+    // Classify this thread's ray. Out-of-bounds threads and dead-ray
+    // threads (matIdx == -1) participate in the SIMD prefix-sum scans
+    // with pred=0 - they don't contribute to any queue but they do
+    // participate in the SIMD-group reductions, which is what
+    // simd_prefix_exclusive_sum / simd_sum require to behave
+    // correctly (the intrinsics are uniform across all 32 lanes).
+    int matType = -1;
+    if (inBounds)
+    {
+        int mIdx = matIdx[gid];
+        if (mIdx >= 0)
+        {
+            GpuMaterial m = materials[mIdx];
+            bool hasEmissive = (m.emissive.x > 0.0f ||
+                                m.emissive.y > 0.0f ||
+                                m.emissive.z > 0.0f);
+            if (hasEmissive)        matType = 3;
+            else if (m.metallic)    matType = 1;
+            else if (m.transparent) matType = 2;
+            else                    matType = 0;
+        }
+    }
+
+    // Four buckets, four SIMD-batched atomic-appends. The loop unrolls
+    // at compile time (b is a constexpr literal in each iteration).
+    for (int b = 0; b < 4; b++)
+    {
+        uint pred  = (matType == b) ? 1u : 0u;
+        uint prefix = simd_prefix_exclusive_sum(pred);
+        uint count  = simd_sum(pred);
+
+        uint base = 0u;
+        if (count > 0u)
+        {
+            if (simd_is_first())
+            {
+                base = atomic_fetch_add_explicit(&queueCounters[b],
+                                                 count,
+                                                 memory_order_relaxed);
+            }
+            base = simd_broadcast(base, 0);
+        }
+
+        if (pred != 0u)
+        {
+            uint slot = base + prefix;
+            switch (b)
+            {
+                case 0: queueDiffuse[slot]  = gid; break;
+                case 1: queueMirror[slot]   = gid; break;
+                case 2: queueGlass[slot]    = gid; break;
+                case 3: queueEmissive[slot] = gid; break;
+            }
+        }
+    }
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -1928,6 +2041,22 @@ namespace
         id<MTLBuffer> normalY;
         id<MTLBuffer> normalZ;
 
+        // Per-material queues populated by wf_compact_by_material.
+        // Each holds up to rayCount uint ray-indices (worst case: every
+        // ray hits the same material type). Shading kernels for material
+        // type T read queueT[0..queueCounters[T]-1] as their input set.
+        id<MTLBuffer> queueDiffuse;
+        id<MTLBuffer> queueMirror;
+        id<MTLBuffer> queueGlass;
+        id<MTLBuffer> queueEmissive;
+
+        // 4 atomic_uint counters, one per material queue. Zeroed by the
+        // host (blit-encoder fill) before each compaction dispatch.
+        // After compaction, queueCounters[t] = number of valid entries
+        // in queue<t>; the shading-kernel dispatch reads this to size
+        // its grid.
+        id<MTLBuffer> queueCounters;
+
         NSUInteger rayCount = 0;
         bool valid = false;
     };
@@ -1979,6 +2108,12 @@ namespace
         wf.normalY     = alloc(floatBytes);
         wf.normalZ     = alloc(floatBytes);
 
+        wf.queueDiffuse  = alloc(uintBytes);
+        wf.queueMirror   = alloc(uintBytes);
+        wf.queueGlass    = alloc(uintBytes);
+        wf.queueEmissive = alloc(uintBytes);
+        wf.queueCounters = alloc(4 * sizeof(uint32_t));
+
         // Validate: any nil means an allocation failed (out of memory).
         // Caller falls back to megakernel rather than crashing.
         wf.valid = (wf.originX && wf.originY && wf.originZ &&
@@ -1988,7 +2123,10 @@ namespace
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
                     wf.matIdx &&
                     wf.hitX && wf.hitY && wf.hitZ &&
-                    wf.normalX && wf.normalY && wf.normalZ);
+                    wf.normalX && wf.normalY && wf.normalZ &&
+                    wf.queueDiffuse && wf.queueMirror &&
+                    wf.queueGlass && wf.queueEmissive &&
+                    wf.queueCounters);
         return wf;
     }
 
@@ -2086,6 +2224,7 @@ struct MetalRenderer::Impl
     // commits per the wavefront commit sequence.
     id<MTLComputePipelineState> pipelineWfRayGen     = nil;
     id<MTLComputePipelineState> pipelineWfIntersect  = nil;
+    id<MTLComputePipelineState> pipelineWfCompact    = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -2238,6 +2377,22 @@ namespace
         if (!im.pipelineWfIntersect)
         {
             std::cerr << "MetalRenderer: wavefront intersect pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        id<MTLFunction> fnWfCompact = [lib newFunctionWithName:@"wf_compact_by_material"];
+        if (!fnWfCompact)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'wf_compact_by_material' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineWfCompact = [im.device newComputePipelineStateWithFunction:fnWfCompact error:&err];
+        if (!im.pipelineWfCompact)
+        {
+            std::cerr << "MetalRenderer: wavefront compaction pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
