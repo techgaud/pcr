@@ -2841,29 +2841,42 @@ namespace
         // Metal's 31-buffer-per-kernel limit). Mirror/glass/emissive
         // bind a minimal scene (materials only); diffuse binds the full
         // scene because NEE shadow rays go through sceneIntersect.
-        auto buildShadingPipeline = [&](const char *name,
-                                        id<MTLComputePipelineState> *out) -> bool {
+        //
+        // Returns the pipeline state by value (nil on failure) rather
+        // than writing through an out-parameter pointer. ARC defaults
+        // an `id<X> *` parameter to __autoreleasing ownership, but the
+        // im.pipelineWf* fields are __strong (struct fields default to
+        // strong), and ARC refuses to materialize the autorelease/
+        // writeback temp through a non-local strong pointer. Returning
+        // by value lets the caller's assignment do the ARC handoff
+        // cleanly without any ownership annotation gymnastics.
+        auto buildShadingPipeline = [&](const char *name) -> id<MTLComputePipelineState> {
             id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
             if (!fn) {
                 std::cerr << "MetalRenderer: MSL kernel '" << name
                           << "' not found" << std::endl;
-                return false;
+                return nil;
             }
             NSError *e = nil;
-            *out = [im.device newComputePipelineStateWithFunction:fn error:&e];
-            if (!*out) {
+            id<MTLComputePipelineState> ps =
+                [im.device newComputePipelineStateWithFunction:fn error:&e];
+            if (!ps) {
                 std::cerr << "MetalRenderer: wavefront shading pipeline '"
                           << name << "' build failed: "
                           << (e ? [[e localizedDescription] UTF8String] : "(no error info)")
                           << std::endl;
-                return false;
+                return nil;
             }
-            return true;
+            return ps;
         };
-        if (!buildShadingPipeline("wf_shade_emissive", &im.pipelineWfShadeEmissive)) return false;
-        if (!buildShadingPipeline("wf_shade_mirror",   &im.pipelineWfShadeMirror))   return false;
-        if (!buildShadingPipeline("wf_shade_glass",    &im.pipelineWfShadeGlass))    return false;
-        if (!buildShadingPipeline("wf_shade_diffuse",  &im.pipelineWfShadeDiffuse))  return false;
+        im.pipelineWfShadeEmissive = buildShadingPipeline("wf_shade_emissive");
+        if (!im.pipelineWfShadeEmissive) return false;
+        im.pipelineWfShadeMirror   = buildShadingPipeline("wf_shade_mirror");
+        if (!im.pipelineWfShadeMirror)   return false;
+        im.pipelineWfShadeGlass    = buildShadingPipeline("wf_shade_glass");
+        if (!im.pipelineWfShadeGlass)    return false;
+        im.pipelineWfShadeDiffuse  = buildShadingPipeline("wf_shade_diffuse");
+        if (!im.pipelineWfShadeDiffuse)  return false;
 
         id<MTLFunction> fnWfWriteback = [lib newFunctionWithName:@"wf_output_writeback"];
         if (!fnWfWriteback)
