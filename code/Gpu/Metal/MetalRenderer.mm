@@ -2181,6 +2181,64 @@ kernel void wf_shade_diffuse(
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
 }
+
+// ============================================================
+// ==== Wavefront output writeback ============================
+// ============================================================
+//
+// Reduce kernel that runs once per pixel at the end of a wavefront
+// pipeline pass. Sums the `sampleCount` accumulated colors that
+// belong to each pixel (one ray per sample per pixel were processed
+// in parallel during the pass) and writes the sum into the output
+// texture - clobbering on the first touch, accumulating thereafter
+// to handle multi-pass aaSamples * passesPerAa accumulation.
+//
+// Ray layout in the SoA buffers during a wavefront pass:
+//   rayIdx in [0, pixelCount * sampleCount)
+//   pixelIdx   = rayIdx % pixelCount
+//   sampleSlot = rayIdx / pixelCount
+// One thread here per pixel, iterates the sampleCount entries that
+// belong to it, sums their colors, writes the result.
+//
+// First-touch detection mirrors megakernel's path_trace_pass:
+// (aaIdx == 0 AND sampleStart == 0) means this is the very first
+// contribution to this pixel; later passes accumulate. CPU readback
+// divides by total contributions (aaSamples * samples) the same way
+// non-adaptive megakernel multi-pass does.
+
+kernel void wf_output_writeback(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device const float                         *colorR        [[buffer(10)]],
+    device const float                         *colorG        [[buffer(11)]],
+    device const float                         *colorB        [[buffer(12)]],
+    texture2d<float, access::read_write>        output        [[texture(0)]],
+    uint2                                       gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= uint(u.width) || gid.y >= uint(u.height)) return;
+    uint pixelIdx   = gid.y * uint(u.width) + gid.x;
+    uint pixelCount = uint(u.width) * uint(u.height);
+    uint samples    = max(1u, uint(u.sampleCount));
+
+    float3 sumThisPass = float3(0.0f);
+    for (uint s = 0u; s < samples; s++) {
+        uint rayIdx = s * pixelCount + pixelIdx;
+        sumThisPass += float3(colorR[rayIdx],
+                              colorG[rayIdx],
+                              colorB[rayIdx]);
+    }
+
+    // First-touch (first dispatch covering this pixel within the
+    // render) clobbers the texture; subsequent passes accumulate.
+    // Matches the megakernel non-adaptive multi-pass first-touch
+    // convention so the texture-accumulation semantics are identical
+    // between the two architectures.
+    if (u.aaIdx == 0 && u.sampleStart == 0) {
+        output.write(float4(sumThisPass, 0.0f), gid);
+    } else {
+        float4 prev = output.read(gid);
+        output.write(prev + float4(sumThisPass, 0.0f), gid);
+    }
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -2604,6 +2662,7 @@ struct MetalRenderer::Impl
     id<MTLComputePipelineState> pipelineWfShadeMirror   = nil;
     id<MTLComputePipelineState> pipelineWfShadeGlass    = nil;
     id<MTLComputePipelineState> pipelineWfShadeDiffuse  = nil;
+    id<MTLComputePipelineState> pipelineWfWriteback     = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -2805,6 +2864,22 @@ namespace
         if (!buildShadingPipeline("wf_shade_mirror",   &im.pipelineWfShadeMirror))   return false;
         if (!buildShadingPipeline("wf_shade_glass",    &im.pipelineWfShadeGlass))    return false;
         if (!buildShadingPipeline("wf_shade_diffuse",  &im.pipelineWfShadeDiffuse))  return false;
+
+        id<MTLFunction> fnWfWriteback = [lib newFunctionWithName:@"wf_output_writeback"];
+        if (!fnWfWriteback)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'wf_output_writeback' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineWfWriteback = [im.device newComputePipelineStateWithFunction:fnWfWriteback error:&err];
+        if (!im.pipelineWfWriteback)
+        {
+            std::cerr << "MetalRenderer: wavefront output-writeback pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
 
         // Return-by-value here, not a reference-out parameter: ARC
         // reference parameters default to __autoreleasing ownership,
