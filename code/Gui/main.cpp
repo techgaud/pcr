@@ -1588,12 +1588,22 @@ int main(int, char **)
         // tEXt metadata after a render to confirm what shipped.
         ImGui::SeparatorText("GPU Tuning");
         ImGui::TextUnformatted("Threadgroup:");
+        // Threadgroup presets ordered by total threads. Three are below
+        // Apple's SIMD width of 32 (2x2 = 4, 4x4 = 16, 8x4 = 32) so they
+        // partially or fully fill a single SIMD group; the rest are
+        // multiples of 32 for clean SIMD packing. Sub-SIMD presets are
+        // included so empirical A/B can measure whether the extra
+        // concurrency from more in-flight groups outweighs the lane-
+        // utilization loss when each group is smaller than a SIMD.
         struct TgPreset { const char *label; int x; int y; };
         static const TgPreset kTgPresets[] = {
-            {"8x8",   8,  8},
-            {"16x16", 16, 16},
-            {"32x8",  32, 8},
-            {"32x32", 32, 32},
+            {"2x2",   2,  2},   // 4 threads, ⅛ SIMD - extreme small-group probe
+            {"4x4",   4,  4},   // 16 threads, ½ SIMD
+            {"8x4",   8,  4},   // 32 threads, exactly 1 SIMD group
+            {"8x8",   8,  8},   // 64 threads, 2 SIMD groups (default-equivalent)
+            {"16x16", 16, 16},  // 256 threads, 8 SIMD groups
+            {"32x8",  32, 8},   // 256 threads, wide layout
+            {"32x32", 32, 32},  // 1024 threads, full threadgroup (legacy default)
         };
         for (const auto &tp : kTgPresets)
         {
