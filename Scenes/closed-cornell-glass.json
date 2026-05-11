@@ -1,0 +1,62 @@
+{
+  "schema": "1.0",
+  "name": "closed-cornell-glass",
+  "version": "1.0.0",
+
+  // cornell-glass with a fourth wall added behind the camera. The
+  // standard cornell-glass scene leaves the box's front face open at
+  // z = 0 (where the camera sits), which means any secondary ray that
+  // bounces off the mirror sphere toward +Z escapes the scene and
+  // contributes zero radiance -- visible as the dark camera-facing
+  // patches on the mirror sphere ("breaking the fourth wall").
+  //
+  // This variant closes that face with a cream plane at z = +0.5, just
+  // behind the camera origin (0, 0, 0). Primary rays start at z = 0
+  // heading -Z and never intersect a +0.5 plane, so the camera still
+  // sees the same scene. Secondary rays heading +Z now hit the new
+  // wall and pick up the box's cream lighting like any other interior
+  // surface, eliminating the dark camera-facing reflections.
+  //
+  // Use this in place of cornell-glass for renders where you want a
+  // closed-box look on the mirror and glass reflections.
+
+  "camera": { "position": [0, 0, 0], "fov": 65 },
+
+  "materials": {
+    "cream":     { "albedo": [0.74, 0.74, 0.64] },
+    "red":       { "albedo": [0.63, 0.06, 0.05] },
+    "green":     { "albedo": [0.13, 0.45, 0.10] },
+    "warmlight": { "emissive": [80.0, 68.0, 48.0] },
+    "mirror":    { "albedo": [0.95, 0.95, 0.95], "metallic": true },
+    "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5, "cauchyB": 0.013 }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -6], "u": [4, 0, 0], "v": [0, 0, 7], "material": "cream" },
+    { "type": "plane", "name": "back-wall",
+      "origin": [2, 2, -6], "u": [-6, 0, 0], "v": [0, -6, 0], "material": "cream" },
+    { "type": "plane", "name": "floor",
+      "origin": [2, -2, 0], "u": [0, 0, -7], "v": [-4, 0, 0], "material": "cream" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, 0], "u": [0, 4, 0], "v": [0, 0, -6], "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -6], "u": [0, 4, 0], "v": [0, 0, 6], "material": "red" },
+
+    // Fourth wall: 6x6 parallelogram at z = +0.5, normal pointing
+    // toward -Z (into the box). u and v ordered so u x v gives a -Z
+    // normal: u = (0, -6, 0), v = (-6, 0, 0) cross to (0, 0, -36).
+    // Corners cover x in [-3, 3], y in [-3, 3], oversized like the
+    // back-wall so coplanar ties at the corners go to the side walls
+    // (same convention used elsewhere in this scene).
+    { "type": "plane", "name": "fourth-wall",
+      "origin": [3, 3, 0.5], "u": [0, -6, 0], "v": [-6, 0, 0], "material": "cream" },
+
+    { "type": "sphere", "center": [-0.7, -1.2, -4.0], "radius": 0.8, "material": "mirror" },
+    { "type": "sphere", "center": [0.8, -1.3, -3.0], "radius": 0.7, "material": "glass" },
+
+    { "type": "plane", "name": "area-light", "light": true,
+      "origin": [-0.375, 2, -4.25], "u": [0.75, 0, 0], "v": [0, 0, 0.4],
+      "material": "warmlight" }
+  ]
+}

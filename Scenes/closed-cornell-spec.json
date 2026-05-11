@@ -1,0 +1,104 @@
+{
+  "schema": "1.0",
+  "name": "closed-cornell-spec",
+  "version": "1.0.0",
+
+  // cornell-spec with a backdrop wall added behind the camera. The
+  // standard cornell-spec scene has a wide gap between the camera at
+  // z = 0 and the box's open face at z = -5.77, with nothing between
+  // them. Any secondary ray that exits the box through the open face
+  // toward +Z flies through the empty gap, past the camera, and out
+  // into the void -- contributing zero radiance and producing dark
+  // patches in specular-material reflections.
+  //
+  // This variant adds a white plane at z = +0.5, just behind the
+  // camera origin (0, 0, 0). Primary rays start at z = 0 heading -Z
+  // and never intersect a +0.5 plane, so the camera still sees the
+  // same scene. Secondary rays escaping the box pick up the white
+  // wall's lighting on their way back through, eliminating the dark
+  // camera-facing patches.
+  //
+  // Geometrically this is a backdrop, not a box closure: the box
+  // itself stays open at z = -5.77, with the new wall floating
+  // behind the camera 6.27 units away from the opening. (cornell-
+  // glass's camera sits AT its box's opening, so a wall at z = +0.5
+  // there actually closes the box; cornell-spec's camera is outside
+  // its box, so the analogous wall placement is a backdrop instead.)
+  // Either way, the effect on specular-material reflections is the
+  // same: rays bouncing back toward +Z now see lit geometry.
+
+  "camera": { "position": [0, 0, 0], "fov": 38 },
+
+  "materials": {
+    "white": { "albedo":   [0.71, 0.69, 0.59],
+               "albedo_spd":   "cornell/white-paint" },
+    "red":   { "albedo":   [0.63, 0.065, 0.05],
+               "albedo_spd":   "cornell/red-paint" },
+    "green": { "albedo":   [0.14, 0.45, 0.091],
+               "albedo_spd":   "cornell/green-paint" },
+    "light": { "emissive": [70.0, 60.0, 42.0],
+               "emissive_spd": "cornell/light", "emissive_scale": 5.0 }
+  },
+
+  "primitives": [
+    { "type": "plane", "name": "ceiling",
+      "origin": [-2, 2, -9.80], "u": [4, 0, 0], "v": [0, 0, 4.03], "material": "white" },
+    { "type": "plane", "name": "back-wall",
+      "origin": [2, 2, -9.80], "u": [-4, 0, 0], "v": [0, -4, 0], "material": "white" },
+    { "type": "plane", "name": "floor",
+      "origin": [2, -2, -5.77], "u": [0, 0, -4.03], "v": [-4, 0, 0], "material": "white" },
+    { "type": "plane", "name": "right-wall",
+      "origin": [2, -2, -5.77], "u": [0, 4, 0], "v": [0, 0, -4.03], "material": "green" },
+    { "type": "plane", "name": "left-wall",
+      "origin": [-2, -2, -9.80], "u": [0, 4, 0], "v": [0, 0, 4.03], "material": "red" },
+
+    // Backdrop wall: 6x6 parallelogram at z = +0.5, normal pointing
+    // toward -Z (toward the box). u and v ordered so u x v gives a -Z
+    // normal: u = (0, -6, 0), v = (-6, 0, 0) cross to (0, 0, -36).
+    // Oversized to catch rays at oblique angles past the box opening.
+    { "type": "plane", "name": "fourth-wall",
+      "origin": [3, 3, 0.5], "u": [0, -6, 0], "v": [-6, 0, 0], "material": "white" },
+
+    { "type": "plane", "name": "tall-bottom",
+      "origin": [-1.4017, -2.0, -8.6882], "u": [1.134, 0, -0.3575], "v": [0.3575, 0, 1.134],
+      "material": "white" },
+    { "type": "plane", "name": "tall-top",
+      "origin": [-1.4017, 0.3782, -8.6882], "u": [1.134, 0, -0.3575], "v": [0.3575, 0, 1.134],
+      "material": "white" },
+    { "type": "plane", "name": "tall-back",
+      "origin": [-1.4017, -2.0, -8.6882], "u": [1.134, 0, -0.3575], "v": [0, 2.378, 0],
+      "material": "white" },
+    { "type": "plane", "name": "tall-front",
+      "origin": [-1.0441, -2.0, -7.5542], "u": [1.134, 0, -0.3575], "v": [0, 2.378, 0],
+      "material": "white" },
+    { "type": "plane", "name": "tall-left",
+      "origin": [-1.4017, -2.0, -8.6882], "u": [0.3575, 0, 1.134], "v": [0, 2.378, 0],
+      "material": "white" },
+    { "type": "plane", "name": "tall-right",
+      "origin": [-0.2677, -2.0, -9.0458], "u": [0.3575, 0, 1.134], "v": [0, 2.378, 0],
+      "material": "white" },
+
+    { "type": "plane", "name": "short-bottom",
+      "origin": [0.2749, -2.0, -7.7358], "u": [1.134, 0, 0.3575], "v": [-0.3575, 0, 1.134],
+      "material": "white" },
+    { "type": "plane", "name": "short-top",
+      "origin": [0.2749, -0.8109, -7.7358], "u": [1.134, 0, 0.3575], "v": [-0.3575, 0, 1.134],
+      "material": "white" },
+    { "type": "plane", "name": "short-back",
+      "origin": [0.2749, -2.0, -7.7358], "u": [1.134, 0, 0.3575], "v": [0, 1.189, 0],
+      "material": "white" },
+    { "type": "plane", "name": "short-front",
+      "origin": [-0.0827, -2.0, -6.6018], "u": [1.134, 0, 0.3575], "v": [0, 1.189, 0],
+      "material": "white" },
+    { "type": "plane", "name": "short-left",
+      "origin": [0.2749, -2.0, -7.7358], "u": [-0.3575, 0, 1.134], "v": [0, 1.189, 0],
+      "material": "white" },
+    { "type": "plane", "name": "short-right",
+      "origin": [1.4089, -2.0, -7.3782], "u": [-0.3575, 0, 1.134], "v": [0, 1.189, 0],
+      "material": "white" },
+
+    { "type": "plane", "name": "area-light", "light": true,
+      "origin": [-0.469, 2.0, -7.41], "u": [0.937, 0, 0], "v": [0, 0, 0.757],
+      "material": "light" }
+  ]
+}
