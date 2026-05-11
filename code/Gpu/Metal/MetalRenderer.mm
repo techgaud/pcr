@@ -246,33 +246,64 @@ struct Scene {
 };
 
 // ---- Spectrum lookup --------------------------------------------------
+//
+// Two overload families. The (Material &) variants take a single material
+// by reference and need no other scene buffers, so the wavefront shading
+// kernels (which bind only materials + the per-ray SoA) can call them
+// directly. The (Scene &, matIdx) variants are the megakernel-facing
+// helpers and forward to the (Material &) implementation.
 
-float lookupTabulated(thread const Scene &S, int matIdx, int src, float lambda) {
+float lookupTabulated(device const GpuMaterial &mat, int src, float lambda) {
     if (lambda < kLambdaMin || lambda > kLambdaMax) return 0.0f;
     float t = (lambda - kLambdaMin) / kSpecStep;
     int   i = int(t);
     if (i >= kSpecSamples - 1) {
-        return src == 0 ? S.materials[matIdx].albedoSpectrum[kSpecSamples - 1]
-                        : S.materials[matIdx].emissiveSpectrum[kSpecSamples - 1];
+        return src == 0 ? mat.albedoSpectrum[kSpecSamples - 1]
+                        : mat.emissiveSpectrum[kSpecSamples - 1];
     }
     float f = t - float(i);
     if (src == 0) {
-        float a = S.materials[matIdx].albedoSpectrum[i];
-        float b = S.materials[matIdx].albedoSpectrum[i + 1];
+        float a = mat.albedoSpectrum[i];
+        float b = mat.albedoSpectrum[i + 1];
         return mix(a, b, f);
     } else {
-        float a = S.materials[matIdx].emissiveSpectrum[i];
-        float b = S.materials[matIdx].emissiveSpectrum[i + 1];
+        float a = mat.emissiveSpectrum[i];
+        float b = mat.emissiveSpectrum[i + 1];
         return mix(a, b, f);
     }
 }
 
+float albedoAt(device const GpuMaterial &mat, float lambda) {
+    return lookupTabulated(mat, 0, lambda);
+}
+
+float emissiveAt(device const GpuMaterial &mat, float lambda) {
+    return lookupTabulated(mat, 1, lambda);
+}
+
+float lookupTabulated(thread const Scene &S, int matIdx, int src, float lambda) {
+    return lookupTabulated(S.materials[matIdx], src, lambda);
+}
+
 float albedoAt(thread const Scene &S, int matIdx, float lambda) {
-    return lookupTabulated(S, matIdx, 0, lambda);
+    return lookupTabulated(S.materials[matIdx], 0, lambda);
 }
 
 float emissiveAt(thread const Scene &S, int matIdx, float lambda) {
-    return lookupTabulated(S, matIdx, 1, lambda);
+    return lookupTabulated(S.materials[matIdx], 1, lambda);
+}
+
+// Evaluate a material's full albedo/emission spectrum at all four hero
+// wavelengths in one call. Pure convenience helper that the wavefront
+// shading kernels use; megakernel inlines the four lookups directly.
+float4 albedoAt4(device const GpuMaterial &mat, float4 lambdas) {
+    return float4(albedoAt(mat, lambdas.x), albedoAt(mat, lambdas.y),
+                  albedoAt(mat, lambdas.z), albedoAt(mat, lambdas.w));
+}
+
+float4 emissiveAt4(device const GpuMaterial &mat, float4 lambdas) {
+    return float4(emissiveAt(mat, lambdas.x), emissiveAt(mat, lambdas.y),
+                  emissiveAt(mat, lambdas.z), emissiveAt(mat, lambdas.w));
 }
 
 // ---- CIE / sRGB -------------------------------------------------------
@@ -297,6 +328,19 @@ float3 singleLambdaXYZ(float lambda, float radiance) {
     const float kYBarIntegral = 106.895210f;
     return cieObserverAt(lambda) * radiance
          * (kLambdaMax - kLambdaMin) / kYBarIntegral;
+}
+
+// Sum singleLambdaXYZ over the four hero wavelengths and apply the 1/4
+// Wilkie hero normalization so the result matches what megakernel hero=4
+// produces from the same (lambdas, perWavelengthRadiance) tuple. The
+// wavefront shading kernels feed this into the per-pixel CIE XYZ
+// accumulator stored in the color buffer.
+float3 heroLambdasXYZ(float4 lambdas, float4 perWavelengthRadiance) {
+    float3 xyz = singleLambdaXYZ(lambdas.x, perWavelengthRadiance.x)
+               + singleLambdaXYZ(lambdas.y, perWavelengthRadiance.y)
+               + singleLambdaXYZ(lambdas.z, perWavelengthRadiance.z)
+               + singleLambdaXYZ(lambdas.w, perWavelengthRadiance.w);
+    return xyz * 0.25f;
 }
 
 float3 xyzToLinearSRGB(float3 xyz) {
@@ -1891,24 +1935,38 @@ kernel void wf_compact_by_material(
 // continue to the next bounce.
 
 kernel void wf_shade_emissive(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device const packed_float3                 *throughput    [[buffer(3)]],
-    device packed_float3                       *color         [[buffer(4)]],
-    device uint                                *alive         [[buffer(8)]],
-    device const int                           *matIdx        [[buffer(9)]],
-    device const GpuMaterial                   *materials     [[buffer(14)]],
-    device const uint                          *queue         [[buffer(24)]],
-    constant uint                              &queueLen      [[buffer(25)]],
-    uint                                        tid           [[thread_position_in_grid]])
+    constant Uniforms                          &u                  [[buffer(0)]],
+    device const packed_float3                 *throughput         [[buffer(3)]],
+    device packed_float3                       *color              [[buffer(4)]],
+    device uint                                *alive              [[buffer(8)]],
+    device const int                           *matIdx             [[buffer(9)]],
+    device const GpuMaterial                   *materials          [[buffer(14)]],
+    device const uint                          *queue              [[buffer(24)]],
+    constant uint                              &queueLen           [[buffer(25)]],
+    device const float4                        *lambdas            [[buffer(27)]],
+    device const float4                        *spectralThroughput [[buffer(28)]],
+    uint                                        tid                [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
 
     int mi = matIdx[gid];
-    float3 t = throughput[gid];
-    float3 emissive = materials[mi].emissive.rgb;
 
-    color[gid] = float3(color[gid]) + t * emissive;
+    if (u.useSpectral != 0) {
+        // Spectral terminal contribution: per-wavelength radiance =
+        // spectralThroughput * emissiveAt(lambdas), then collapse the
+        // 4 hero samples into one XYZ value via heroLambdasXYZ. Color
+        // accumulator stays in CIE XYZ across passes; the CPU readback
+        // converts XYZ -> linear sRGB once at the end.
+        float4 lams   = lambdas[gid];
+        float4 spThru = spectralThroughput[gid];
+        float4 emit   = emissiveAt4(materials[mi], lams);
+        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, spThru * emit);
+    } else {
+        float3 t = throughput[gid];
+        float3 emissive = materials[mi].emissive.rgb;
+        color[gid] = float3(color[gid]) + t * emissive;
+    }
     alive[gid] = 0u;
 }
 
@@ -1920,20 +1978,22 @@ kernel void wf_shade_emissive(
 // nudged by epsilon along the normal to avoid self-intersection.
 
 kernel void wf_shade_mirror(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device packed_float3                       *origin        [[buffer(1)]],
-    device packed_float3                       *dir           [[buffer(2)]],
-    device packed_float3                       *throughput    [[buffer(3)]],
-    device uint                                *rngState      [[buffer(6)]],
-    device uint                                *bounceDepth   [[buffer(7)]],
-    device uint                                *alive         [[buffer(8)]],
-    device const int                           *matIdx        [[buffer(9)]],
-    device const packed_float3                 *hit           [[buffer(10)]],
-    device const packed_float3                 *normalIn      [[buffer(11)]],
-    device const GpuMaterial                   *materials     [[buffer(14)]],
-    device const uint                          *queue         [[buffer(24)]],
-    constant uint                              &queueLen      [[buffer(25)]],
-    uint                                        tid           [[thread_position_in_grid]])
+    constant Uniforms                          &u                  [[buffer(0)]],
+    device packed_float3                       *origin             [[buffer(1)]],
+    device packed_float3                       *dir                [[buffer(2)]],
+    device packed_float3                       *throughput         [[buffer(3)]],
+    device uint                                *rngState           [[buffer(6)]],
+    device uint                                *bounceDepth        [[buffer(7)]],
+    device uint                                *alive              [[buffer(8)]],
+    device const int                           *matIdx             [[buffer(9)]],
+    device const packed_float3                 *hit                [[buffer(10)]],
+    device const packed_float3                 *normalIn           [[buffer(11)]],
+    device const GpuMaterial                   *materials          [[buffer(14)]],
+    device const uint                          *queue              [[buffer(24)]],
+    constant uint                              &queueLen           [[buffer(25)]],
+    device const float4                        *lambdas            [[buffer(27)]],
+    device float4                              *spectralThroughput [[buffer(28)]],
+    uint                                        tid                [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
@@ -1946,26 +2006,40 @@ kernel void wf_shade_mirror(
     if (!entering) N = -N;
 
     int mi = matIdx[gid];
-    float3 albedo = materials[mi].albedo.rgb;
-    float3 t = throughput[gid];
-
     float3 newDir = reflect(rd, N);
     float3 newOrigin = h + N * 1e-3f;
-    t *= albedo;
-
     uint depth = bounceDepth[gid] + 1u;
     uint seed = rngState[gid];
+
+    // BSDF math splits on RGB vs spectral, but RR + termination is
+    // shared. RR uses max(albedo) for RGB and albedoLam.x for spectral
+    // (same convention megakernel uses in tracePathSpectral so the hero
+    // wavelength drives the survival probability).
     bool alive_after = true;
-    if (u.useRussian != 0 && depth >= 2u) {
-        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
-        if (rand(seed) > p) alive_after = false;
-        else t /= p;
+    if (u.useSpectral != 0) {
+        float4 lams      = lambdas[gid];
+        float4 albedoLam = albedoAt4(materials[mi], lams);
+        float4 spThru    = spectralThroughput[gid] * albedoLam;
+        if (u.useRussian != 0 && depth >= 2u) {
+            float p = clamp(albedoLam.x, 0.05f, 0.95f);
+            if (rand(seed) > p) alive_after = false;
+            else spThru /= p;
+        }
+        spectralThroughput[gid] = spThru;
+    } else {
+        float3 albedo = materials[mi].albedo.rgb;
+        float3 t      = throughput[gid] * albedo;
+        if (u.useRussian != 0 && depth >= 2u) {
+            float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
+            if (rand(seed) > p) alive_after = false;
+            else t /= p;
+        }
+        throughput[gid] = t;
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
-    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
@@ -3727,6 +3801,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     }
                     [enc setBuffer:queueBuf            offset:0 atIndex:24];
                     [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
+                    [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
+                    [enc setBuffer:wfBufs.spectralThroughput offset:0 atIndex:28];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 };
