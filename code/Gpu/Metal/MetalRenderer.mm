@@ -1806,6 +1806,381 @@ kernel void wf_compact_by_material(
         }
     }
 }
+
+// ============================================================
+// ==== Wavefront shading kernels (one per material type) ====
+// ============================================================
+//
+// Each kernel reads its material's compacted queue (produced by
+// wf_compact_by_material) and processes ONLY rays of that material
+// type. No material branching inside a kernel = no divergence inside
+// a SIMD group = the whole point of wavefront.
+//
+// Common pattern per kernel:
+//   1. Read queue[matType][thread] to get the ray's global index gid.
+//   2. Load ray state (origin, direction, throughput, color, rngState,
+//      bounceDepth) and hit info (hitPos, normal, matIdx) from the
+//      SoA buffers at index gid.
+//   3. Read materials[matIdx]. Flip the surface normal if back-facing
+//      (entering = dot(rd, N) < 0; if not entering, N = -N) so all
+//      downstream math sees an outward-facing normal.
+//   4. Apply the material's bounce math (different per kernel).
+//   5. For the diffuse kernel: also do next-event-estimation against
+//      area lights (shadow ray cast, MIS-weighted contribution added
+//      to the color accumulator). Other kernels skip NEE because their
+//      BSDFs are delta functions (no diffuse component to direct-light).
+//   6. Russian roulette + max-depth termination: bounceDepth + 1, RR
+//      check using max(throughput), set alive=0 if terminated.
+//   7. Write updated state back to RayState SoA.
+//
+// Dispatch shape: 1D over the queue length. The host driver (commit
+// #6) reads queueCounters[matType] after compaction to size each
+// shading kernel's grid; if the queue is empty for a given material,
+// the dispatch is skipped entirely.
+//
+// Buffer-binding layout (each kernel binds only what it touches):
+//   buffer(0)         uniforms (read)
+//   buffer(1..6)      origin xyz, dir xyz (R+W, overwritten per bounce)
+//   buffer(7..9)      throughput rgb (R+W)
+//   buffer(10..12)    color rgb (R+W, where light accumulates)
+//   buffer(14)        rngState (R+W)
+//   buffer(15)        bounceDepth (R+W)
+//   buffer(16)        alive (W, set to 0 on terminate)
+//   buffer(17..23)    hit info (R only - already populated by intersect)
+//   buffer(24..30)    scene buffers (R, only diffuse uses all of them
+//                     for shadow rays; mirror/glass/emissive bind just
+//                     materials)
+//   buffer(36)        this material's input queue (read; provides
+//                     ray index for each thread)
+//   buffer(37)        this material's queue length (uniform-style,
+//                     passed as a single-element buffer so the kernel
+//                     can guard against an extra-large dispatch grid)
+// pixelIdx (buffer 13) is unused by shading kernels - the post-pass
+// output writeback kernel uses it.
+
+// ---- Emissive: terminate with light contribution -------------------
+//
+// Ray hit an emissive surface (area light, sun, etc.). In megakernel,
+// this would be `radiance += throughput * emissive; break;`. Here we
+// add to the color accumulator and set alive=0 so the ray doesn't
+// continue to the next bounce.
+
+kernel void wf_shade_emissive(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device float                               *throughputR   [[buffer(7)]],
+    device float                               *throughputG   [[buffer(8)]],
+    device float                               *throughputB   [[buffer(9)]],
+    device float                               *colorR        [[buffer(10)]],
+    device float                               *colorG        [[buffer(11)]],
+    device float                               *colorB        [[buffer(12)]],
+    device uint                                *alive         [[buffer(16)]],
+    device const int                           *matIdx        [[buffer(17)]],
+    device const GpuMaterial                   *materials     [[buffer(26)]],
+    device const uint                          *queue         [[buffer(36)]],
+    constant uint                              &queueLen      [[buffer(37)]],
+    uint                                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= queueLen) return;
+    uint gid = queue[tid];
+
+    int mi = matIdx[gid];
+    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    float3 emissive = materials[mi].emissive.rgb;
+
+    colorR[gid] += throughput.x * emissive.x;
+    colorG[gid] += throughput.y * emissive.y;
+    colorB[gid] += throughput.z * emissive.z;
+    alive[gid] = 0u;
+}
+
+// ---- Mirror: perfect specular reflection ---------------------------
+//
+// Reflect the direction off the surface normal, modulate throughput
+// by albedo. No PDF division because mirrors are delta-distribution
+// BSDFs (the integrand collapses to a single direction). Origin
+// nudged by epsilon along the normal to avoid self-intersection.
+
+kernel void wf_shade_mirror(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device float                               *originX       [[buffer(1)]],
+    device float                               *originY       [[buffer(2)]],
+    device float                               *originZ       [[buffer(3)]],
+    device float                               *dirX          [[buffer(4)]],
+    device float                               *dirY          [[buffer(5)]],
+    device float                               *dirZ          [[buffer(6)]],
+    device float                               *throughputR   [[buffer(7)]],
+    device float                               *throughputG   [[buffer(8)]],
+    device float                               *throughputB   [[buffer(9)]],
+    device uint                                *rngState      [[buffer(14)]],
+    device uint                                *bounceDepth   [[buffer(15)]],
+    device uint                                *alive         [[buffer(16)]],
+    device const int                           *matIdx        [[buffer(17)]],
+    device const float                         *hitX          [[buffer(18)]],
+    device const float                         *hitY          [[buffer(19)]],
+    device const float                         *hitZ          [[buffer(20)]],
+    device const float                         *normalX       [[buffer(21)]],
+    device const float                         *normalY       [[buffer(22)]],
+    device const float                         *normalZ       [[buffer(23)]],
+    device const GpuMaterial                   *materials     [[buffer(26)]],
+    device const uint                          *queue         [[buffer(36)]],
+    constant uint                              &queueLen      [[buffer(37)]],
+    uint                                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= queueLen) return;
+    uint gid = queue[tid];
+
+    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
+    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
+    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+
+    bool entering = dot(rd, N) < 0.0f;
+    if (!entering) N = -N;
+
+    int mi = matIdx[gid];
+    float3 albedo = materials[mi].albedo.rgb;
+    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+
+    float3 newDir = reflect(rd, N);
+    float3 newOrigin = hit + N * 1e-3f;
+    throughput *= albedo;
+
+    // Russian roulette + max-depth termination, matching the
+    // megakernel's bounce loop ordering: RR fires when bounce>=1,
+    // and depth check fires after.
+    uint depth = bounceDepth[gid] + 1u;
+    uint seed = rngState[gid];
+    bool alive_after = true;
+    if (u.useRussian != 0 && depth >= 2u) {
+        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
+        if (rand(seed) > p) alive_after = false;
+        else throughput /= p;
+    }
+    if (depth >= uint(u.depth)) alive_after = false;
+
+    originX[gid] = newOrigin.x; originY[gid] = newOrigin.y; originZ[gid] = newOrigin.z;
+    dirX[gid]    = newDir.x;    dirY[gid]    = newDir.y;    dirZ[gid]    = newDir.z;
+    throughputR[gid] = throughput.x;
+    throughputG[gid] = throughput.y;
+    throughputB[gid] = throughput.z;
+    rngState[gid]    = seed;
+    bounceDepth[gid] = depth;
+    alive[gid]       = alive_after ? 1u : 0u;
+}
+
+// ---- Glass: dielectric refraction via Schlick Fresnel --------------
+//
+// Calls dielectricBounce (existing helper from megakernel) which
+// handles the entering / total-internal-reflection cases and returns
+// a new direction + origin. Same math as megakernel's transparent-
+// material branch in tracePath.
+
+kernel void wf_shade_glass(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device float                               *originX       [[buffer(1)]],
+    device float                               *originY       [[buffer(2)]],
+    device float                               *originZ       [[buffer(3)]],
+    device float                               *dirX          [[buffer(4)]],
+    device float                               *dirY          [[buffer(5)]],
+    device float                               *dirZ          [[buffer(6)]],
+    device float                               *throughputR   [[buffer(7)]],
+    device float                               *throughputG   [[buffer(8)]],
+    device float                               *throughputB   [[buffer(9)]],
+    device uint                                *rngState      [[buffer(14)]],
+    device uint                                *bounceDepth   [[buffer(15)]],
+    device uint                                *alive         [[buffer(16)]],
+    device const int                           *matIdx        [[buffer(17)]],
+    device const float                         *hitX          [[buffer(18)]],
+    device const float                         *hitY          [[buffer(19)]],
+    device const float                         *hitZ          [[buffer(20)]],
+    device const float                         *normalX       [[buffer(21)]],
+    device const float                         *normalY       [[buffer(22)]],
+    device const float                         *normalZ       [[buffer(23)]],
+    device const GpuMaterial                   *materials     [[buffer(26)]],
+    device const uint                          *queue         [[buffer(36)]],
+    constant uint                              &queueLen      [[buffer(37)]],
+    uint                                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= queueLen) return;
+    uint gid = queue[tid];
+
+    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
+    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
+    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+
+    bool entering = dot(rd, N) < 0.0f;
+    if (!entering) N = -N;
+
+    int mi = matIdx[gid];
+    GpuMaterial mat = materials[mi];
+    float3 albedo = mat.albedo.rgb;
+    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    uint seed = rngState[gid];
+
+    DielectricOut b = dielectricBounce(rd, N, hit, entering, mat.ior, rand(seed));
+    throughput *= albedo;
+
+    uint depth = bounceDepth[gid] + 1u;
+    bool alive_after = true;
+    if (u.useRussian != 0 && depth >= 2u) {
+        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
+        if (rand(seed) > p) alive_after = false;
+        else throughput /= p;
+    }
+    if (depth >= uint(u.depth)) alive_after = false;
+
+    originX[gid] = b.origin.x; originY[gid] = b.origin.y; originZ[gid] = b.origin.z;
+    dirX[gid]    = b.dir.x;    dirY[gid]    = b.dir.y;    dirZ[gid]    = b.dir.z;
+    throughputR[gid] = throughput.x;
+    throughputG[gid] = throughput.y;
+    throughputB[gid] = throughput.z;
+    rngState[gid]    = seed;
+    bounceDepth[gid] = depth;
+    alive[gid]       = alive_after ? 1u : 0u;
+}
+
+// ---- Diffuse: cosine-weighted hemisphere + NEE direct lighting -----
+//
+// The most involved kernel. Two contributions:
+//   1. Direct lighting via next-event estimation: pick a point on an
+//      area light, cast a shadow ray, accumulate the (visibility *
+//      G-term * albedo/PI * emissive * totalLightArea) integrand.
+//      MIS weighting when useMIS is on (matches megakernel exactly).
+//   2. Indirect: cosine-weighted hemisphere sample for the next-bounce
+//      direction, throughput *= albedo. (PI cancellation: BRDF =
+//      albedo/PI, PDF = cosTheta/PI, BRDF*cosTheta/PDF = albedo. The
+//      cosTheta * PI cancellation is why we don't see an explicit
+//      cosTheta in the throughput update.)
+
+kernel void wf_shade_diffuse(
+    constant Uniforms                          &u             [[buffer(0)]],
+    device float                               *originX       [[buffer(1)]],
+    device float                               *originY       [[buffer(2)]],
+    device float                               *originZ       [[buffer(3)]],
+    device float                               *dirX          [[buffer(4)]],
+    device float                               *dirY          [[buffer(5)]],
+    device float                               *dirZ          [[buffer(6)]],
+    device float                               *throughputR   [[buffer(7)]],
+    device float                               *throughputG   [[buffer(8)]],
+    device float                               *throughputB   [[buffer(9)]],
+    device float                               *colorR        [[buffer(10)]],
+    device float                               *colorG        [[buffer(11)]],
+    device float                               *colorB        [[buffer(12)]],
+    device uint                                *rngState      [[buffer(14)]],
+    device uint                                *bounceDepth   [[buffer(15)]],
+    device uint                                *alive         [[buffer(16)]],
+    device const int                           *matIdx        [[buffer(17)]],
+    device const float                         *hitX          [[buffer(18)]],
+    device const float                         *hitY          [[buffer(19)]],
+    device const float                         *hitZ          [[buffer(20)]],
+    device const float                         *normalX       [[buffer(21)]],
+    device const float                         *normalY       [[buffer(22)]],
+    device const float                         *normalZ       [[buffer(23)]],
+    device const GpuSphere                     *spheres       [[buffer(24)]],
+    device const GpuPlane                      *planes        [[buffer(25)]],
+    device const GpuMaterial                   *materials     [[buffer(26)]],
+    device const GpuTriangle                   *triangles     [[buffer(27)]],
+    device const GpuBvhNode                    *bvhNodes      [[buffer(28)]],
+    device const GpuLight                      *lights        [[buffer(29)]],
+    device const GpuLightTriangle              *lightTris     [[buffer(30)]],
+    device const uint                          *queue         [[buffer(36)]],
+    constant uint                              &queueLen      [[buffer(37)]],
+    uint                                        tid           [[thread_position_in_grid]])
+{
+    if (tid >= queueLen) return;
+    uint gid = queue[tid];
+
+    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
+    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
+    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+
+    bool entering = dot(rd, N) < 0.0f;
+    if (!entering) N = -N;
+
+    int mi = matIdx[gid];
+    float3 albedo = materials[mi].albedo.rgb;
+    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    uint seed = rngState[gid];
+
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
+                lights, lightTris };
+
+    // Direct lighting via NEE: average u.shadowSamples shadow rays.
+    float3 directLo = float3(0.0f);
+    if (u.totalLightArea > 0.0f) {
+        for (int s = 0; s < u.shadowSamples; s++) {
+            float3 sampleP, sampleN, sampleEmissive;
+            int sampleMatIdx;
+            sampleAreaLight(S, seed, sampleP, sampleN, sampleEmissive, sampleMatIdx);
+
+            float3 Li = sampleP - hit;
+            float3 wi = normalize(Li);
+            float cosTheta = max(0.0f, dot(wi, N));
+            float lightDist2 = dot(Li, Li);
+            float3 shadowOrigin = (cosTheta <= 0.0f) ? hit - N * 1e-3f : hit + N * 1e-3f;
+
+            bool occluded = false;
+            float3 sh, sN;
+            int sMat;
+            if (sceneIntersect(S, shadowOrigin, wi, sh, sN, sMat)) {
+                float3 d = sh - shadowOrigin;
+                float occluderDist2 = dot(d, d);
+                if (occluderDist2 < lightDist2 - 1e-3f) {
+                    GpuMaterial om = S.materials[sMat];
+                    if (!any(om.emissive.rgb > float3(0.0f))) occluded = true;
+                }
+            }
+
+            if (!occluded) {
+                float cosLight = max(0.0f, dot(sampleN, -wi));
+                float G = (cosTheta * cosLight) / lightDist2;
+                float3 directContrib = (albedo / PI) * sampleEmissive * G * u.totalLightArea;
+                if (u.useMIS != 0 && cosLight > 1e-6f) {
+                    float pdfLight = lightDist2 / (cosLight * u.totalLightArea);
+                    float pdfBrdf  = cosTheta / PI;
+                    float w = (pdfLight * pdfLight) /
+                              (pdfLight * pdfLight + pdfBrdf * pdfBrdf);
+                    directContrib *= w;
+                }
+                directLo += directContrib;
+            }
+        }
+        directLo /= float(u.shadowSamples);
+    }
+    // Accumulate direct lighting into the color buffer.
+    float3 directAdd = throughput * directLo;
+    colorR[gid] += directAdd.x;
+    colorG[gid] += directAdd.y;
+    colorB[gid] += directAdd.z;
+
+    // Russian roulette: same conditions as megakernel (after bounce 0).
+    uint depth = bounceDepth[gid] + 1u;
+    bool alive_after = true;
+    if (u.useRussian != 0 && depth >= 2u) {
+        float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
+        if (rand(seed) > p) alive_after = false;
+        else throughput /= p;
+    }
+    if (depth >= uint(u.depth)) alive_after = false;
+
+    // Indirect: cosine-weighted hemisphere sample. Stratified
+    // sampling not supported in wavefront v1 (the megakernel uses it
+    // for the first bounce only; wavefront's loss of explicit per-
+    // sample indexing makes the same trick hard to plumb. Documented
+    // as a minor quality-vs-coherence trade-off; the impact on noise
+    // for typical Picture-class renders is small).
+    float3 newDir = sampleHemisphere(N, seed);
+    float3 newOrigin = hit + N * 1e-3f;
+    throughput *= albedo;
+
+    originX[gid] = newOrigin.x; originY[gid] = newOrigin.y; originZ[gid] = newOrigin.z;
+    dirX[gid]    = newDir.x;    dirY[gid]    = newDir.y;    dirZ[gid]    = newDir.z;
+    throughputR[gid] = throughput.x;
+    throughputG[gid] = throughput.y;
+    throughputB[gid] = throughput.z;
+    rngState[gid]    = seed;
+    bounceDepth[gid] = depth;
+    alive[gid]       = alive_after ? 1u : 0u;
+}
 )MSL";
 
 // ---------- Host-side POD layouts mirroring the MSL structs ---------------
@@ -2225,6 +2600,10 @@ struct MetalRenderer::Impl
     id<MTLComputePipelineState> pipelineWfRayGen     = nil;
     id<MTLComputePipelineState> pipelineWfIntersect  = nil;
     id<MTLComputePipelineState> pipelineWfCompact    = nil;
+    id<MTLComputePipelineState> pipelineWfShadeEmissive = nil;
+    id<MTLComputePipelineState> pipelineWfShadeMirror   = nil;
+    id<MTLComputePipelineState> pipelineWfShadeGlass    = nil;
+    id<MTLComputePipelineState> pipelineWfShadeDiffuse  = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -2397,6 +2776,35 @@ namespace
                       << std::endl;
             return false;
         }
+
+        // Four shading kernels, one per material type. Each binds only
+        // the SoA buffers it touches (drops unused ones to stay under
+        // Metal's 31-buffer-per-kernel limit). Mirror/glass/emissive
+        // bind a minimal scene (materials only); diffuse binds the full
+        // scene because NEE shadow rays go through sceneIntersect.
+        auto buildShadingPipeline = [&](const char *name,
+                                        id<MTLComputePipelineState> *out) -> bool {
+            id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+            if (!fn) {
+                std::cerr << "MetalRenderer: MSL kernel '" << name
+                          << "' not found" << std::endl;
+                return false;
+            }
+            NSError *e = nil;
+            *out = [im.device newComputePipelineStateWithFunction:fn error:&e];
+            if (!*out) {
+                std::cerr << "MetalRenderer: wavefront shading pipeline '"
+                          << name << "' build failed: "
+                          << (e ? [[e localizedDescription] UTF8String] : "(no error info)")
+                          << std::endl;
+                return false;
+            }
+            return true;
+        };
+        if (!buildShadingPipeline("wf_shade_emissive", &im.pipelineWfShadeEmissive)) return false;
+        if (!buildShadingPipeline("wf_shade_mirror",   &im.pipelineWfShadeMirror))   return false;
+        if (!buildShadingPipeline("wf_shade_glass",    &im.pipelineWfShadeGlass))    return false;
+        if (!buildShadingPipeline("wf_shade_diffuse",  &im.pipelineWfShadeDiffuse))  return false;
 
         // Return-by-value here, not a reference-out parameter: ARC
         // reference parameters default to __autoreleasing ownership,
