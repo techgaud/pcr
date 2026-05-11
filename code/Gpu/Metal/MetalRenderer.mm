@@ -3727,20 +3727,35 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     //     1080^2 Picture). Working set grows linearly; alloc may fail at
     //     very high resolutions in multi-spp mode, in which case the
     //     renderer falls back to megakernel.
+    // Fork-mode allocations expand each per-ray SoA buffer by 4x to
+    // hold up to three forked sub-rays per primary at the first
+    // dispersive glass refraction. The "natural" ray count for
+    // dispatching at the base case is pixelCount * samplesPerPass; the
+    // allocated slot count is 4x that when fork is on. Both numbers
+    // are needed downstream -- baseRayCount sizes per-pixel iteration
+    // in writeback / ray-gen, bufferSlots sizes the wavefront kernel
+    // dispatches and the SoA allocations.
     WavefrontRayBuffers wfBufs;
+    NSUInteger baseRayCount = 0;
+    NSUInteger bufferSlots  = 0;
+    bool spectralForkActive = effectiveWavefront && useSpectral && spectralFork;
     if (effectiveWavefront)
     {
         NSUInteger pixelCount = NSUInteger(_width) * NSUInteger(_height);
-        NSUInteger rayCount = pixelCount * NSUInteger(samplesPerPass);
-        wfBufs = allocateWavefrontBuffers(_impl->device, rayCount, pixelCount);
+        baseRayCount = pixelCount * NSUInteger(samplesPerPass);
+        bufferSlots  = spectralForkActive ? 4 * baseRayCount : baseRayCount;
+        wfBufs = allocateWavefrontBuffers(_impl->device, bufferSlots, pixelCount);
         if (!wfBufs.valid)
         {
             std::cerr << "MetalRenderer: failed to allocate wavefront SoA "
-                      << "buffers for " << rayCount << " rays "
-                      << "(samplesPerPass=" << samplesPerPass
+                      << "buffers for " << bufferSlots << " slots "
+                      << "(baseRayCount=" << baseRayCount
+                      << ", samplesPerPass=" << samplesPerPass
+                      << ", spectralFork=" << (spectralForkActive ? 1 : 0)
                       << "); falling back to megakernel for this render."
                       << std::endl;
             effectiveWavefront = false;
+            spectralForkActive = false;
         }
     }
 
@@ -3762,18 +3777,21 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         // code; deferred until profiling shows it matters.
 
         NSUInteger pixelCount = NSUInteger(_width) * NSUInteger(_height);
-        NSUInteger rayCount   = pixelCount * NSUInteger(samplesPerPass);
         // 2D dispatch over (width, height) for output writeback (one
         // thread per pixel).
         MTLSize threadgroups2D = MTLSizeMake(
             (NSUInteger)((_width  + tgX - 1) / tgX),
             (NSUInteger)((_height + tgY - 1) / tgY), 1);
-        // 1D dispatch over rayCount for ray-gen / intersect / compact /
-        // shading. rayCount in 1spp mode is pixelCount; in multi-spp
-        // mode it's pixelCount * samplesPerPass.
+        // 1D dispatch over the allocated SoA slot count for ray-gen /
+        // intersect / compact / shading. When spectralFork is on,
+        // bufferSlots is 4 * baseRayCount to hold fork sub-rays; the
+        // first baseRayCount slots are primaries and slots beyond are
+        // fork-claim space. Kernels still bounds-check internally on
+        // baseRayCount until the glass kernel starts populating fork
+        // slots; over-dispatch threads early-return harmlessly.
         NSUInteger linearThreadsPerGroup = NSUInteger(tgX) * NSUInteger(tgY);
         MTLSize threadgroups1D = MTLSizeMake(
-            (rayCount + linearThreadsPerGroup - 1) / linearThreadsPerGroup, 1, 1);
+            (bufferSlots + linearThreadsPerGroup - 1) / linearThreadsPerGroup, 1, 1);
         MTLSize threadsPerGroup1D = MTLSizeMake(linearThreadsPerGroup, 1, 1);
 
         // Zero the per-pixel Welford state buffer once at render start.
