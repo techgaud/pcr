@@ -1532,6 +1532,7 @@ kernel void wf_generate_primary_rays(
     device uint                *rngState     [[buffer(6)]],
     device uint                *bounceDepth  [[buffer(7)]],
     device uint                *alive        [[buffer(8)]],
+    device const Welford       *pixelWelford [[buffer(26)]],
     uint                        gid          [[thread_position_in_grid]])
 {
     // 1D dispatch over rayCount = pixelCount * samplesPerPass.
@@ -1547,6 +1548,19 @@ kernel void wf_generate_primary_rays(
     uint sampleSlot    = gid / pixelCount;
     int2 pix = int2(int(pixelIdxLocal % uint(u.width)),
                     int(pixelIdxLocal / uint(u.width)));
+
+    // Adaptive convergence early-exit: pixelWelford[pixelIdxLocal].done
+    // is set by the writeback kernel once a pixel's running mean has
+    // stabilized (taken >= 4 aaIdx with rel variance < 0.05). Done
+    // pixels skip primary-ray gen entirely - we just zero alive and
+    // the downstream intersect / compaction / shading kernels treat
+    // the ray as terminated.
+    if (u.useAdaptive != 0 && pixelWelford[pixelIdxLocal].done != 0) {
+        alive[gid] = 0u;
+        bounceDepth[gid] = 0u;
+        pixelIdx[gid] = pixelIdxLocal;
+        return;
+    }
 
     // RNG seed: includes sampleSlot so the N rays for a pixel within
     // one pipeline run get decorrelated random sequences. The
@@ -2144,6 +2158,7 @@ kernel void wf_shade_diffuse(
 kernel void wf_output_writeback(
     constant Uniforms                          &u             [[buffer(0)]],
     device const packed_float3                 *color         [[buffer(4)]],
+    device Welford                             *pixelWelford  [[buffer(26)]],
     texture2d<float, access::read_write>        output        [[texture(0)]],
     uint2                                       gid           [[thread_position_in_grid]])
 {
@@ -2152,17 +2167,90 @@ kernel void wf_output_writeback(
     uint pixelCount = uint(u.width) * uint(u.height);
     uint samples    = max(1u, uint(u.sampleCount));
 
+    // Adaptive convergence early-exit. Done pixels keep their
+    // last-written running-mean in the output texture; we skip the
+    // sum-and-accumulate work entirely.
+    if (u.useAdaptive != 0 && pixelWelford[pixelIdx].done != 0)
+        return;
+
     float3 sumThisPass = float3(0.0f);
     for (uint s = 0u; s < samples; s++) {
         uint rayIdx = s * pixelCount + pixelIdx;
         sumThisPass += float3(color[rayIdx]);
     }
 
-    // First-touch (first dispatch covering this pixel within the
-    // render) clobbers the texture; subsequent passes accumulate.
-    // Matches the megakernel non-adaptive multi-pass first-touch
-    // convention so the texture-accumulation semantics are identical
-    // between the two architectures.
+    if (u.useAdaptive != 0) {
+        // Adaptive path: accumulate this pass's contribution into the
+        // per-pixel Welford staging buffer. On the last batch of an
+        // aaIdx (batchEndOfAa=1), finalize the AA-iteration mean,
+        // fold it into the Welford accumulator, check for convergence,
+        // and write the running mean to the output texture.
+        //
+        // Mid-aaIdx passes: don't touch the output texture. It keeps
+        // showing the last-written mean from the previous aaIdx
+        // boundary. CPU readback for the adaptive path therefore
+        // skips the divide-by-total step (texture is already in mean
+        // space, not sum space).
+        pixelWelford[pixelIdx].stagingR += sumThisPass.x;
+        pixelWelford[pixelIdx].stagingG += sumThisPass.y;
+        pixelWelford[pixelIdx].stagingB += sumThisPass.z;
+
+        if (u.batchEndOfAa != 0)
+        {
+            // Sum-of-samples-this-aaIdx -> per-aaIdx mean.
+            float invSamples = 1.0f / float(max(1, u.samples));
+            float3 aaMean = float3(pixelWelford[pixelIdx].stagingR,
+                                    pixelWelford[pixelIdx].stagingG,
+                                    pixelWelford[pixelIdx].stagingB) * invSamples;
+
+            // Reset staging for the next aaIdx.
+            pixelWelford[pixelIdx].stagingR = 0.0f;
+            pixelWelford[pixelIdx].stagingG = 0.0f;
+            pixelWelford[pixelIdx].stagingB = 0.0f;
+
+            // Welford update over completed-aaIdx means. Same
+            // formulation as megakernel adaptive's path_trace_pass_adaptive
+            // so the convergence behavior matches: each data point is
+            // one AA iteration's mean, threshold 0.05 on relative
+            // variance after >= 4 taken.
+            int takenNew = pixelWelford[pixelIdx].taken + 1;
+            float3 mean = float3(pixelWelford[pixelIdx].meanR,
+                                 pixelWelford[pixelIdx].meanG,
+                                 pixelWelford[pixelIdx].meanB);
+            float3 m2 = float3(pixelWelford[pixelIdx].m2R,
+                               pixelWelford[pixelIdx].m2G,
+                               pixelWelford[pixelIdx].m2B);
+            float3 delta = aaMean - mean;
+            mean += delta / float(takenNew);
+            float3 delta2 = aaMean - mean;
+            m2 += delta * delta2;
+
+            pixelWelford[pixelIdx].meanR = mean.x;
+            pixelWelford[pixelIdx].meanG = mean.y;
+            pixelWelford[pixelIdx].meanB = mean.z;
+            pixelWelford[pixelIdx].m2R   = m2.x;
+            pixelWelford[pixelIdx].m2G   = m2.y;
+            pixelWelford[pixelIdx].m2B   = m2.z;
+            pixelWelford[pixelIdx].taken = takenNew;
+
+            if (takenNew >= 4) {
+                float3 variance = m2 / float(takenNew - 1);
+                float3 rel = variance / (mean * mean + float3(0.01f));
+                if (max(max(rel.r, rel.g), rel.b) < 0.05f) {
+                    pixelWelford[pixelIdx].done = 1;
+                }
+            }
+
+            output.write(float4(mean, 1.0f), gid);
+        }
+        return;
+    }
+
+    // Non-adaptive path. First-touch (first dispatch covering this
+    // pixel within the render) clobbers the texture; subsequent passes
+    // accumulate. Matches the megakernel non-adaptive multi-pass
+    // first-touch convention so the texture-accumulation semantics
+    // are identical between the two architectures.
     if (u.aaIdx == 0 && u.sampleStart == 0) {
         output.write(float4(sumThisPass, 0.0f), gid);
     } else {
@@ -2410,6 +2498,15 @@ namespace
         id<MTLBuffer> queueGlass;
         id<MTLBuffer> queueEmissive;
 
+        // Per-pixel Welford state (PCRWelfordState struct, 48 bytes per
+        // pixel) for adaptive wavefront. Always allocated when wavefront
+        // is active even if useAdaptive=false; the kernels guard their
+        // reads with `u.useAdaptive` so the storage is dead-code in
+        // non-adaptive mode. The buffer is pixelCount-sized (not
+        // rayCount-sized), since adaptive convergence is decided per
+        // pixel, not per sample slot.
+        id<MTLBuffer> pixelWelford;
+
         // 4 atomic_uint counters, one per material queue. Zeroed by the
         // host (blit-encoder fill) before each compaction dispatch.
         // After compaction, queueCounters[t] = number of valid entries
@@ -2432,7 +2529,7 @@ namespace
     // dispatch path in renderInternal calls this, runs the pipeline, and
     // lets the returned struct die at scope-exit (ARC handles release).
     [[maybe_unused]] WavefrontRayBuffers allocateWavefrontBuffers(
-        id<MTLDevice> device, NSUInteger rayCount)
+        id<MTLDevice> device, NSUInteger rayCount, NSUInteger pixelCount)
     {
         WavefrontRayBuffers wf;
         wf.rayCount = rayCount;
@@ -2466,12 +2563,21 @@ namespace
         wf.queueEmissive = alloc(uintBytes);
         wf.queueCounters = alloc(4 * sizeof(uint32_t));
 
+        // Per-pixel Welford state for adaptive wavefront. Sized to
+        // pixelCount (one entry per output pixel, NOT one per ray) since
+        // adaptive convergence is decided per pixel. ~48 MB at 1080^2,
+        // ~768 MB at 4K, ~3 GB at 8K. Allocated unconditionally so the
+        // ray-gen + writeback kernels can declare it as a bound buffer
+        // parameter; the kernels guard their reads behind u.useAdaptive
+        // so it's dead memory in non-adaptive renders.
+        wf.pixelWelford = alloc(pixelCount * 48);  // 48 = sizeof(PCRWelfordState)
+
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
                     wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
-                    wf.queueCounters);
+                    wf.queueCounters && wf.pixelWelford);
         return wf;
     }
 
@@ -3061,21 +3167,37 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
 
     // Architecture selection. Wavefront baseline ships as of this
-    // commit and runs whenever useWavefront=true AND useAdaptive=false.
-    // Adaptive sampling is not yet supported in wavefront mode (per
-    // TODO.md item #1) - useWavefront + useAdaptive falls back to
-    // megakernel with a stderr warning so the user isn't silently
-    // surprised by getting one mode when they asked for another.
+    // commit and runs whenever useWavefront=true under one of the
+    // supported configurations. Configs that wavefront doesn't (yet)
+    // support fall back to megakernel with a stderr warning so the
+    // user isn't silently surprised by getting one architecture when
+    // they asked for another. Currently unsupported in wavefront:
+    //   1. useSpectral - wavefront shading kernels are RGB-only; the
+    //      spectral hero-wavelength path lives only in megakernel's
+    //      tracePathSpectral. Wavefront spectral support is its own
+    //      project (per-wavelength queues or per-wavelength state in
+    //      the ray buffers).
+    //   2. useAdaptive AND wavefrontMultiSample - adaptive works in
+    //      1spp wavefront (the writeback can finalize a per-aaIdx mean
+    //      cleanly since each pipeline run is exactly one sample), but
+    //      multi-sample-per-pass wavefront would need a more complex
+    //      reduction over the per-pass samples.
     bool effectiveWavefront = useWavefront;
-    if (useWavefront && useAdaptive)
+    if (useWavefront)
     {
-        std::cerr << "MetalRenderer: --wavefront + --adaptive isn't "
-                  << "supported yet. Falling back to megakernel for "
-                  << "this render so adaptive sampling stays active. "
-                  << "See TODO.md item #1 for the design that brings "
-                  << "adaptive into wavefront mode."
-                  << std::endl;
-        effectiveWavefront = false;
+        const char *fallbackReason = nullptr;
+        if (useSpectral)
+            fallbackReason = "spectral mode";
+        else if (useAdaptive && wavefrontMultiSample)
+            fallbackReason = "adaptive + multi-sample-per-pass";
+        if (fallbackReason)
+        {
+            std::cerr << "MetalRenderer: wavefront doesn't support "
+                      << fallbackReason << " yet. Falling back to "
+                      << "megakernel for this render."
+                      << std::endl;
+            effectiveWavefront = false;
+        }
     }
 
     if (!initMetal(*_impl, _width, _height)) return;
@@ -3354,7 +3476,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     {
         NSUInteger pixelCount = NSUInteger(_width) * NSUInteger(_height);
         NSUInteger rayCount = pixelCount * NSUInteger(samplesPerPass);
-        wfBufs = allocateWavefrontBuffers(_impl->device, rayCount);
+        wfBufs = allocateWavefrontBuffers(_impl->device, rayCount, pixelCount);
         if (!wfBufs.valid)
         {
             std::cerr << "MetalRenderer: failed to allocate wavefront SoA "
@@ -3398,6 +3520,28 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             (rayCount + linearThreadsPerGroup - 1) / linearThreadsPerGroup, 1, 1);
         MTLSize threadsPerGroup1D = MTLSizeMake(linearThreadsPerGroup, 1, 1);
 
+        // Zero the per-pixel Welford state buffer once at render start.
+        // Metal private storage is uninitialized; the writeback kernel
+        // and ray-gen kernel both READ from this buffer (welford.done
+        // and welford.staging*) on every pass, so garbage initial values
+        // would cause pixels to be misclassified as "done" or accumulate
+        // into NaN staging. A single blit-fill is essentially free
+        // compared to the render and avoids the alternative of kernel-
+        // side first-touch init logic.
+        if (useAdaptive)
+        {
+            id<MTLCommandBuffer> initCmd = [_impl->queue commandBuffer];
+            id<MTLBlitCommandEncoder> blit = [initCmd blitCommandEncoder];
+            NSUInteger welfordBytes = pixelCount * 48;
+            [blit fillBuffer:wfBufs.pixelWelford
+                       range:NSMakeRange(0, welfordBytes)
+                       value:0];
+            [blit endEncoding];
+            [initCmd commit];
+            // Queue is serial; the fill completes before any subsequent
+            // cmdbuf's compute work. No waitUntilCompleted needed.
+        }
+
         for (int p = 0; p < totalPasses; p++)
         {
             if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
@@ -3428,6 +3572,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
                 [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
                 [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                [enc setBuffer:wfBufs.pixelWelford offset:0 atIndex:26];
                 [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                 [enc endEncoding];
             }
@@ -3552,6 +3697,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setComputePipelineState:_impl->pipelineWfWriteback];
                 [enc setBuffer:uniformsBuf offset:p * uniformsStride atIndex:0];
                 [enc setBuffer:wfBufs.color offset:0 atIndex:4];
+                [enc setBuffer:wfBufs.pixelWelford offset:0 atIndex:26];
                 [enc setTexture:_impl->outputTex atIndex:0];
                 [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
                 [enc endEncoding];

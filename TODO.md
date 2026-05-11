@@ -47,23 +47,30 @@ Low. Single-file change in `OidnDenoise.cpp`. Existing CPU-only OIDN device (sel
 
 Render `cornell` at d=4 / s=64 (low samples to maximize noise so denoise is visible), with `useOIDN=true` and `useDenoise=false`, compare wallclock + image quality before / after. After the fix the output should be visibly smoother and stderr should show no OIDN error.
 
-## Adaptive sampling in wavefront mode
+## Adaptive sampling in wavefront multi-sample-per-pass mode
 
-**Status:** explicit limitation as of the wavefront baseline. `useAdaptive` is silently honored only when `useWavefront=false` (megakernel multi-pass). When `useWavefront=true`, the adaptive flag is ignored and a stderr warning fires.
+**Status:** partial. Adaptive sampling works in `useWavefront + wavefrontMultiSample=false` (1-spp wavefront). The writeback kernel accumulates per-pass contributions into a per-pixel staging slot and, on the last sample of each aaIdx, finalizes the iteration's mean, folds it into a Welford accumulator, checks for convergence, and writes the running mean to the output texture. Done pixels short-circuit in ray-gen and the rest of the pipeline.
 
-### Why deferred
+`useWavefront + useAdaptive + wavefrontMultiSample=true` still falls back to megakernel with a stderr warning.
 
-Megakernel adaptive keeps per-pixel Welford state in a device buffer, updated at AA-iteration boundaries (the last batch of each aaIdx fires the convergence check). Wavefront has no AA-iteration boundary per-pixel because rays from different pixels interleave through the shading kernels, so the existing Welford-update trigger doesn't map across cleanly.
+### Why deferred for multi-spp
 
-### Two paths forward (pick one when revisiting)
+The 1-spp variant works because each pipeline run is exactly one sample for each pixel, so the writeback can sum them across passes into staging and divide by `u.samples` at the aaIdx boundary cleanly. Multi-spp packs `samplesPerPass` samples per pixel per pass, which means the writeback's per-pixel-per-aaIdx sum needs to thread through both a within-pass sample-axis loop AND the cross-pass staging accumulator. Doable, just more bookkeeping.
 
-1. **Run wavefront within each AA iteration.** One full wavefront pipeline run per aaIdx. Welford updates between passes, same per-pixel device buffer pattern as megakernel multi-pass. Preserves the existing adaptive semantics and convergence threshold. Cost: each pipeline run has 1/aaSamples the rays-in-flight that a one-shot wavefront run would have, so some of wavefront's ray-parallelism gain is given back. Probably still net positive for divergence-heavy scenes.
+### Implementation outline (for multi-spp)
 
-2. **Per-ray Welford in the ray state struct.** Each ray carries running mean/M2/count for its destination pixel. Convergence is checked when a ray terminates (no hit or depth exceeded), at which point a "this pixel is done" flag is set in a per-pixel mask. Subsequent primary-ray generation skips done pixels. More complex (Welford state now lives on the hot ray-state path), but preserves wavefront's one-shot pipeline.
+The 1-spp writeback already does:
+```
+sumThisPass = sum of color[s*pixelCount + pixelIdx] for s in 0..sampleCount
+staging += sumThisPass
+if batchEndOfAa: aaMean = staging / samples; Welford update; reset staging
+```
+
+For multi-spp: `sumThisPass` is already a multi-sample sum (sampleCount > 1). The math should already work - `staging` becomes a sum of all samples in the aaIdx across all batches, divide by `u.samples` at boundary. Need to test that the 1-spp writeback handles sampleCount > 1 correctly when fallback gate is lifted. Probably 5-line change.
 
 ### When to revisit
 
-Right after the wavefront baseline ships and proves itself on non-adaptive renders. Top of the TODO list because Nate uses adaptive often in spectral mode where the convergence early-exit is significant.
+When multi-spp wavefront becomes worth tuning. Current numbers (~2-3% win for multi-spp over 1-spp) suggest 1-spp+adaptive may be the natural daily-driver anyway, since adaptive's early-exit savings stack on top of wavefront's divergence elimination and 1-spp+adaptive has the smaller working set.
 
 ## A/B test multi-level prefix-sum vs SIMD-group-batched atomic for queue compaction
 

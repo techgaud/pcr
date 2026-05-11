@@ -384,16 +384,30 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.wavefrontMultiSample = j.wavefrontMultiSample;
 }
 
-// Returns true when the renderer will silently rewrite this job's
-// architecture choice at dispatch time. Currently fires when useWavefront
-// is on with useAdaptive (adaptive doesn't yet work in wavefront mode,
-// per TODO.md item #1, so MetalRenderer falls back to megakernel and
-// logs to stderr). The queue UI uses this to color the displaced
-// wavefront tag light red so the user can tell at a glance that what
-// they requested isn't what actually runs.
+// Returns nullptr if the job will run with its requested architecture,
+// or a short human-readable reason if the renderer will silently
+// rewrite the architecture at dispatch time (falling back to
+// megakernel). The queue UI uses this to color the displaced wavefront
+// tag light red and to print a "-> megakernel (reason)" hint below.
+//
+// Current fallback rules in MetalRenderer (kept in sync here):
+//   - useWavefront + useSpectral: wavefront shading kernels are
+//     RGB-only; spectral path lives only in megakernel.
+//   - useWavefront + useAdaptive + multi-sample-per-pass: adaptive
+//     works in 1spp wavefront but the multi-spp writeback's
+//     per-pass-multi-sample reduction isn't ported yet.
+static const char *wavefrontFallbackReason(const JobConfig &j)
+{
+    if (!j.useWavefront) return nullptr;
+    if (j.useSpectral) return "spectral mode";
+    if (j.useAdaptive && j.wavefrontMultiSample)
+        return "adaptive + multi-spp";
+    return nullptr;
+}
+
 static bool wavefrontWillFallback(const JobConfig &j)
 {
-    return j.useWavefront && j.useAdaptive;
+    return wavefrontFallbackReason(j) != nullptr;
 }
 
 // Render one queue row's summary inline. Each tag becomes its own
@@ -2139,10 +2153,10 @@ int main(int, char **)
 
                     ImGui::TableNextColumn();
                     renderJobSummary(r.config);
-                    if (wavefrontWillFallback(r.config))
+                    if (const char *reason = wavefrontFallbackReason(r.config))
                         ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f),
-                                           "  -> megakernel (adaptive forces "
-                                           "wavefront fallback)");
+                                           "  -> megakernel (wavefront doesn't "
+                                           "support %s yet)", reason);
                     if (r.status == JobResult::Done && !r.outputPath.empty())
                         ImGui::TextDisabled("  -> %s",
                             fs::path(r.outputPath).filename().string().c_str());
