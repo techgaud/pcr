@@ -439,9 +439,19 @@ static void renderJobSummary(const JobConfig &j)
     if (j.useRussian)    tag("rr");
     if (j.useStratified) tag("strat");
     if (j.useWavefront) {
-        const char *waveLabel = j.wavefrontMultiSample ? "wave-mspp" : "wave-1spp";
-        if (wavefrontWillFallback(j)) tagRed(waveLabel);
-        else                          tag(waveLabel);
+        // Append "-fork" to the wavefront tag when fork mode is selected
+        // AND the render is actually in spectral mode (the setting is
+        // ignored in RGB renders). Lets A/B comparisons identify the
+        // dispersion strategy from the queue row at a glance without
+        // grepping PNG metadata.
+        char waveBuf[24];
+        const char *waveBase = j.wavefrontMultiSample ? "wave-mspp" : "wave-1spp";
+        if (j.useSpectral && j.spectralFork)
+            std::snprintf(waveBuf, sizeof(waveBuf), "%s-fork", waveBase);
+        else
+            std::snprintf(waveBuf, sizeof(waveBuf), "%s", waveBase);
+        if (wavefrontWillFallback(j)) tagRed(waveBuf);
+        else                          tag(waveBuf);
     }
     char tgInfo[32];
     std::snprintf(tgInfo, sizeof(tgInfo), "tg%dx%d", j.threadgroupX, j.threadgroupY);
@@ -465,8 +475,10 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useMIS)        tags += " mis";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
-    if (j.useWavefront)
+    if (j.useWavefront) {
         tags += j.wavefrontMultiSample ? " wave-mspp" : " wave-1spp";
+        if (j.useSpectral && j.spectralFork) tags += "-fork";
+    }
     std::snprintf(buf, sizeof(buf),
                   "%s  %dx%d  d%d/s%d/S%d%s  tg%dx%d",
                   j.sceneName.c_str(), j.width, j.height,
