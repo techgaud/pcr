@@ -3392,23 +3392,23 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // support fall back to megakernel with a stderr warning so the
     // user isn't silently surprised by getting one architecture when
     // they asked for another. Currently unsupported in wavefront:
-    //   1. useSpectral - wavefront shading kernels are RGB-only; the
-    //      spectral hero-wavelength path lives only in megakernel's
-    //      tracePathSpectral. Wavefront spectral support is its own
-    //      project (per-wavelength queues or per-wavelength state in
-    //      the ray buffers).
-    //   2. useAdaptive AND wavefrontMultiSample - adaptive works in
-    //      1spp wavefront (the writeback can finalize a per-aaIdx mean
-    //      cleanly since each pipeline run is exactly one sample), but
-    //      multi-sample-per-pass wavefront would need a more complex
-    //      reduction over the per-pass samples.
+    //   - useAdaptive AND wavefrontMultiSample - adaptive works in
+    //     1spp wavefront (the writeback can finalize a per-aaIdx mean
+    //     cleanly since each pipeline run is exactly one sample), but
+    //     multi-sample-per-pass wavefront would need a more complex
+    //     reduction over the per-pass samples.
+    //
+    // Spectral mode is supported in wavefront via 4 hero wavelengths
+    // (Wilkie 2014) per ray with terminate-on-dispersion at glass hits.
+    // Convergence vs megakernel hero=4: similar on diffuse-dominant
+    // scenes, slightly worse on dispersive-glass scenes because
+    // megakernel forks four sub-paths per glass hit while wavefront
+    // keeps only the hero past dispersion.
     bool effectiveWavefront = useWavefront;
     if (useWavefront)
     {
         const char *fallbackReason = nullptr;
-        if (useSpectral)
-            fallbackReason = "spectral mode";
-        else if (useAdaptive && wavefrontMultiSample)
+        if (useAdaptive && wavefrontMultiSample)
             fallbackReason = "adaptive + multi-sample-per-pass";
         if (fallbackReason)
         {

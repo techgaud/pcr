@@ -386,15 +386,12 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
 // tag light red and to print a "-> megakernel (reason)" hint below.
 //
 // Current fallback rules in MetalRenderer (kept in sync here):
-//   - useWavefront + useSpectral: wavefront shading kernels are
-//     RGB-only; spectral path lives only in megakernel.
 //   - useWavefront + useAdaptive + multi-sample-per-pass: adaptive
 //     works in 1spp wavefront but the multi-spp writeback's
 //     per-pass-multi-sample reduction isn't ported yet.
 static const char *wavefrontFallbackReason(const JobConfig &j)
 {
     if (!j.useWavefront) return nullptr;
-    if (j.useSpectral) return "spectral mode";
     if (j.useAdaptive && j.wavefrontMultiSample)
         return "adaptive + multi-spp";
     return nullptr;
