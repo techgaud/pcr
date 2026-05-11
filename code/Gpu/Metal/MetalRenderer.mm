@@ -1644,6 +1644,140 @@ namespace
     static_assert(sizeof(PCRWelfordState) == 48,
                   "PCRWelfordState must be 48 bytes to match the MSL Welford struct");
 
+    // ---------- Wavefront ray-state SoA buffers --------------------------
+    //
+    // Per-render allocation for the wavefront path tracer. Each "field" of
+    // a ray gets its own MTLBuffer (Struct of Arrays layout) so that
+    // adjacent threads in a SIMD group read adjacent memory addresses,
+    // matching Apple Silicon's preferred coalesced-load access pattern.
+    //
+    // The alternative (AoS, one big struct per ray, all fields packed
+    // contiguously) is simpler to think about but loses coalescing because
+    // a SIMD group of 32 threads each reading "their" ray's origin_x ends
+    // up scattering 32 reads across 32 different cache lines instead of
+    // one fat coalesced load. SoA flips the layout so all 32 threads'
+    // origin_x values are contiguous, one cache line, one transaction.
+    // Production wavefront renderers (PBRT-v4, OptiX-style, Hyperion)
+    // converge on SoA for this reason.
+    //
+    // Two struct families:
+    //   - RayState (persistent across bounces): origin, direction, the
+    //     running color accumulator and throughput, pixel index, RNG
+    //     state, bounce counter, alive flag. Updated by the shading
+    //     kernels after each bounce.
+    //   - HitInfo (transient per bounce): material index, hit position,
+    //     surface normal. Written by the intersect kernel, read by the
+    //     per-material shading kernels, overwritten on the next bounce.
+    //
+    // Storage: MTLResourceStorageModePrivate (GPU-only, no CPU-side
+    // mapping needed). Allocated at render start sized by width*height
+    // since wavefront processes one (aaIdx, sample-batch) pass at a time
+    // (full-AA-times-samples in-flight at once is impractical: at 1080^2
+    // with aa=4 samples=2048 that's 9.6B rays = ~960 GB of state, doesn't
+    // fit). The pass-loop runs the wavefront pipeline aaSamples *
+    // passesPerAa times, same multi-pass structure as megakernel.
+    //
+    // Sizing per ray: 16 float fields + 4 uint fields = 80 bytes ray state
+    // + 7 float fields + 1 int field = 32 bytes hit info = 112 bytes/ray.
+    // 1080^2 = 132 MB; 4K = 1.87 GB; 8K = 7.5 GB. M1 Ultra's 64 GB
+    // unified memory comfortable up through 8K.
+    //
+    // These structs are populated by allocateWavefrontBuffers() and live
+    // for the duration of a single render() call. Buffers self-release
+    // via ARC when the holder goes out of scope.
+    struct WavefrontRayBuffers
+    {
+        // Persistent ray state (one float / uint per ray per field).
+        id<MTLBuffer> originX;
+        id<MTLBuffer> originY;
+        id<MTLBuffer> originZ;
+        id<MTLBuffer> dirX;
+        id<MTLBuffer> dirY;
+        id<MTLBuffer> dirZ;
+        id<MTLBuffer> throughputR;
+        id<MTLBuffer> throughputG;
+        id<MTLBuffer> throughputB;
+        id<MTLBuffer> colorR;
+        id<MTLBuffer> colorG;
+        id<MTLBuffer> colorB;
+        id<MTLBuffer> pixelIdx;
+        id<MTLBuffer> rngState;
+        id<MTLBuffer> bounceDepth;
+        id<MTLBuffer> alive;
+
+        // Transient hit info (overwritten by intersect each bounce).
+        id<MTLBuffer> matIdx;
+        id<MTLBuffer> hitX;
+        id<MTLBuffer> hitY;
+        id<MTLBuffer> hitZ;
+        id<MTLBuffer> normalX;
+        id<MTLBuffer> normalY;
+        id<MTLBuffer> normalZ;
+
+        NSUInteger rayCount = 0;
+        bool valid = false;
+    };
+
+    // Allocate the wavefront SoA buffer set sized to hold `rayCount` rays.
+    // All buffers are private storage (GPU-only). Returns a struct whose
+    // .valid flag is false if any allocation failed; caller checks .valid
+    // before dispatching and skips wavefront on failure.
+    //
+    // Currently unused at the call sites: the wavefront kernels haven't
+    // shipped, so renderInternal still falls back to megakernel before
+    // ever reaching this allocator. Once the kernels land, the wavefront
+    // dispatch path in renderInternal calls this, runs the pipeline, and
+    // lets the returned struct die at scope-exit (ARC handles release).
+    [[maybe_unused]] WavefrontRayBuffers allocateWavefrontBuffers(
+        id<MTLDevice> device, NSUInteger rayCount)
+    {
+        WavefrontRayBuffers wf;
+        wf.rayCount = rayCount;
+        auto alloc = [&](size_t bytes) -> id<MTLBuffer> {
+            return [device newBufferWithLength:bytes
+                                       options:MTLResourceStorageModePrivate];
+        };
+        const size_t floatBytes = rayCount * sizeof(float);
+        const size_t uintBytes  = rayCount * sizeof(uint32_t);
+        const size_t intBytes   = rayCount * sizeof(int32_t);
+
+        wf.originX     = alloc(floatBytes);
+        wf.originY     = alloc(floatBytes);
+        wf.originZ     = alloc(floatBytes);
+        wf.dirX        = alloc(floatBytes);
+        wf.dirY        = alloc(floatBytes);
+        wf.dirZ        = alloc(floatBytes);
+        wf.throughputR = alloc(floatBytes);
+        wf.throughputG = alloc(floatBytes);
+        wf.throughputB = alloc(floatBytes);
+        wf.colorR      = alloc(floatBytes);
+        wf.colorG      = alloc(floatBytes);
+        wf.colorB      = alloc(floatBytes);
+        wf.pixelIdx    = alloc(uintBytes);
+        wf.rngState    = alloc(uintBytes);
+        wf.bounceDepth = alloc(uintBytes);
+        wf.alive       = alloc(uintBytes);
+        wf.matIdx      = alloc(intBytes);
+        wf.hitX        = alloc(floatBytes);
+        wf.hitY        = alloc(floatBytes);
+        wf.hitZ        = alloc(floatBytes);
+        wf.normalX     = alloc(floatBytes);
+        wf.normalY     = alloc(floatBytes);
+        wf.normalZ     = alloc(floatBytes);
+
+        // Validate: any nil means an allocation failed (out of memory).
+        // Caller falls back to megakernel rather than crashing.
+        wf.valid = (wf.originX && wf.originY && wf.originZ &&
+                    wf.dirX && wf.dirY && wf.dirZ &&
+                    wf.throughputR && wf.throughputG && wf.throughputB &&
+                    wf.colorR && wf.colorG && wf.colorB &&
+                    wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
+                    wf.matIdx &&
+                    wf.hitX && wf.hitY && wf.hitZ &&
+                    wf.normalX && wf.normalY && wf.normalZ);
+        return wf;
+    }
+
     // Mirrors the OpenGL backend's compressZone helper (Windows long
     // zone names like "Eastern Daylight Time" -> "EDT"). On macOS the
     // POSIX abbreviations come back already short, so the map is
