@@ -103,8 +103,8 @@ int main(int argc, char *argv[])
     uint64_t seed = 0;
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
-    bool useWavefront = false;
-    bool wavefrontMultiSample = false;
+    bool useWavefront = pcr::kDefaultUseWavefront;
+    bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -249,19 +249,23 @@ int main(int argc, char *argv[])
                  "--threadgroup-x.")
         ->default_str(std::to_string(pcr::kDefaultThreadgroupY))
         ->check(CLI::PositiveNumber);
-    options->add_flag("--wavefront", useWavefront,
+    options->add_flag("--wavefront,!--no-wavefront", useWavefront,
                  "Use the wavefront path tracer architecture (rays "
                  "rebatched per-material between bounces) instead of "
-                 "the default megakernel single-kernel architecture. "
-                 "Metal backend only (Apple Silicon).");
+                 "the megakernel single-kernel architecture. ON by "
+                 "default since v1.4.2 (wavefront beat megakernel by "
+                 "~25% in A/B). --no-wavefront forces megakernel for "
+                 "this render. Metal backend only (Apple Silicon); "
+                 "the flag is a no-op on Win/Linux OpenGL.");
     options->add_flag("--wavefront-multi-sample", wavefrontMultiSample,
-                 "When --wavefront is on, process the megakernel-equivalent "
+                 "When wavefront is on, process the megakernel-equivalent "
                  "samplesPerPass count of samples per pipeline run instead "
-                 "of v1's one-sample-per-run. Trades dispatch overhead "
-                 "(fewer passes) for higher per-ray memory bandwidth "
-                 "(larger working set). A/B against single-sample-per-pass "
-                 "wavefront to find the workload-specific optimum. Ignored "
-                 "when --wavefront is off.");
+                 "of the default one-sample-per-run. Trades dispatch "
+                 "overhead (fewer passes) for higher per-ray memory "
+                 "bandwidth (larger working set). The 1-spp default won "
+                 "the early A/B by ~2-3%, so this flag mostly exists for "
+                 "re-measuring at different resolutions / sample counts. "
+                 "Ignored when wavefront is off.");
 #endif
 
     CLI11_PARSE(app, argc, argv);

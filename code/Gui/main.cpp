@@ -119,17 +119,12 @@ struct JobConfig
     int  threadgroupX = pcr::kDefaultThreadgroupX;
     int  threadgroupY = pcr::kDefaultThreadgroupY;
 
-    // Architecture toggle. false = megakernel (default). true = wavefront.
-    // Persisted, plumbed through the renderer, but the GUI radio button
-    // for switching it stays hidden until wavefront kernels actually
-    // exist. CLI exposes --wavefront for early testing of the plumbing.
-    bool useWavefront = false;
-
-    // When useWavefront=true: false = 1 sample per pipeline run (v1
-    // default, smaller working set); true = budget-derived samples per
-    // pipeline run (matches megakernel's samplesPerPass, trades dispatch
-    // overhead for memory bandwidth).
-    bool wavefrontMultiSample = false;
+    // Architecture toggle. Defaults centralized in GpuDefaults.h (true /
+    // false as of v1.4.2 = wavefront-1spp default, picked by A/B). GUI
+    // exposes the radio under Architecture (debug) for opt-out / mode
+    // switching; CLI exposes --no-wavefront for the same.
+    bool useWavefront = pcr::kDefaultUseWavefront;
+    bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
 };
 
 struct JobResult
@@ -296,8 +291,8 @@ struct Settings
     // Architecture toggle. false = megakernel, true = wavefront. Persisted
     // even though the GUI doesn't surface a switch yet so future flips of
     // the GUI radio don't lose state across launches.
-    bool useWavefront = false;
-    bool wavefrontMultiSample = false;
+    bool useWavefront = pcr::kDefaultUseWavefront;
+    bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -1728,9 +1723,12 @@ int main(int, char **)
                 settings.useWavefront = false;
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Single MSL kernel runs the full path-"
-                                  "tracing loop per pixel. The v1.4.0+ "
-                                  "default; well-tuned, supports adaptive "
-                                  "sampling.");
+                                  "tracing loop per pixel. The v1.4.0 "
+                                  "baseline; well-tuned, supports adaptive "
+                                  "and spectral. Pick this for spectral "
+                                  "renders (wavefront falls back to "
+                                  "megakernel for spectral anyway) or "
+                                  "if you suspect a wavefront regression.");
             ImGui::SameLine();
             bool isWf1spp = settings.useWavefront && !settings.wavefrontMultiSample;
             bool isWfMspp = settings.useWavefront &&  settings.wavefrontMultiSample;

@@ -78,8 +78,8 @@ public:
     // has the megakernel path; setting useWavefront=true on this backend
     // is a no-op (no fallback warning needed since wavefront-on-OpenGL
     // isn't planned). The Metal backend honors the field.
-    bool useWavefront = false;
-    bool wavefrontMultiSample = false;
+    bool useWavefront = pcr::kDefaultUseWavefront;
+    bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

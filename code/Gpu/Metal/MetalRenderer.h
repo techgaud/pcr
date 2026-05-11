@@ -77,16 +77,10 @@ public:
     // yet, setting this to true falls back to megakernel and prints a
     // stderr warning once per render. Adaptive sampling is not supported
     // in wavefront mode and is silently ignored when both flags are set.
-    bool useWavefront = false;
-
-    // When useWavefront=true, controls samplesPerPass for the wavefront
-    // pipeline. false (default) = 1 sample per pipeline run (the safer,
-    // smaller-working-set v1 mode). true = budget-derived multi-sample
-    // per pass (matches megakernel's samplesPerPass), trades dispatch
-    // overhead for higher per-ray memory bandwidth pressure. A/B
-    // depending on workload - 1spp won by ~25% over megakernel at the
-    // first measurement; multi-spp is an open question.
-    bool wavefrontMultiSample = false;
+    // Architecture defaults centralized in GpuDefaults.h. useWavefront
+    // = true since v1.4.2 (wavefront beat megakernel ~25% in A/B).
+    bool useWavefront = pcr::kDefaultUseWavefront;
+    bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

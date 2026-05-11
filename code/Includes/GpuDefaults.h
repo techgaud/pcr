@@ -30,4 +30,23 @@ namespace pcr
 constexpr int kDefaultThreadgroupX = 8;
 constexpr int kDefaultThreadgroupY = 8;
 
+// Architecture default. true = wavefront (rays rebatched per-material
+// between bounces, divergence-free shading kernels), false = megakernel
+// (single-kernel pipeline, the v1.4.0+ baseline). Set to true based on
+// v1.4.2 A/B measurements showing wavefront-1spp beats megakernel by
+// ~25% on cornell-spec at 1080^2 Picture, with no quality regression.
+// Configurations that wavefront doesn't yet support (spectral, multi-
+// sample-per-pass + adaptive) fall back to megakernel automatically
+// with a stderr warning, so this default Just Works for the common
+// cases without surprising the user on the unsupported edges.
+constexpr bool kDefaultUseWavefront = true;
+
+// When useWavefront=true, whether to dispatch multiple samples per
+// pipeline run (true) or one sample per pipeline run (false). 1spp
+// is the safer default: smaller per-render working set, narrower
+// performance variance across scene sizes. Multi-spp won by only
+// ~2-3% in the first A/B and has scaling concerns at 4K+ where the
+// working set grows linearly with samplesPerPass.
+constexpr bool kDefaultWavefrontMultiSample = false;
+
 } // namespace pcr
