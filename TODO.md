@@ -2,6 +2,51 @@
 
 Deferred work, with enough context to pick up cold later.
 
+## OIDN buffer-access bug (denoising silently disabled on Apple Silicon)
+
+**Status:** confirmed bug. Every OIDN-enabled render on Apple Silicon prints `OIDN filter error: image data not accessible by the device, please use OIDNBuffer or device allocator for storage` to stderr and produces output WITHOUT the OIDN denoise applied. The renderer doesn't bail, it just skips the denoise step, so the user gets the raw HDR + tone-map (or the bilateral fallback when `useDenoise` is also on). Visually: more noise than the user expected on every OIDN-enabled render to date.
+
+### Why deferred
+
+Pre-existing bug that's been silently failing. Orthogonal to the wavefront work that surfaced it. Caught when v1.4.2's wavefront fallback path also tripped the same OIDN warning.
+
+### Root cause
+
+`code/OidnDenoise.cpp::denoise()` calls `filter.setImage(...)` with raw `std::vector<Vec3f>::data()` pointers. OIDN 2.x rejects this when the device backend can directly access GPU memory (Metal on Apple Silicon). The fix is to allocate device-side buffers via `device.newBuffer()` and bind those instead of raw CPU pointers; on Apple Silicon's unified memory the buffer is in the same physical RAM as the std::vector so the cost is effectively just a memcpy through the buffer's `write()` / `read()` API.
+
+### Implementation outline
+
+```cpp
+size_t bytes = (size_t)width * (size_t)height * 3 * sizeof(float);
+oidn::BufferRef colorBuf  = device.newBuffer(bytes);
+oidn::BufferRef albedoBuf, normalBuf;
+colorBuf.write(0, bytes, color.data());
+filter.setImage("color",  colorBuf,  oidn::Format::Float3, w, h);
+if (haveAlbedo) {
+    albedoBuf = device.newBuffer(bytes);
+    albedoBuf.write(0, bytes, albedo.data());
+    filter.setImage("albedo", albedoBuf, oidn::Format::Float3, w, h);
+}
+if (haveNormal) {
+    normalBuf = device.newBuffer(bytes);
+    normalBuf.write(0, bytes, normal.data());
+    filter.setImage("normal", normalBuf, oidn::Format::Float3, w, h);
+}
+filter.setImage("output", colorBuf, oidn::Format::Float3, w, h);
+// ... commit + execute ...
+colorBuf.read(0, bytes, color.data());
+```
+
+Plus error-check `device.getError()` after each `newBuffer` since out-of-memory or capability-mismatch could surface there.
+
+### Risk
+
+Low. Single-file change in `OidnDenoise.cpp`. Existing CPU-only OIDN device (selectable via env var or explicit device-type construction) would also fix it but loses the Apple Silicon GPU acceleration that OIDN ships with by default; the buffer-route is the right answer.
+
+### Validation
+
+Render `cornell` at d=4 / s=64 (low samples to maximize noise so denoise is visible), with `useOIDN=true` and `useDenoise=false`, compare wallclock + image quality before / after. After the fix the output should be visibly smoother and stderr should show no OIDN error.
+
 ## Adaptive sampling in wavefront mode
 
 **Status:** explicit limitation as of the wavefront baseline. `useAdaptive` is silently honored only when `useWavefront=false` (megakernel multi-pass). When `useWavefront=true`, the adaptive flag is ignored and a stderr warning fires.
