@@ -384,8 +384,64 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.wavefrontMultiSample = j.wavefrontMultiSample;
 }
 
-// Short single-line summary for the queue UI row. "<scene>  WxH  d?/s?/S?
-// [tags] tg?x?" - tags include only flags that are ON to keep it scannable.
+// Returns true when the renderer will silently rewrite this job's
+// architecture choice at dispatch time. Currently fires when useWavefront
+// is on with useAdaptive (adaptive doesn't yet work in wavefront mode,
+// per TODO.md item #1, so MetalRenderer falls back to megakernel and
+// logs to stderr). The queue UI uses this to color the displaced
+// wavefront tag light red so the user can tell at a glance that what
+// they requested isn't what actually runs.
+static bool wavefrontWillFallback(const JobConfig &j)
+{
+    return j.useWavefront && j.useAdaptive;
+}
+
+// Render one queue row's summary inline. Each tag becomes its own
+// ImGui::Text so we can color individual tags differently (light red
+// for settings that get overridden at dispatch time).
+static void renderJobSummary(const JobConfig &j)
+{
+    char prefix[128];
+    std::snprintf(prefix, sizeof(prefix), "%s  %dx%d  d%d/s%d/S%d",
+                  j.sceneName.c_str(), j.width, j.height,
+                  j.depth, j.samples, j.shadowSamples);
+    ImGui::TextUnformatted(prefix);
+
+    auto tag = [](const char *label) {
+        ImGui::SameLine();
+        ImGui::TextUnformatted(label);
+    };
+    auto tagRed = [](const char *label) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f), "%s", label);
+    };
+
+    if (j.useSpectral)   tag("spec");
+    if (j.useAA) {
+        char aa[16]; std::snprintf(aa, sizeof(aa), "aa%d", j.aaSamples);
+        tag(aa);
+    }
+    if (j.useAdaptive)   tag("adapt");
+    if (j.useOIDN)       tag("oidn");
+    if (j.useACES)       tag("aces");
+    if (j.useDenoise && !j.useOIDN) tag("denoise");
+    if (j.useMIS)        tag("mis");
+    if (j.useRussian)    tag("rr");
+    if (j.useStratified) tag("strat");
+    if (j.useWavefront) {
+        const char *waveLabel = j.wavefrontMultiSample ? "wave-mspp" : "wave-1spp";
+        if (wavefrontWillFallback(j)) tagRed(waveLabel);
+        else                          tag(waveLabel);
+    }
+    char tgInfo[32];
+    std::snprintf(tgInfo, sizeof(tgInfo), "tg%dx%d", j.threadgroupX, j.threadgroupY);
+    tag(tgInfo);
+}
+
+// Legacy single-line string version of the summary, kept for callers
+// that want a flat string (e.g. logging, PNG metadata). The GUI queue
+// row uses renderJobSummary() above instead so it can color individual
+// tags.
 static std::string summarizeJob(const JobConfig &j)
 {
     char buf[256];
@@ -2082,7 +2138,11 @@ int main(int, char **)
                     }
 
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(summarizeJob(r.config).c_str());
+                    renderJobSummary(r.config);
+                    if (wavefrontWillFallback(r.config))
+                        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.55f, 1.0f),
+                                           "  -> megakernel (adaptive forces "
+                                           "wavefront fallback)");
                     if (r.status == JobResult::Done && !r.outputPath.empty())
                         ImGui::TextDisabled("  -> %s",
                             fs::path(r.outputPath).filename().string().c_str());
