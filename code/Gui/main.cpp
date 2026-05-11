@@ -124,6 +124,12 @@ struct JobConfig
     // for switching it stays hidden until wavefront kernels actually
     // exist. CLI exposes --wavefront for early testing of the plumbing.
     bool useWavefront = false;
+
+    // When useWavefront=true: false = 1 sample per pipeline run (v1
+    // default, smaller working set); true = budget-derived samples per
+    // pipeline run (matches megakernel's samplesPerPass, trades dispatch
+    // overhead for memory bandwidth).
+    bool wavefrontMultiSample = false;
 };
 
 struct JobResult
@@ -291,6 +297,7 @@ struct Settings
     // even though the GUI doesn't surface a switch yet so future flips of
     // the GUI radio don't lose state across launches.
     bool useWavefront = false;
+    bool wavefrontMultiSample = false;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -344,6 +351,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.threadgroupX  = s.threadgroupX;
     j.threadgroupY  = s.threadgroupY;
     j.useWavefront  = s.useWavefront;
+    j.wavefrontMultiSample = s.wavefrontMultiSample;
     return j;
 }
 
@@ -373,6 +381,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.threadgroupX  = j.threadgroupX;
     s.threadgroupY  = j.threadgroupY;
     s.useWavefront  = j.useWavefront;
+    s.wavefrontMultiSample = j.wavefrontMultiSample;
 }
 
 // Short single-line summary for the queue UI row. "<scene>  WxH  d?/s?/S?
@@ -390,7 +399,8 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useMIS)        tags += " mis";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
-    if (j.useWavefront)  tags += " wave";
+    if (j.useWavefront)
+        tags += j.wavefrontMultiSample ? " wave-mspp" : " wave-1spp";
     std::snprintf(buf, sizeof(buf),
                   "%s  %dx%d  d%d/s%d/S%d%s  tg%dx%d",
                   j.sceneName.c_str(), j.width, j.height,
@@ -452,6 +462,7 @@ static void loadSettings(Settings &s)
         s.threadgroupX  = j.value("threadgroupX",  s.threadgroupX);
         s.threadgroupY  = j.value("threadgroupY",  s.threadgroupY);
         s.useWavefront  = j.value("useWavefront",  s.useWavefront);
+        s.wavefrontMultiSample = j.value("wavefrontMultiSample", s.wavefrontMultiSample);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -521,6 +532,7 @@ static json buildSettingsJson(const Settings &s)
     j["threadgroupX"]  = s.threadgroupX;
     j["threadgroupY"]  = s.threadgroupY;
     j["useWavefront"]  = s.useWavefront;
+    j["wavefrontMultiSample"] = s.wavefrontMultiSample;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -802,6 +814,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.threadgroupX  = settings.threadgroupX;
         renderer.threadgroupY  = settings.threadgroupY;
         renderer.useWavefront  = settings.useWavefront;
+        renderer.wavefrontMultiSample = settings.wavefrontMultiSample;
 #endif
         if (live)
         {
@@ -1633,33 +1646,50 @@ int main(int, char **)
         {
             ImGui::SeparatorText("Architecture (debug)");
 
-            // Backend / dispatch architecture radio. Same radio-button
-            // style as the Mode section's Reinhard/ACES + RGB/Spectral.
-            // megakernel is the proven default; wavefront ships as of
-            // v1.4.2 but adaptive sampling isn't supported in wavefront
-            // mode (renderInternal falls back to megakernel with a
-            // stderr warning when useWavefront + useAdaptive collide).
+            // Backend / dispatch architecture radio. Three states
+            // encoded across two persisted bools:
+            //   (useWavefront=false,   *)               -> Megakernel
+            //   (useWavefront=true,  wavefrontMultiSample=false) -> Wavefront (1spp)
+            //   (useWavefront=true,  wavefrontMultiSample=true)  -> Wavefront (multi-spp)
+            // Style mirrors the Mode section's tone-map / color radios.
             ImGui::TextUnformatted("Backend:");
             ImGui::SameLine();
             if (ImGui::RadioButton("Megakernel", !settings.useWavefront))
                 settings.useWavefront = false;
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Single MSL kernel runs the full path-"
-                                  "tracing loop per pixel (one bounce, two, "
-                                  "..., output). The v1.4.0+ default; well-"
-                                  "tuned, supports adaptive sampling.");
+                                  "tracing loop per pixel. The v1.4.0+ "
+                                  "default; well-tuned, supports adaptive "
+                                  "sampling.");
             ImGui::SameLine();
-            if (ImGui::RadioButton("Wavefront", settings.useWavefront))
+            bool isWf1spp = settings.useWavefront && !settings.wavefrontMultiSample;
+            bool isWfMspp = settings.useWavefront &&  settings.wavefrontMultiSample;
+            if (ImGui::RadioButton("Wavefront (1spp)", isWf1spp))
+            {
                 settings.useWavefront = true;
+                settings.wavefrontMultiSample = false;
+            }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Rays split across multiple specialized "
-                                  "kernels per material type (ray-gen, "
-                                  "intersect, compact, shade-by-material x4, "
-                                  "writeback). Eliminates intra-SIMD "
-                                  "divergence at the cost of extra dispatch "
-                                  "overhead. Doesn't support adaptive yet "
-                                  "(falls back to megakernel if --adaptive "
-                                  "is also on).");
+                ImGui::SetTooltip("Rays split across per-material shading "
+                                  "kernels. One sample per pipeline run "
+                                  "(smaller working set, more dispatches). "
+                                  "v1.4.2 baseline; beat megakernel by "
+                                  "~25%% in early A/B.");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Wavefront (multi-spp)", isWfMspp))
+            {
+                settings.useWavefront = true;
+                settings.wavefrontMultiSample = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Wavefront with budget-derived samples per "
+                                  "pipeline run (matches megakernel's "
+                                  "samplesPerPass). Fewer dispatches, much "
+                                  "larger working set. A/B against 1spp to "
+                                  "find the workload-specific optimum - the "
+                                  "memory bandwidth pressure may eat the "
+                                  "dispatch-overhead savings, or it may "
+                                  "stack on top of them.");
 
             ImGui::TextUnformatted("Threadgroup:");
             // Presets ordered by total threads. Three are below Apple's

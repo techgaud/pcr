@@ -104,6 +104,7 @@ int main(int argc, char *argv[])
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
     bool useWavefront = false;
+    bool wavefrontMultiSample = false;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -252,9 +253,15 @@ int main(int argc, char *argv[])
                  "Use the wavefront path tracer architecture (rays "
                  "rebatched per-material between bounces) instead of "
                  "the default megakernel single-kernel architecture. "
-                 "Currently a no-op fallback to megakernel with a "
-                 "stderr warning until the wavefront kernels ship; "
-                 "see TODO.md. Metal backend only.");
+                 "Metal backend only (Apple Silicon).");
+    options->add_flag("--wavefront-multi-sample", wavefrontMultiSample,
+                 "When --wavefront is on, process the megakernel-equivalent "
+                 "samplesPerPass count of samples per pipeline run instead "
+                 "of v1's one-sample-per-run. Trades dispatch overhead "
+                 "(fewer passes) for higher per-ray memory bandwidth "
+                 "(larger working set). A/B against single-sample-per-pass "
+                 "wavefront to find the workload-specific optimum. Ignored "
+                 "when --wavefront is off.");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -436,10 +443,12 @@ int main(int argc, char *argv[])
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;
     renderer.useWavefront = useWavefront;
+    renderer.wavefrontMultiSample = wavefrontMultiSample;
 #else
     (void)threadgroupX;
     (void)threadgroupY;
     (void)useWavefront;
+    (void)wavefrontMultiSample;
 #endif
     renderer.render(sceneData, start, outputDir);
 

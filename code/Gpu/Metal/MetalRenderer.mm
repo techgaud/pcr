@@ -1532,18 +1532,27 @@ kernel void wf_generate_primary_rays(
     device uint                *rngState     [[buffer(6)]],
     device uint                *bounceDepth  [[buffer(7)]],
     device uint                *alive        [[buffer(8)]],
-    uint2                       gid          [[thread_position_in_grid]])
+    uint                        gid          [[thread_position_in_grid]])
 {
-    int2 pix = int2(int(gid.x), int(gid.y));
-    if (pix.x >= u.width || pix.y >= u.height) return;
+    // 1D dispatch over rayCount = pixelCount * samplesPerPass.
+    // rayIdx layout: rays for sample-slot s live at indices
+    // [s*pixelCount, (s+1)*pixelCount). Matches what wf_output_writeback
+    // expects when it sums per-pixel across samples.
+    uint pixelCount = uint(u.width) * uint(u.height);
+    uint samples    = max(1u, uint(u.sampleCount));
+    uint rayCount   = pixelCount * samples;
+    if (gid >= rayCount) return;
 
-    uint idx = uint(pix.y) * uint(u.width) + uint(pix.x);
+    uint pixelIdxLocal = gid % pixelCount;
+    uint sampleSlot    = gid / pixelCount;
+    int2 pix = int2(int(pixelIdxLocal % uint(u.width)),
+                    int(pixelIdxLocal / uint(u.width)));
 
-    // RNG seed: same scheme as the megakernel's path_trace_pass so
-    // future wavefront/megakernel A/B tests at the same (frameSeed,
-    // aaIdx, sampleStart) produce comparable noise patterns (not
-    // bit-identical because the per-ray sample loop is structurally
-    // different, but statistically equivalent).
+    // RNG seed: includes sampleSlot so the N rays for a pixel within
+    // one pipeline run get decorrelated random sequences. The
+    // megakernel hands different `s` values into the same per-pixel
+    // RNG by stepping the seed within the kernel loop; wavefront
+    // mints a fresh seed per (pix, aaIdx, sampleStart+sampleSlot).
     uint jitterSeed = uint(pix.x) * 1973u + uint(pix.y) * 9277u
                     + uint(u.frameSeed) * 26699u
                     + uint(u.aaIdx) * 16127u;
@@ -1576,24 +1585,24 @@ kernel void wf_generate_primary_rays(
                                      -1.0f));
     float3 rayOrigin = float3(u.originX, u.originY, u.originZ);
 
-    // Write the RayState SoA. packed_float3 is 12-byte aligned so 32
-    // adjacent threads write 32 * 12 = 384 bytes contiguous = 6
-    // coalesced cache lines per vec3 field (matches what 3 separate
-    // float buffers would do but in 1 binding slot instead of 3).
-    origin[idx]      = rayOrigin;
-    dir[idx]         = rayDir;
-    throughput[idx]  = float3(1.0f);
-    color[idx]       = float3(0.0f);
-    pixelIdx[idx]    = idx;
+    // Write the RayState SoA at this ray's slot (gid).
+    origin[gid]      = rayOrigin;
+    dir[gid]         = rayDir;
+    throughput[gid]  = float3(1.0f);
+    color[gid]       = float3(0.0f);
+    pixelIdx[gid]    = pixelIdxLocal;
 
-    // Per-ray RNG state: includes sampleStart so different sample
-    // batches use decorrelated sequences (matches megakernel). Seed
-    // gets advanced by individual rand() calls during shading later.
-    rngState[idx]    = jitterSeed
+    // Per-ray RNG state: includes sampleStart (per-pass offset) AND
+    // sampleSlot (within-pass offset) so each unique (aaIdx, sample)
+    // tuple gets its own decorrelated sequence. 12379 is a random
+    // prime, distinct from the 7919 used for sampleStart, to keep
+    // the two contributions from collapsing into the same bit pattern.
+    rngState[gid]    = jitterSeed
                      + uint(u.sampleStart) * 7919u
+                     + sampleSlot * 12379u
                      + 0x9e3779b9u;
-    bounceDepth[idx] = 0;
-    alive[idx]       = 1;
+    bounceDepth[gid] = 0;
+    alive[gid]       = 1;
 }
 
 // Wavefront intersect kernel. Reads each ray's origin/direction from the
@@ -1644,7 +1653,10 @@ kernel void wf_intersect(
     device const GpuLightTriangle              *lightTris    [[buffer(18)]],
     uint                                        gid          [[thread_position_in_grid]])
 {
-    uint rayCount = uint(u.width) * uint(u.height);
+    // rayCount = pixelCount * samplesPerPass for multi-spp wavefront;
+    // megakernel sets sampleCount=1 effectively because it dispatches
+    // one ray per pixel per pass (wavefront 1-spp also has sampleCount=1).
+    uint rayCount = uint(u.width) * uint(u.height) * max(1u, uint(u.sampleCount));
     if (gid >= rayCount) return;
 
     if (alive[gid] == 0u) {
@@ -1722,7 +1734,7 @@ kernel void wf_compact_by_material(
     device uint                                *queueEmissive [[buffer(23)]],
     uint                                        gid           [[thread_position_in_grid]])
 {
-    uint rayCount = uint(u.width) * uint(u.height);
+    uint rayCount = uint(u.width) * uint(u.height) * max(1u, uint(u.sampleCount));
     bool inBounds = (gid < rayCount);
 
     // Classify this thread's ray. Out-of-bounds threads and dead-ray
@@ -3223,23 +3235,22 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
     int tilesY = (_height + tileH - 1) / tileH;
 
-    // Wavefront v1 override: dispatch one sample per pipeline run
-    // (samplesPerPass = 1) and skip spatial chopping (each wavefront
-    // kernel is small relative to the watchdog budget so tile splits
-    // aren't needed). Multi-sample-per-pass wavefront would amortize
-    // dispatch overhead and is a follow-up TODO; the megakernel
-    // samplesPerPass = ~40 produces ~50x more rays per dispatch.
+    // Wavefront override. Two sub-modes:
+    //   wavefrontMultiSample=false (default): 1 sample per pipeline run.
+    //     Smallest working set (rayCount = pixelCount). Highest dispatch
+    //     count - totalPasses = aaSamples * samples instead of
+    //     aaSamples * passesPerAa.
+    //   wavefrontMultiSample=true: keep megakernel-computed samplesPerPass.
+    //     Working set scales linearly with samplesPerPass (more memory
+    //     bandwidth pressure) but dispatch count drops back to megakernel-
+    //     equivalent. Net effect is workload-dependent.
+    // Spatial chopping (tilesY > 1) doesn't apply to wavefront: its
+    // kernels are individually small relative to the watchdog budget
+    // regardless of resolution.
     if (effectiveWavefront)
     {
-        if (samplesPerPass != 1 || tilesY != 1)
-        {
-            std::cerr << "MetalRenderer: wavefront v1 runs one sample per "
-                      << "pipeline run (megakernel uses " << samplesPerPass
-                      << " samples per pass at this resolution). Higher "
-                      << "dispatch overhead expected; multi-sample-per-pass "
-                      << "wavefront is a follow-up TODO." << std::endl;
-        }
-        samplesPerPass = 1;
+        if (!wavefrontMultiSample)
+            samplesPerPass = 1;
         tilesY = 1;
     }
 
@@ -3331,22 +3342,26 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
 
     // Wavefront allocation: per-render, GPU-only ray-state buffers.
-    // Sized for one ray per pixel per pass (wavefront v1 runs
-    // samplesPerPass=1 effectively - one sample per pipeline run, so
-    // totalPasses = aaSamples * samples * tilesY which is more than
-    // megakernel's totalPasses but each is a small atomic-coherent
-    // pipeline). Multi-sample-per-pass would cut dispatch overhead
-    // and is a follow-up optimization once the baseline ships.
+    // Sized for samplesPerPass rays per pixel concurrently in flight.
+    //   wavefrontMultiSample=false: rayCount = pixelCount (one ray per pixel)
+    //   wavefrontMultiSample=true:  rayCount = pixelCount * samplesPerPass
+    //     where samplesPerPass is megakernel's budget-derived value (~40 at
+    //     1080^2 Picture). Working set grows linearly; alloc may fail at
+    //     very high resolutions in multi-spp mode, in which case the
+    //     renderer falls back to megakernel.
     WavefrontRayBuffers wfBufs;
     if (effectiveWavefront)
     {
-        NSUInteger rayCount = NSUInteger(_width) * NSUInteger(_height);
+        NSUInteger pixelCount = NSUInteger(_width) * NSUInteger(_height);
+        NSUInteger rayCount = pixelCount * NSUInteger(samplesPerPass);
         wfBufs = allocateWavefrontBuffers(_impl->device, rayCount);
         if (!wfBufs.valid)
         {
             std::cerr << "MetalRenderer: failed to allocate wavefront SoA "
-                      << "buffers for " << rayCount << " rays; falling "
-                      << "back to megakernel for this render." << std::endl;
+                      << "buffers for " << rayCount << " rays "
+                      << "(samplesPerPass=" << samplesPerPass
+                      << "); falling back to megakernel for this render."
+                      << std::endl;
             effectiveWavefront = false;
         }
     }
@@ -3368,10 +3383,16 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         // avoid the wasted lane launches at the cost of more host
         // code; deferred until profiling shows it matters.
 
-        NSUInteger rayCount = NSUInteger(_width) * NSUInteger(_height);
+        NSUInteger pixelCount = NSUInteger(_width) * NSUInteger(_height);
+        NSUInteger rayCount   = pixelCount * NSUInteger(samplesPerPass);
+        // 2D dispatch over (width, height) for output writeback (one
+        // thread per pixel).
         MTLSize threadgroups2D = MTLSizeMake(
             (NSUInteger)((_width  + tgX - 1) / tgX),
             (NSUInteger)((_height + tgY - 1) / tgY), 1);
+        // 1D dispatch over rayCount for ray-gen / intersect / compact /
+        // shading. rayCount in 1spp mode is pixelCount; in multi-spp
+        // mode it's pixelCount * samplesPerPass.
         NSUInteger linearThreadsPerGroup = NSUInteger(tgX) * NSUInteger(tgY);
         MTLSize threadgroups1D = MTLSizeMake(
             (rayCount + linearThreadsPerGroup - 1) / linearThreadsPerGroup, 1, 1);
@@ -3392,6 +3413,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             //   9 matIdx (int); 10..11 hit/normal (packed_float3);
             //   12..18 scene; 19 queueCounters; 20..23 four queues;
             //   24 shading queue input; 25 queueLen (counter offset).
+            // Dispatched 1D over rayCount (= pixelCount * samplesPerPass)
+            // so multi-sample-per-pass mode lights up one ray per pixel
+            // per sample concurrently.
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:_impl->pipelineWfRayGen];
@@ -3404,7 +3428,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
                 [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
                 [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
-                [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
+                [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                 [enc endEncoding];
             }
 
@@ -3777,11 +3801,15 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     addText("OIDN",          useOIDN     ? "1" : "0");
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
-    // Architecture records what ACTUALLY ran, not what was requested.
-    // useWavefront=true falls back to megakernel until the wavefront
-    // kernels ship; effectiveWavefront reflects the post-fallback choice
-    // so the metadata is honest.
-    addText("Architecture",  effectiveWavefront ? "wavefront" : "megakernel");
+    // Architecture records what ACTUALLY ran, not what was requested
+    // (useWavefront+useAdaptive falls back to megakernel; alloc failure
+    // also falls back). The wavefront sub-mode key disambiguates the
+    // 1-sample-per-pass vs multi-sample-per-pass variants so post-hoc
+    // A/B grepping by ThreadgroupX/Y/Architecture stays unambiguous.
+    addText("Architecture", effectiveWavefront ? "wavefront" : "megakernel");
+    if (effectiveWavefront)
+        addText("WavefrontMode",
+                wavefrontMultiSample ? "multi-spp" : "1spp");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

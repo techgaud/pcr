@@ -79,6 +79,7 @@ public:
     // is a no-op (no fallback warning needed since wavefront-on-OpenGL
     // isn't planned). The Metal backend honors the field.
     bool useWavefront = false;
+    bool wavefrontMultiSample = false;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
