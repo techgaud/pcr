@@ -1524,22 +1524,14 @@ kernel void path_trace_pass_adaptive(
 
 kernel void wf_generate_primary_rays(
     constant Uniforms          &u            [[buffer(0)]],
-    device float               *originX      [[buffer(1)]],
-    device float               *originY      [[buffer(2)]],
-    device float               *originZ      [[buffer(3)]],
-    device float               *dirX         [[buffer(4)]],
-    device float               *dirY         [[buffer(5)]],
-    device float               *dirZ         [[buffer(6)]],
-    device float               *throughputR  [[buffer(7)]],
-    device float               *throughputG  [[buffer(8)]],
-    device float               *throughputB  [[buffer(9)]],
-    device float               *colorR       [[buffer(10)]],
-    device float               *colorG       [[buffer(11)]],
-    device float               *colorB       [[buffer(12)]],
-    device uint                *pixelIdx     [[buffer(13)]],
-    device uint                *rngState     [[buffer(14)]],
-    device uint                *bounceDepth  [[buffer(15)]],
-    device uint                *alive        [[buffer(16)]],
+    device packed_float3       *origin       [[buffer(1)]],
+    device packed_float3       *dir          [[buffer(2)]],
+    device packed_float3       *throughput   [[buffer(3)]],
+    device packed_float3       *color        [[buffer(4)]],
+    device uint                *pixelIdx     [[buffer(5)]],
+    device uint                *rngState     [[buffer(6)]],
+    device uint                *bounceDepth  [[buffer(7)]],
+    device uint                *alive        [[buffer(8)]],
     uint2                       gid          [[thread_position_in_grid]])
 {
     int2 pix = int2(int(gid.x), int(gid.y));
@@ -1574,26 +1566,19 @@ kernel void wf_generate_primary_rays(
     float scale  = tan(u.fov * 0.5f);
     float2 nd = (jpix * 2.0f - float2(u.width, u.height)) /
                 float2(u.width, u.height);
-    float3 dir = normalize(float3(nd.x * scale * aspect,
-                                  -nd.y * scale,
-                                  -1.0f));
-    float3 origin = float3(u.originX, u.originY, u.originZ);
+    float3 rayDir = normalize(float3(nd.x * scale * aspect,
+                                     -nd.y * scale,
+                                     -1.0f));
+    float3 rayOrigin = float3(u.originX, u.originY, u.originZ);
 
-    // Write the RayState SoA. Each buffer index is the linear pixel
-    // index; SIMD group of 32 adjacent threads writes 32 contiguous
-    // floats (one cache line per field, perfect coalescing).
-    originX[idx]     = origin.x;
-    originY[idx]     = origin.y;
-    originZ[idx]     = origin.z;
-    dirX[idx]        = dir.x;
-    dirY[idx]        = dir.y;
-    dirZ[idx]        = dir.z;
-    throughputR[idx] = 1.0f;
-    throughputG[idx] = 1.0f;
-    throughputB[idx] = 1.0f;
-    colorR[idx]      = 0.0f;
-    colorG[idx]      = 0.0f;
-    colorB[idx]      = 0.0f;
+    // Write the RayState SoA. packed_float3 is 12-byte aligned so 32
+    // adjacent threads write 32 * 12 = 384 bytes contiguous = 6
+    // coalesced cache lines per vec3 field (matches what 3 separate
+    // float buffers would do but in 1 binding slot instead of 3).
+    origin[idx]      = rayOrigin;
+    dir[idx]         = rayDir;
+    throughput[idx]  = float3(1.0f);
+    color[idx]       = float3(0.0f);
     pixelIdx[idx]    = idx;
 
     // Per-ray RNG state: includes sampleStart so different sample
@@ -1615,13 +1600,17 @@ kernel void wf_generate_primary_rays(
 // terminated"; rays that intersected nothing also get matIdx = -1 and
 // will terminate at compaction time.
 //
-// Buffer-binding layout (per the convention established by ray-gen):
-//   buffer(0)         = uniforms
-//   buffer(1..6)      = origin xyz, dir xyz (read)
-//   buffer(16)        = alive (read)
-//   buffer(17..23)    = matIdx + hitPos xyz + normal xyz (write)
-//   buffer(24..30)    = scene buffers (read; spheres, planes, materials,
-//                       triangles, bvh, lights, lightTris)
+// Buffer-binding layout (packed_float3 SoA, per the convention
+// established by ray-gen):
+//   buffer(0)   = uniforms
+//   buffer(1)   = origin (packed_float3, read)
+//   buffer(2)   = dir    (packed_float3, read)
+//   buffer(8)   = alive  (uint, read)
+//   buffer(9)   = matIdx (int, write)
+//   buffer(10)  = hit    (packed_float3, write)
+//   buffer(11)  = normal (packed_float3, write)
+//   buffer(12..18) = scene buffers (spheres, planes, materials,
+//                    triangles, bvh, lights, lightTris)
 // The other RayState fields (throughput, color, pixelIdx, rngState,
 // bounceDepth) aren't accessed here and intentionally aren't bound.
 //
@@ -1635,61 +1624,42 @@ kernel void wf_generate_primary_rays(
 
 kernel void wf_intersect(
     constant Uniforms                          &u            [[buffer(0)]],
-    device const float                         *originX      [[buffer(1)]],
-    device const float                         *originY      [[buffer(2)]],
-    device const float                         *originZ      [[buffer(3)]],
-    device const float                         *dirX         [[buffer(4)]],
-    device const float                         *dirY         [[buffer(5)]],
-    device const float                         *dirZ         [[buffer(6)]],
-    device const uint                          *alive        [[buffer(16)]],
-    device int                                 *matIdxOut    [[buffer(17)]],
-    device float                               *hitX         [[buffer(18)]],
-    device float                               *hitY         [[buffer(19)]],
-    device float                               *hitZ         [[buffer(20)]],
-    device float                               *normalX      [[buffer(21)]],
-    device float                               *normalY      [[buffer(22)]],
-    device float                               *normalZ      [[buffer(23)]],
-    device const GpuSphere                     *spheres      [[buffer(24)]],
-    device const GpuPlane                      *planes       [[buffer(25)]],
-    device const GpuMaterial                   *materials    [[buffer(26)]],
-    device const GpuTriangle                   *triangles    [[buffer(27)]],
-    device const GpuBvhNode                    *bvhNodes     [[buffer(28)]],
-    device const GpuLight                      *lights       [[buffer(29)]],
-    device const GpuLightTriangle              *lightTris    [[buffer(30)]],
+    device const packed_float3                 *origin       [[buffer(1)]],
+    device const packed_float3                 *dir          [[buffer(2)]],
+    device const uint                          *alive        [[buffer(8)]],
+    device int                                 *matIdxOut    [[buffer(9)]],
+    device packed_float3                       *hit          [[buffer(10)]],
+    device packed_float3                       *normalOut    [[buffer(11)]],
+    device const GpuSphere                     *spheres      [[buffer(12)]],
+    device const GpuPlane                      *planes       [[buffer(13)]],
+    device const GpuMaterial                   *materials    [[buffer(14)]],
+    device const GpuTriangle                   *triangles    [[buffer(15)]],
+    device const GpuBvhNode                    *bvhNodes     [[buffer(16)]],
+    device const GpuLight                      *lights       [[buffer(17)]],
+    device const GpuLightTriangle              *lightTris    [[buffer(18)]],
     uint                                        gid          [[thread_position_in_grid]])
 {
     uint rayCount = uint(u.width) * uint(u.height);
     if (gid >= rayCount) return;
 
-    // Dead-ray skip. Writing -1 lets the compaction kernel treat the
-    // slot as "terminated" without needing a separate alive check on
-    // the read side.
     if (alive[gid] == 0u) {
         matIdxOut[gid] = -1;
         return;
     }
 
-    float3 ro = float3(originX[gid], originY[gid], originZ[gid]);
-    float3 rd = float3(dirX[gid],    dirY[gid],    dirZ[gid]);
+    float3 ro = origin[gid];
+    float3 rd = dir[gid];
 
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
                 lights, lightTris };
 
-    float3 hit, N;
-    int matIdx;
-    if (sceneIntersect(S, ro, rd, hit, N, matIdx)) {
-        matIdxOut[gid] = matIdx;
-        hitX[gid]      = hit.x;
-        hitY[gid]      = hit.y;
-        hitZ[gid]      = hit.z;
-        normalX[gid]   = N.x;
-        normalY[gid]   = N.y;
-        normalZ[gid]   = N.z;
+    float3 hp, N;
+    int mi;
+    if (sceneIntersect(S, ro, rd, hp, N, mi)) {
+        matIdxOut[gid] = mi;
+        hit[gid]       = hp;
+        normalOut[gid] = N;
     } else {
-        // Ray escaped (no hit). matIdx = -1 sentinel; compaction sees
-        // this as "terminate" and the ray won't appear in any shading
-        // queue. Its accumulated color stays at whatever the previous
-        // bounce left.
         matIdxOut[gid] = -1;
     }
 }
@@ -1728,23 +1698,23 @@ kernel void wf_intersect(
 //
 // Buffer layout:
 //   buffer(0)         uniforms
-//   buffer(17)        matIdx (input from HitInfo SoA)
-//   buffer(26)        materials (scene buffer, read for classification)
-//   buffer(31)        queueCounters (atomic_uint[4])
-//   buffer(32..35)    queue[diffuse|mirror|glass|emissive]
+//   buffer(9)         matIdx (input from HitInfo SoA)
+//   buffer(14)        materials (scene buffer, read for classification)
+//   buffer(19)        queueCounters (atomic_uint[4])
+//   buffer(20..23)    queue[diffuse|mirror|glass|emissive]
 //
 // queueCounters must be zeroed by the host (blit-encoder fill) before
 // each compaction dispatch. The driver in commit #6 handles that.
 
 kernel void wf_compact_by_material(
     constant Uniforms                          &u             [[buffer(0)]],
-    device const int                           *matIdx        [[buffer(17)]],
-    device const GpuMaterial                   *materials     [[buffer(26)]],
-    device atomic_uint                         *queueCounters [[buffer(31)]],
-    device uint                                *queueDiffuse  [[buffer(32)]],
-    device uint                                *queueMirror   [[buffer(33)]],
-    device uint                                *queueGlass    [[buffer(34)]],
-    device uint                                *queueEmissive [[buffer(35)]],
+    device const int                           *matIdx        [[buffer(9)]],
+    device const GpuMaterial                   *materials     [[buffer(14)]],
+    device atomic_uint                         *queueCounters [[buffer(19)]],
+    device uint                                *queueDiffuse  [[buffer(20)]],
+    device uint                                *queueMirror   [[buffer(21)]],
+    device uint                                *queueGlass    [[buffer(22)]],
+    device uint                                *queueEmissive [[buffer(23)]],
     uint                                        gid           [[thread_position_in_grid]])
 {
     uint rayCount = uint(u.width) * uint(u.height);
@@ -1838,24 +1808,26 @@ kernel void wf_compact_by_material(
 // shading kernel's grid; if the queue is empty for a given material,
 // the dispatch is skipped entirely.
 //
-// Buffer-binding layout (each kernel binds only what it touches):
-//   buffer(0)         uniforms (read)
-//   buffer(1..6)      origin xyz, dir xyz (R+W, overwritten per bounce)
-//   buffer(7..9)      throughput rgb (R+W)
-//   buffer(10..12)    color rgb (R+W, where light accumulates)
-//   buffer(14)        rngState (R+W)
-//   buffer(15)        bounceDepth (R+W)
-//   buffer(16)        alive (W, set to 0 on terminate)
-//   buffer(17..23)    hit info (R only - already populated by intersect)
-//   buffer(24..30)    scene buffers (R, only diffuse uses all of them
-//                     for shadow rays; mirror/glass/emissive bind just
-//                     materials)
-//   buffer(36)        this material's input queue (read; provides
-//                     ray index for each thread)
-//   buffer(37)        this material's queue length (uniform-style,
-//                     passed as a single-element buffer so the kernel
-//                     can guard against an extra-large dispatch grid)
-// pixelIdx (buffer 13) is unused by shading kernels - the post-pass
+// Buffer-binding layout (packed_float3 SoA, fits within Metal's 31-
+// buffer-per-kernel limit). Each kernel binds only what it touches:
+//   buffer(0)   uniforms (read)
+//   buffer(1)   origin (packed_float3, R+W per bounce)
+//   buffer(2)   dir    (packed_float3, R+W per bounce)
+//   buffer(3)   throughput (packed_float3, R+W)
+//   buffer(4)   color  (packed_float3, R+W, light accumulator)
+//   buffer(6)   rngState (uint, R+W)
+//   buffer(7)   bounceDepth (uint, R+W)
+//   buffer(8)   alive (uint, W on terminate)
+//   buffer(9)   matIdx (int, R only - populated by intersect)
+//   buffer(10)  hit    (packed_float3, R only)
+//   buffer(11)  normal (packed_float3, R only)
+//   buffer(12..18) scene buffers (R, only diffuse uses all for shadow
+//                  rays; mirror/glass/emissive bind just materials at 14)
+//   buffer(24)  this material's input queue (read; ray indices)
+//   buffer(25)  this material's queue length (queueCounters bound at
+//               offset matType*4 so the kernel's `constant uint&`
+//               binding loads queueCounters[matType])
+// pixelIdx (buffer 5) is unused by shading kernels - the post-pass
 // output writeback kernel uses it.
 
 // ---- Emissive: terminate with light contribution -------------------
@@ -1867,29 +1839,23 @@ kernel void wf_compact_by_material(
 
 kernel void wf_shade_emissive(
     constant Uniforms                          &u             [[buffer(0)]],
-    device float                               *throughputR   [[buffer(7)]],
-    device float                               *throughputG   [[buffer(8)]],
-    device float                               *throughputB   [[buffer(9)]],
-    device float                               *colorR        [[buffer(10)]],
-    device float                               *colorG        [[buffer(11)]],
-    device float                               *colorB        [[buffer(12)]],
-    device uint                                *alive         [[buffer(16)]],
-    device const int                           *matIdx        [[buffer(17)]],
-    device const GpuMaterial                   *materials     [[buffer(26)]],
-    device const uint                          *queue         [[buffer(36)]],
-    constant uint                              &queueLen      [[buffer(37)]],
+    device const packed_float3                 *throughput    [[buffer(3)]],
+    device packed_float3                       *color         [[buffer(4)]],
+    device uint                                *alive         [[buffer(8)]],
+    device const int                           *matIdx        [[buffer(9)]],
+    device const GpuMaterial                   *materials     [[buffer(14)]],
+    device const uint                          *queue         [[buffer(24)]],
+    constant uint                              &queueLen      [[buffer(25)]],
     uint                                        tid           [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
 
     int mi = matIdx[gid];
-    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    float3 t = throughput[gid];
     float3 emissive = materials[mi].emissive.rgb;
 
-    colorR[gid] += throughput.x * emissive.x;
-    colorG[gid] += throughput.y * emissive.y;
-    colorB[gid] += throughput.z * emissive.z;
+    color[gid] = float3(color[gid]) + t * emissive;
     alive[gid] = 0u;
 }
 
@@ -1902,66 +1868,51 @@ kernel void wf_shade_emissive(
 
 kernel void wf_shade_mirror(
     constant Uniforms                          &u             [[buffer(0)]],
-    device float                               *originX       [[buffer(1)]],
-    device float                               *originY       [[buffer(2)]],
-    device float                               *originZ       [[buffer(3)]],
-    device float                               *dirX          [[buffer(4)]],
-    device float                               *dirY          [[buffer(5)]],
-    device float                               *dirZ          [[buffer(6)]],
-    device float                               *throughputR   [[buffer(7)]],
-    device float                               *throughputG   [[buffer(8)]],
-    device float                               *throughputB   [[buffer(9)]],
-    device uint                                *rngState      [[buffer(14)]],
-    device uint                                *bounceDepth   [[buffer(15)]],
-    device uint                                *alive         [[buffer(16)]],
-    device const int                           *matIdx        [[buffer(17)]],
-    device const float                         *hitX          [[buffer(18)]],
-    device const float                         *hitY          [[buffer(19)]],
-    device const float                         *hitZ          [[buffer(20)]],
-    device const float                         *normalX       [[buffer(21)]],
-    device const float                         *normalY       [[buffer(22)]],
-    device const float                         *normalZ       [[buffer(23)]],
-    device const GpuMaterial                   *materials     [[buffer(26)]],
-    device const uint                          *queue         [[buffer(36)]],
-    constant uint                              &queueLen      [[buffer(37)]],
+    device packed_float3                       *origin        [[buffer(1)]],
+    device packed_float3                       *dir           [[buffer(2)]],
+    device packed_float3                       *throughput    [[buffer(3)]],
+    device uint                                *rngState      [[buffer(6)]],
+    device uint                                *bounceDepth   [[buffer(7)]],
+    device uint                                *alive         [[buffer(8)]],
+    device const int                           *matIdx        [[buffer(9)]],
+    device const packed_float3                 *hit           [[buffer(10)]],
+    device const packed_float3                 *normalIn      [[buffer(11)]],
+    device const GpuMaterial                   *materials     [[buffer(14)]],
+    device const uint                          *queue         [[buffer(24)]],
+    constant uint                              &queueLen      [[buffer(25)]],
     uint                                        tid           [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
 
-    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
-    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
-    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+    float3 rd  = dir[gid];
+    float3 N   = normalIn[gid];
+    float3 h   = hit[gid];
 
     bool entering = dot(rd, N) < 0.0f;
     if (!entering) N = -N;
 
     int mi = matIdx[gid];
     float3 albedo = materials[mi].albedo.rgb;
-    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    float3 t = throughput[gid];
 
     float3 newDir = reflect(rd, N);
-    float3 newOrigin = hit + N * 1e-3f;
-    throughput *= albedo;
+    float3 newOrigin = h + N * 1e-3f;
+    t *= albedo;
 
-    // Russian roulette + max-depth termination, matching the
-    // megakernel's bounce loop ordering: RR fires when bounce>=1,
-    // and depth check fires after.
     uint depth = bounceDepth[gid] + 1u;
     uint seed = rngState[gid];
     bool alive_after = true;
     if (u.useRussian != 0 && depth >= 2u) {
         float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
         if (rand(seed) > p) alive_after = false;
-        else throughput /= p;
+        else t /= p;
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
-    originX[gid] = newOrigin.x; originY[gid] = newOrigin.y; originZ[gid] = newOrigin.z;
-    dirX[gid]    = newDir.x;    dirY[gid]    = newDir.y;    dirZ[gid]    = newDir.z;
-    throughputR[gid] = throughput.x;
-    throughputG[gid] = throughput.y;
-    throughputB[gid] = throughput.z;
+    origin[gid]      = newOrigin;
+    dir[gid]         = newDir;
+    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
@@ -1976,36 +1927,26 @@ kernel void wf_shade_mirror(
 
 kernel void wf_shade_glass(
     constant Uniforms                          &u             [[buffer(0)]],
-    device float                               *originX       [[buffer(1)]],
-    device float                               *originY       [[buffer(2)]],
-    device float                               *originZ       [[buffer(3)]],
-    device float                               *dirX          [[buffer(4)]],
-    device float                               *dirY          [[buffer(5)]],
-    device float                               *dirZ          [[buffer(6)]],
-    device float                               *throughputR   [[buffer(7)]],
-    device float                               *throughputG   [[buffer(8)]],
-    device float                               *throughputB   [[buffer(9)]],
-    device uint                                *rngState      [[buffer(14)]],
-    device uint                                *bounceDepth   [[buffer(15)]],
-    device uint                                *alive         [[buffer(16)]],
-    device const int                           *matIdx        [[buffer(17)]],
-    device const float                         *hitX          [[buffer(18)]],
-    device const float                         *hitY          [[buffer(19)]],
-    device const float                         *hitZ          [[buffer(20)]],
-    device const float                         *normalX       [[buffer(21)]],
-    device const float                         *normalY       [[buffer(22)]],
-    device const float                         *normalZ       [[buffer(23)]],
-    device const GpuMaterial                   *materials     [[buffer(26)]],
-    device const uint                          *queue         [[buffer(36)]],
-    constant uint                              &queueLen      [[buffer(37)]],
+    device packed_float3                       *origin        [[buffer(1)]],
+    device packed_float3                       *dir           [[buffer(2)]],
+    device packed_float3                       *throughput    [[buffer(3)]],
+    device uint                                *rngState      [[buffer(6)]],
+    device uint                                *bounceDepth   [[buffer(7)]],
+    device uint                                *alive         [[buffer(8)]],
+    device const int                           *matIdx        [[buffer(9)]],
+    device const packed_float3                 *hit           [[buffer(10)]],
+    device const packed_float3                 *normalIn      [[buffer(11)]],
+    device const GpuMaterial                   *materials     [[buffer(14)]],
+    device const uint                          *queue         [[buffer(24)]],
+    constant uint                              &queueLen      [[buffer(25)]],
     uint                                        tid           [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
 
-    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
-    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
-    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+    float3 rd = dir[gid];
+    float3 N  = normalIn[gid];
+    float3 h  = hit[gid];
 
     bool entering = dot(rd, N) < 0.0f;
     if (!entering) N = -N;
@@ -2013,26 +1954,24 @@ kernel void wf_shade_glass(
     int mi = matIdx[gid];
     GpuMaterial mat = materials[mi];
     float3 albedo = mat.albedo.rgb;
-    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    float3 t = throughput[gid];
     uint seed = rngState[gid];
 
-    DielectricOut b = dielectricBounce(rd, N, hit, entering, mat.ior, rand(seed));
-    throughput *= albedo;
+    DielectricOut b = dielectricBounce(rd, N, h, entering, mat.ior, rand(seed));
+    t *= albedo;
 
     uint depth = bounceDepth[gid] + 1u;
     bool alive_after = true;
     if (u.useRussian != 0 && depth >= 2u) {
         float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
         if (rand(seed) > p) alive_after = false;
-        else throughput /= p;
+        else t /= p;
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
-    originX[gid] = b.origin.x; originY[gid] = b.origin.y; originZ[gid] = b.origin.z;
-    dirX[gid]    = b.dir.x;    dirY[gid]    = b.dir.y;    dirZ[gid]    = b.dir.z;
-    throughputR[gid] = throughput.x;
-    throughputG[gid] = throughput.y;
-    throughputB[gid] = throughput.z;
+    origin[gid]      = b.origin;
+    dir[gid]         = b.dir;
+    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
@@ -2053,52 +1992,40 @@ kernel void wf_shade_glass(
 
 kernel void wf_shade_diffuse(
     constant Uniforms                          &u             [[buffer(0)]],
-    device float                               *originX       [[buffer(1)]],
-    device float                               *originY       [[buffer(2)]],
-    device float                               *originZ       [[buffer(3)]],
-    device float                               *dirX          [[buffer(4)]],
-    device float                               *dirY          [[buffer(5)]],
-    device float                               *dirZ          [[buffer(6)]],
-    device float                               *throughputR   [[buffer(7)]],
-    device float                               *throughputG   [[buffer(8)]],
-    device float                               *throughputB   [[buffer(9)]],
-    device float                               *colorR        [[buffer(10)]],
-    device float                               *colorG        [[buffer(11)]],
-    device float                               *colorB        [[buffer(12)]],
-    device uint                                *rngState      [[buffer(14)]],
-    device uint                                *bounceDepth   [[buffer(15)]],
-    device uint                                *alive         [[buffer(16)]],
-    device const int                           *matIdx        [[buffer(17)]],
-    device const float                         *hitX          [[buffer(18)]],
-    device const float                         *hitY          [[buffer(19)]],
-    device const float                         *hitZ          [[buffer(20)]],
-    device const float                         *normalX       [[buffer(21)]],
-    device const float                         *normalY       [[buffer(22)]],
-    device const float                         *normalZ       [[buffer(23)]],
-    device const GpuSphere                     *spheres       [[buffer(24)]],
-    device const GpuPlane                      *planes        [[buffer(25)]],
-    device const GpuMaterial                   *materials     [[buffer(26)]],
-    device const GpuTriangle                   *triangles     [[buffer(27)]],
-    device const GpuBvhNode                    *bvhNodes      [[buffer(28)]],
-    device const GpuLight                      *lights        [[buffer(29)]],
-    device const GpuLightTriangle              *lightTris     [[buffer(30)]],
-    device const uint                          *queue         [[buffer(36)]],
-    constant uint                              &queueLen      [[buffer(37)]],
+    device packed_float3                       *origin        [[buffer(1)]],
+    device packed_float3                       *dir           [[buffer(2)]],
+    device packed_float3                       *throughput    [[buffer(3)]],
+    device packed_float3                       *color         [[buffer(4)]],
+    device uint                                *rngState      [[buffer(6)]],
+    device uint                                *bounceDepth   [[buffer(7)]],
+    device uint                                *alive         [[buffer(8)]],
+    device const int                           *matIdx        [[buffer(9)]],
+    device const packed_float3                 *hit           [[buffer(10)]],
+    device const packed_float3                 *normalIn      [[buffer(11)]],
+    device const GpuSphere                     *spheres       [[buffer(12)]],
+    device const GpuPlane                      *planes        [[buffer(13)]],
+    device const GpuMaterial                   *materials     [[buffer(14)]],
+    device const GpuTriangle                   *triangles     [[buffer(15)]],
+    device const GpuBvhNode                    *bvhNodes      [[buffer(16)]],
+    device const GpuLight                      *lights        [[buffer(17)]],
+    device const GpuLightTriangle              *lightTris     [[buffer(18)]],
+    device const uint                          *queue         [[buffer(24)]],
+    constant uint                              &queueLen      [[buffer(25)]],
     uint                                        tid           [[thread_position_in_grid]])
 {
     if (tid >= queueLen) return;
     uint gid = queue[tid];
 
-    float3 rd = float3(dirX[gid], dirY[gid], dirZ[gid]);
-    float3 N  = float3(normalX[gid], normalY[gid], normalZ[gid]);
-    float3 hit = float3(hitX[gid], hitY[gid], hitZ[gid]);
+    float3 rd = dir[gid];
+    float3 N  = normalIn[gid];
+    float3 h  = hit[gid];
 
     bool entering = dot(rd, N) < 0.0f;
     if (!entering) N = -N;
 
     int mi = matIdx[gid];
     float3 albedo = materials[mi].albedo.rgb;
-    float3 throughput = float3(throughputR[gid], throughputG[gid], throughputB[gid]);
+    float3 t = throughput[gid];
     uint seed = rngState[gid];
 
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
@@ -2112,11 +2039,11 @@ kernel void wf_shade_diffuse(
             int sampleMatIdx;
             sampleAreaLight(S, seed, sampleP, sampleN, sampleEmissive, sampleMatIdx);
 
-            float3 Li = sampleP - hit;
+            float3 Li = sampleP - h;
             float3 wi = normalize(Li);
             float cosTheta = max(0.0f, dot(wi, N));
             float lightDist2 = dot(Li, Li);
-            float3 shadowOrigin = (cosTheta <= 0.0f) ? hit - N * 1e-3f : hit + N * 1e-3f;
+            float3 shadowOrigin = (cosTheta <= 0.0f) ? h - N * 1e-3f : h + N * 1e-3f;
 
             bool occluded = false;
             float3 sh, sN;
@@ -2147,10 +2074,7 @@ kernel void wf_shade_diffuse(
         directLo /= float(u.shadowSamples);
     }
     // Accumulate direct lighting into the color buffer.
-    float3 directAdd = throughput * directLo;
-    colorR[gid] += directAdd.x;
-    colorG[gid] += directAdd.y;
-    colorB[gid] += directAdd.z;
+    color[gid] = float3(color[gid]) + t * directLo;
 
     // Russian roulette: same conditions as megakernel (after bounce 0).
     uint depth = bounceDepth[gid] + 1u;
@@ -2158,25 +2082,19 @@ kernel void wf_shade_diffuse(
     if (u.useRussian != 0 && depth >= 2u) {
         float p = clamp(max(max(albedo.r, albedo.g), albedo.b), 0.05f, 0.95f);
         if (rand(seed) > p) alive_after = false;
-        else throughput /= p;
+        else t /= p;
     }
     if (depth >= uint(u.depth)) alive_after = false;
 
-    // Indirect: cosine-weighted hemisphere sample. Stratified
-    // sampling not supported in wavefront v1 (the megakernel uses it
-    // for the first bounce only; wavefront's loss of explicit per-
-    // sample indexing makes the same trick hard to plumb. Documented
-    // as a minor quality-vs-coherence trade-off; the impact on noise
-    // for typical Picture-class renders is small).
+    // Indirect: cosine-weighted hemisphere sample. Stratified not
+    // supported in wavefront v1.
     float3 newDir = sampleHemisphere(N, seed);
-    float3 newOrigin = hit + N * 1e-3f;
-    throughput *= albedo;
+    float3 newOrigin = h + N * 1e-3f;
+    t *= albedo;
 
-    originX[gid] = newOrigin.x; originY[gid] = newOrigin.y; originZ[gid] = newOrigin.z;
-    dirX[gid]    = newDir.x;    dirY[gid]    = newDir.y;    dirZ[gid]    = newDir.z;
-    throughputR[gid] = throughput.x;
-    throughputG[gid] = throughput.y;
-    throughputB[gid] = throughput.z;
+    origin[gid]      = newOrigin;
+    dir[gid]         = newDir;
+    throughput[gid]  = t;
     rngState[gid]    = seed;
     bounceDepth[gid] = depth;
     alive[gid]       = alive_after ? 1u : 0u;
@@ -2208,9 +2126,7 @@ kernel void wf_shade_diffuse(
 
 kernel void wf_output_writeback(
     constant Uniforms                          &u             [[buffer(0)]],
-    device const float                         *colorR        [[buffer(10)]],
-    device const float                         *colorG        [[buffer(11)]],
-    device const float                         *colorB        [[buffer(12)]],
+    device const packed_float3                 *color         [[buffer(4)]],
     texture2d<float, access::read_write>        output        [[texture(0)]],
     uint2                                       gid           [[thread_position_in_grid]])
 {
@@ -2222,9 +2138,7 @@ kernel void wf_output_writeback(
     float3 sumThisPass = float3(0.0f);
     for (uint s = 0u; s < samples; s++) {
         uint rayIdx = s * pixelCount + pixelIdx;
-        sumThisPass += float3(colorR[rayIdx],
-                              colorG[rayIdx],
-                              colorB[rayIdx]);
+        sumThisPass += float3(color[rayIdx]);
     }
 
     // First-touch (first dispatch covering this pixel within the
@@ -2447,32 +2361,28 @@ namespace
     // via ARC when the holder goes out of scope.
     struct WavefrontRayBuffers
     {
-        // Persistent ray state (one float / uint per ray per field).
-        id<MTLBuffer> originX;
-        id<MTLBuffer> originY;
-        id<MTLBuffer> originZ;
-        id<MTLBuffer> dirX;
-        id<MTLBuffer> dirY;
-        id<MTLBuffer> dirZ;
-        id<MTLBuffer> throughputR;
-        id<MTLBuffer> throughputG;
-        id<MTLBuffer> throughputB;
-        id<MTLBuffer> colorR;
-        id<MTLBuffer> colorG;
-        id<MTLBuffer> colorB;
-        id<MTLBuffer> pixelIdx;
-        id<MTLBuffer> rngState;
-        id<MTLBuffer> bounceDepth;
-        id<MTLBuffer> alive;
+        // Persistent ray state. Vec3 fields packed into MSL packed_float3
+        // (12 bytes per element, alignment 4) to fit within Metal's
+        // 31-buffer-per-kernel limit. Separate XYZ buffers would cost 3
+        // binding slots per field and put the diffuse shading kernel
+        // over the limit; packed_float3 is 1 slot per field at the same
+        // memory bandwidth as 3 separate float buffers (32-thread SIMD
+        // reads 32 * 12 = 384 bytes contiguous = 6 cache lines, matching
+        // the separate-buffer case). This is the "hybrid SoA" layout
+        // PBRT-v4 uses for the same reason.
+        id<MTLBuffer> origin;       // packed_float3
+        id<MTLBuffer> dir;          // packed_float3
+        id<MTLBuffer> throughput;   // packed_float3
+        id<MTLBuffer> color;        // packed_float3
+        id<MTLBuffer> pixelIdx;     // uint
+        id<MTLBuffer> rngState;     // uint
+        id<MTLBuffer> bounceDepth;  // uint
+        id<MTLBuffer> alive;        // uint
 
         // Transient hit info (overwritten by intersect each bounce).
-        id<MTLBuffer> matIdx;
-        id<MTLBuffer> hitX;
-        id<MTLBuffer> hitY;
-        id<MTLBuffer> hitZ;
-        id<MTLBuffer> normalX;
-        id<MTLBuffer> normalY;
-        id<MTLBuffer> normalZ;
+        id<MTLBuffer> matIdx;       // int
+        id<MTLBuffer> hit;          // packed_float3
+        id<MTLBuffer> normal;       // packed_float3
 
         // Per-material queues populated by wf_compact_by_material.
         // Each holds up to rayCount uint ray-indices (worst case: every
@@ -2513,33 +2423,25 @@ namespace
             return [device newBufferWithLength:bytes
                                        options:MTLResourceStorageModePrivate];
         };
-        const size_t floatBytes = rayCount * sizeof(float);
-        const size_t uintBytes  = rayCount * sizeof(uint32_t);
-        const size_t intBytes   = rayCount * sizeof(int32_t);
+        // packed_float3 in MSL is 12 bytes, alignment 4 (no padding,
+        // unlike float3 which is 16-byte-aligned vec). Host side just
+        // sizes the buffer to N*12 bytes; the kernel reinterprets via
+        // its `device packed_float3 *` parameter declaration.
+        const size_t packedF3Bytes = rayCount * 3 * sizeof(float);
+        const size_t uintBytes     = rayCount * sizeof(uint32_t);
+        const size_t intBytes      = rayCount * sizeof(int32_t);
 
-        wf.originX     = alloc(floatBytes);
-        wf.originY     = alloc(floatBytes);
-        wf.originZ     = alloc(floatBytes);
-        wf.dirX        = alloc(floatBytes);
-        wf.dirY        = alloc(floatBytes);
-        wf.dirZ        = alloc(floatBytes);
-        wf.throughputR = alloc(floatBytes);
-        wf.throughputG = alloc(floatBytes);
-        wf.throughputB = alloc(floatBytes);
-        wf.colorR      = alloc(floatBytes);
-        wf.colorG      = alloc(floatBytes);
-        wf.colorB      = alloc(floatBytes);
+        wf.origin      = alloc(packedF3Bytes);
+        wf.dir         = alloc(packedF3Bytes);
+        wf.throughput  = alloc(packedF3Bytes);
+        wf.color       = alloc(packedF3Bytes);
         wf.pixelIdx    = alloc(uintBytes);
         wf.rngState    = alloc(uintBytes);
         wf.bounceDepth = alloc(uintBytes);
         wf.alive       = alloc(uintBytes);
         wf.matIdx      = alloc(intBytes);
-        wf.hitX        = alloc(floatBytes);
-        wf.hitY        = alloc(floatBytes);
-        wf.hitZ        = alloc(floatBytes);
-        wf.normalX     = alloc(floatBytes);
-        wf.normalY     = alloc(floatBytes);
-        wf.normalZ     = alloc(floatBytes);
+        wf.hit         = alloc(packedF3Bytes);
+        wf.normal      = alloc(packedF3Bytes);
 
         wf.queueDiffuse  = alloc(uintBytes);
         wf.queueMirror   = alloc(uintBytes);
@@ -2547,16 +2449,9 @@ namespace
         wf.queueEmissive = alloc(uintBytes);
         wf.queueCounters = alloc(4 * sizeof(uint32_t));
 
-        // Validate: any nil means an allocation failed (out of memory).
-        // Caller falls back to megakernel rather than crashing.
-        wf.valid = (wf.originX && wf.originY && wf.originZ &&
-                    wf.dirX && wf.dirY && wf.dirZ &&
-                    wf.throughputR && wf.throughputG && wf.throughputB &&
-                    wf.colorR && wf.colorG && wf.colorB &&
+        wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
-                    wf.matIdx &&
-                    wf.hitX && wf.hitY && wf.hitZ &&
-                    wf.normalX && wf.normalY && wf.normalZ &&
+                    wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
                     wf.queueCounters);
@@ -3485,26 +3380,25 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             id<MTLCommandBuffer> cmdbuf = [_impl->queue commandBuffer];
 
             // ---- Ray-gen ----
+            // Buffer layout (packed_float3 SoA, MSL hard-caps buffer
+            // index at 30):
+            //   0 uniforms; 1..4 origin/dir/throughput/color (packed_float3);
+            //   5..8 pixelIdx/rngState/bounceDepth/alive (uint);
+            //   9 matIdx (int); 10..11 hit/normal (packed_float3);
+            //   12..18 scene; 19 queueCounters; 20..23 four queues;
+            //   24 shading queue input; 25 queueLen (counter offset).
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:_impl->pipelineWfRayGen];
-                [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
-                [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
-                [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
-                [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
-                [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
-                [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
-                [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
-                [enc setBuffer:wfBufs.throughputR offset:0 atIndex:7];
-                [enc setBuffer:wfBufs.throughputG offset:0 atIndex:8];
-                [enc setBuffer:wfBufs.throughputB offset:0 atIndex:9];
-                [enc setBuffer:wfBufs.colorR      offset:0 atIndex:10];
-                [enc setBuffer:wfBufs.colorG      offset:0 atIndex:11];
-                [enc setBuffer:wfBufs.colorB      offset:0 atIndex:12];
-                [enc setBuffer:wfBufs.pixelIdx    offset:0 atIndex:13];
-                [enc setBuffer:wfBufs.rngState    offset:0 atIndex:14];
-                [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:15];
-                [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
+                [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
+                [enc setBuffer:wfBufs.origin      offset:0 atIndex:1];
+                [enc setBuffer:wfBufs.dir         offset:0 atIndex:2];
+                [enc setBuffer:wfBufs.throughput  offset:0 atIndex:3];
+                [enc setBuffer:wfBufs.color       offset:0 atIndex:4];
+                [enc setBuffer:wfBufs.pixelIdx    offset:0 atIndex:5];
+                [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
+                [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
+                [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
                 [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
                 [enc endEncoding];
             }
@@ -3525,28 +3419,20 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 {
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:_impl->pipelineWfIntersect];
-                    [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
-                    [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
-                    [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
-                    [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
-                    [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
-                    [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
-                    [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
-                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
-                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:17];
-                    [enc setBuffer:wfBufs.hitX        offset:0 atIndex:18];
-                    [enc setBuffer:wfBufs.hitY        offset:0 atIndex:19];
-                    [enc setBuffer:wfBufs.hitZ        offset:0 atIndex:20];
-                    [enc setBuffer:wfBufs.normalX     offset:0 atIndex:21];
-                    [enc setBuffer:wfBufs.normalY     offset:0 atIndex:22];
-                    [enc setBuffer:wfBufs.normalZ     offset:0 atIndex:23];
-                    [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:24];
-                    [enc setBuffer:_impl->planeBuf    offset:0 atIndex:25];
-                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:26];
-                    [enc setBuffer:_impl->triangleBuf offset:0 atIndex:27];
-                    [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:28];
-                    [enc setBuffer:_impl->lightBuf    offset:0 atIndex:29];
-                    [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:30];
+                    [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.origin      offset:0 atIndex:1];
+                    [enc setBuffer:wfBufs.dir         offset:0 atIndex:2];
+                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:9];
+                    [enc setBuffer:wfBufs.hit         offset:0 atIndex:10];
+                    [enc setBuffer:wfBufs.normal      offset:0 atIndex:11];
+                    [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:12];
+                    [enc setBuffer:_impl->planeBuf    offset:0 atIndex:13];
+                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:14];
+                    [enc setBuffer:_impl->triangleBuf offset:0 atIndex:15];
+                    [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:16];
+                    [enc setBuffer:_impl->lightBuf    offset:0 atIndex:17];
+                    [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:18];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 }
@@ -3556,13 +3442,13 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:_impl->pipelineWfCompact];
                     [enc setBuffer:uniformsBuf            offset:p * uniformsStride atIndex:0];
-                    [enc setBuffer:wfBufs.matIdx            offset:0 atIndex:17];
-                    [enc setBuffer:_impl->materialBuf       offset:0 atIndex:26];
-                    [enc setBuffer:wfBufs.queueCounters     offset:0 atIndex:31];
-                    [enc setBuffer:wfBufs.queueDiffuse      offset:0 atIndex:32];
-                    [enc setBuffer:wfBufs.queueMirror       offset:0 atIndex:33];
-                    [enc setBuffer:wfBufs.queueGlass        offset:0 atIndex:34];
-                    [enc setBuffer:wfBufs.queueEmissive     offset:0 atIndex:35];
+                    [enc setBuffer:wfBufs.matIdx            offset:0 atIndex:9];
+                    [enc setBuffer:_impl->materialBuf       offset:0 atIndex:14];
+                    [enc setBuffer:wfBufs.queueCounters     offset:0 atIndex:19];
+                    [enc setBuffer:wfBufs.queueDiffuse      offset:0 atIndex:20];
+                    [enc setBuffer:wfBufs.queueMirror       offset:0 atIndex:21];
+                    [enc setBuffer:wfBufs.queueGlass        offset:0 atIndex:22];
+                    [enc setBuffer:wfBufs.queueEmissive     offset:0 atIndex:23];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 }
@@ -3578,55 +3464,54 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 auto encodeShading = [&](id<MTLComputePipelineState> pipeline,
                                          id<MTLBuffer> queueBuf,
                                          NSUInteger counterOffset,
-                                         bool needsFullScene) {
+                                         bool needsFullScene,
+                                         bool needsColor) {
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:pipeline];
-                    [enc setBuffer:uniformsBuf      offset:p * uniformsStride atIndex:0];
-                    [enc setBuffer:wfBufs.originX     offset:0 atIndex:1];
-                    [enc setBuffer:wfBufs.originY     offset:0 atIndex:2];
-                    [enc setBuffer:wfBufs.originZ     offset:0 atIndex:3];
-                    [enc setBuffer:wfBufs.dirX        offset:0 atIndex:4];
-                    [enc setBuffer:wfBufs.dirY        offset:0 atIndex:5];
-                    [enc setBuffer:wfBufs.dirZ        offset:0 atIndex:6];
-                    [enc setBuffer:wfBufs.throughputR offset:0 atIndex:7];
-                    [enc setBuffer:wfBufs.throughputG offset:0 atIndex:8];
-                    [enc setBuffer:wfBufs.throughputB offset:0 atIndex:9];
-                    [enc setBuffer:wfBufs.colorR      offset:0 atIndex:10];
-                    [enc setBuffer:wfBufs.colorG      offset:0 atIndex:11];
-                    [enc setBuffer:wfBufs.colorB      offset:0 atIndex:12];
-                    [enc setBuffer:wfBufs.rngState    offset:0 atIndex:14];
-                    [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:15];
-                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:16];
-                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:17];
-                    [enc setBuffer:wfBufs.hitX        offset:0 atIndex:18];
-                    [enc setBuffer:wfBufs.hitY        offset:0 atIndex:19];
-                    [enc setBuffer:wfBufs.hitZ        offset:0 atIndex:20];
-                    [enc setBuffer:wfBufs.normalX     offset:0 atIndex:21];
-                    [enc setBuffer:wfBufs.normalY     offset:0 atIndex:22];
-                    [enc setBuffer:wfBufs.normalZ     offset:0 atIndex:23];
+                    [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.origin      offset:0 atIndex:1];
+                    [enc setBuffer:wfBufs.dir         offset:0 atIndex:2];
+                    [enc setBuffer:wfBufs.throughput  offset:0 atIndex:3];
+                    if (needsColor)
+                        [enc setBuffer:wfBufs.color   offset:0 atIndex:4];
+                    [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
+                    [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
+                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                    [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:9];
+                    [enc setBuffer:wfBufs.hit         offset:0 atIndex:10];
+                    [enc setBuffer:wfBufs.normal      offset:0 atIndex:11];
+                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:14];
                     if (needsFullScene)
                     {
-                        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:24];
-                        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:25];
-                        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:27];
-                        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:28];
-                        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:29];
-                        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:30];
+                        [enc setBuffer:_impl->sphereBuf   offset:0 atIndex:12];
+                        [enc setBuffer:_impl->planeBuf    offset:0 atIndex:13];
+                        [enc setBuffer:_impl->triangleBuf offset:0 atIndex:15];
+                        [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:16];
+                        [enc setBuffer:_impl->lightBuf    offset:0 atIndex:17];
+                        [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:18];
                     }
-                    [enc setBuffer:_impl->materialBuf offset:0 atIndex:26];
-                    [enc setBuffer:queueBuf            offset:0 atIndex:36];
-                    [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:37];
+                    [enc setBuffer:queueBuf            offset:0 atIndex:24];
+                    [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 };
+                // Diffuse needs the full scene (for NEE shadow rays) and
+                // the color buffer (writes direct-lighting contribution).
+                // Mirror / glass don't accumulate light to color (delta
+                // BSDFs). Emissive writes to color but doesn't need
+                // scene geometry.
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
-                              0 * sizeof(uint32_t), /*fullScene=*/true);
+                              0 * sizeof(uint32_t), /*fullScene=*/true,
+                              /*needsColor=*/true);
                 encodeShading(_impl->pipelineWfShadeMirror,   wfBufs.queueMirror,
-                              1 * sizeof(uint32_t), /*fullScene=*/false);
+                              1 * sizeof(uint32_t), /*fullScene=*/false,
+                              /*needsColor=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
-                              2 * sizeof(uint32_t), /*fullScene=*/false);
+                              2 * sizeof(uint32_t), /*fullScene=*/false,
+                              /*needsColor=*/false);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
-                              3 * sizeof(uint32_t), /*fullScene=*/false);
+                              3 * sizeof(uint32_t), /*fullScene=*/false,
+                              /*needsColor=*/true);
             }
 
             // ---- Output writeback ----
@@ -3636,10 +3521,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:_impl->pipelineWfWriteback];
-                [enc setBuffer:uniformsBuf  offset:p * uniformsStride atIndex:0];
-                [enc setBuffer:wfBufs.colorR offset:0 atIndex:10];
-                [enc setBuffer:wfBufs.colorG offset:0 atIndex:11];
-                [enc setBuffer:wfBufs.colorB offset:0 atIndex:12];
+                [enc setBuffer:uniformsBuf offset:p * uniformsStride atIndex:0];
+                [enc setBuffer:wfBufs.color offset:0 atIndex:4];
                 [enc setTexture:_impl->outputTex atIndex:0];
                 [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
                 [enc endEncoding];
