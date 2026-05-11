@@ -1523,17 +1523,19 @@ kernel void path_trace_pass_adaptive(
 // in the post-pipeline driver kernel.
 
 kernel void wf_generate_primary_rays(
-    constant Uniforms          &u            [[buffer(0)]],
-    device packed_float3       *origin       [[buffer(1)]],
-    device packed_float3       *dir          [[buffer(2)]],
-    device packed_float3       *throughput   [[buffer(3)]],
-    device packed_float3       *color        [[buffer(4)]],
-    device uint                *pixelIdx     [[buffer(5)]],
-    device uint                *rngState     [[buffer(6)]],
-    device uint                *bounceDepth  [[buffer(7)]],
-    device uint                *alive        [[buffer(8)]],
-    device const Welford       *pixelWelford [[buffer(26)]],
-    uint                        gid          [[thread_position_in_grid]])
+    constant Uniforms          &u                  [[buffer(0)]],
+    device packed_float3       *origin             [[buffer(1)]],
+    device packed_float3       *dir                [[buffer(2)]],
+    device packed_float3       *throughput         [[buffer(3)]],
+    device packed_float3       *color              [[buffer(4)]],
+    device uint                *pixelIdx           [[buffer(5)]],
+    device uint                *rngState           [[buffer(6)]],
+    device uint                *bounceDepth        [[buffer(7)]],
+    device uint                *alive              [[buffer(8)]],
+    device const Welford       *pixelWelford       [[buffer(26)]],
+    device float4              *lambdas            [[buffer(27)]],
+    device float4              *spectralThroughput [[buffer(28)]],
+    uint                        gid                [[thread_position_in_grid]])
 {
     // 1D dispatch over rayCount = pixelCount * samplesPerPass.
     // rayIdx layout: rays for sample-slot s live at indices
@@ -1606,15 +1608,35 @@ kernel void wf_generate_primary_rays(
     color[gid]       = float3(0.0f);
     pixelIdx[gid]    = pixelIdxLocal;
 
-    // Per-ray RNG state: includes sampleStart (per-pass offset) AND
+    // Per-ray RNG seed: includes sampleStart (per-pass offset) AND
     // sampleSlot (within-pass offset) so each unique (aaIdx, sample)
     // tuple gets its own decorrelated sequence. 12379 is a random
     // prime, distinct from the 7919 used for sampleStart, to keep
     // the two contributions from collapsing into the same bit pattern.
-    rngState[gid]    = jitterSeed
-                     + uint(u.sampleStart) * 7919u
-                     + sampleSlot * 12379u
-                     + 0x9e3779b9u;
+    uint seed = jitterSeed
+              + uint(u.sampleStart) * 7919u
+              + sampleSlot * 12379u
+              + 0x9e3779b9u;
+
+    // Spectral mode: assign the 4 hero wavelengths via Wilkie 2014
+    // stratified sampling, one random offset + 3 strides through the
+    // 400..700 nm range with wraparound. Matches the megakernel hero=4
+    // recipe in path_trace_pass exactly so wavefront and megakernel
+    // sample the same spectral distribution. Initial throughput is
+    // float4(1) since no surface has been touched yet.
+    if (u.useSpectral != 0) {
+        float kSpan   = kLambdaMax - kLambdaMin;
+        float kStride = kSpan / 4.0f;
+        float4 lams;
+        lams.x = kLambdaMin + rand(seed) * kSpan;
+        lams.y = lams.x + kStride;          if (lams.y > kLambdaMax) lams.y -= kSpan;
+        lams.z = lams.x + kStride * 2.0f;   if (lams.z > kLambdaMax) lams.z -= kSpan;
+        lams.w = lams.x + kStride * 3.0f;   if (lams.w > kLambdaMax) lams.w -= kSpan;
+        lambdas[gid]            = lams;
+        spectralThroughput[gid] = float4(1.0f);
+    }
+
+    rngState[gid]    = seed;
     bounceDepth[gid] = 0;
     alive[gid]       = 1;
 }
@@ -3589,7 +3611,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             //   5..8 pixelIdx/rngState/bounceDepth/alive (uint);
             //   9 matIdx (int); 10..11 hit/normal (packed_float3);
             //   12..18 scene; 19 queueCounters; 20..23 four queues;
-            //   24 shading queue input; 25 queueLen (counter offset).
+            //   24 shading queue input; 25 queueLen (counter offset);
+            //   26 pixelWelford (PCRWelfordState[]);
+            //   27 lambdas (float4, hero wavelengths, spectral-only);
+            //   28 spectralThroughput (float4, per-wavelength scalar
+            //      throughput, spectral-only).
             // Dispatched 1D over rayCount (= pixelCount * samplesPerPass)
             // so multi-sample-per-pass mode lights up one ray per pixel
             // per sample concurrently.
@@ -3605,7 +3631,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
                 [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
                 [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
-                [enc setBuffer:wfBufs.pixelWelford offset:0 atIndex:26];
+                [enc setBuffer:wfBufs.pixelWelford       offset:0 atIndex:26];
+                [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
+                [enc setBuffer:wfBufs.spectralThroughput offset:0 atIndex:28];
                 [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                 [enc endEncoding];
             }
