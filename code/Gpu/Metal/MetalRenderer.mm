@@ -368,6 +368,27 @@ float rand(thread uint &seed) {
     return float(pcg(seed)) / 4294967295.0f;
 }
 
+// Atomic float-add via uint CAS. M1 (Metal 2) doesn't have native
+// atomic_fetch_add for floats; the loop reinterprets the slot's bits as
+// float, adds, and compare-exchange-weak's the result. Used by the
+// wavefront fork-mode scatter kernel to accumulate per-pixel fork
+// contributions across threads that may target the same pixel.
+//
+// memory_order_relaxed throughout: the writeback kernel doesn't run
+// until the scatter dispatch's command-buffer-ordering boundary, so
+// the only ordering required is single-pixel-coherent atomic-add
+// semantics, which CAS provides.
+void atomic_add_float(device atomic_uint *p, float v) {
+    if (v == 0.0f) return;
+    uint oldI = atomic_load_explicit(p, memory_order_relaxed);
+    uint newI;
+    do {
+        float newF = as_type<float>(oldI) + v;
+        newI = as_type<uint>(newF);
+    } while (!atomic_compare_exchange_weak_explicit(
+        p, &oldI, newI, memory_order_relaxed, memory_order_relaxed));
+}
+
 float3 sampleHemisphereFrom(float3 N, float r1, float r2) {
     float r = sqrt(r1);
     float phi = 2.0f * PI * r2;
@@ -1723,27 +1744,30 @@ kernel void wf_generate_primary_rays(
 // ray count.
 
 kernel void wf_intersect(
-    constant Uniforms                          &u            [[buffer(0)]],
-    device const packed_float3                 *origin       [[buffer(1)]],
-    device const packed_float3                 *dir          [[buffer(2)]],
-    device const uint                          *alive        [[buffer(8)]],
-    device int                                 *matIdxOut    [[buffer(9)]],
-    device packed_float3                       *hit          [[buffer(10)]],
-    device packed_float3                       *normalOut    [[buffer(11)]],
-    device const GpuSphere                     *spheres      [[buffer(12)]],
-    device const GpuPlane                      *planes       [[buffer(13)]],
-    device const GpuMaterial                   *materials    [[buffer(14)]],
-    device const GpuTriangle                   *triangles    [[buffer(15)]],
-    device const GpuBvhNode                    *bvhNodes     [[buffer(16)]],
-    device const GpuLight                      *lights       [[buffer(17)]],
-    device const GpuLightTriangle              *lightTris    [[buffer(18)]],
-    uint                                        gid          [[thread_position_in_grid]])
+    constant Uniforms                          &u              [[buffer(0)]],
+    device const packed_float3                 *origin         [[buffer(1)]],
+    device const packed_float3                 *dir            [[buffer(2)]],
+    device const uint                          *alive          [[buffer(8)]],
+    device int                                 *matIdxOut      [[buffer(9)]],
+    device packed_float3                       *hit            [[buffer(10)]],
+    device packed_float3                       *normalOut      [[buffer(11)]],
+    device const GpuSphere                     *spheres        [[buffer(12)]],
+    device const GpuPlane                      *planes         [[buffer(13)]],
+    device const GpuMaterial                   *materials      [[buffer(14)]],
+    device const GpuTriangle                   *triangles      [[buffer(15)]],
+    device const GpuBvhNode                    *bvhNodes       [[buffer(16)]],
+    device const GpuLight                      *lights         [[buffer(17)]],
+    device const GpuLightTriangle              *lightTris      [[buffer(18)]],
+    device const atomic_uint                   *rayCountAtomic [[buffer(29)]],
+    uint                                        gid            [[thread_position_in_grid]])
 {
-    // rayCount = pixelCount * samplesPerPass for multi-spp wavefront;
-    // megakernel sets sampleCount=1 effectively because it dispatches
-    // one ray per pixel per pass (wavefront 1-spp also has sampleCount=1).
-    uint rayCount = uint(u.width) * uint(u.height) * max(1u, uint(u.sampleCount));
-    if (gid >= rayCount) return;
+    // Bounds = baseRayCount + (forks claimed so far in this pass). In
+    // terminate mode the atomic stays at 0 and totalRays == baseRayCount;
+    // in fork mode glass kernel growth on prior bounces is reflected
+    // here so fork slots get processed by this bounce's intersect.
+    uint baseRayCount = uint(u.baseRayCount);
+    uint forkCount    = atomic_load_explicit(rayCountAtomic, memory_order_relaxed);
+    if (gid >= baseRayCount + forkCount) return;
 
     if (alive[gid] == 0u) {
         matIdxOut[gid] = -1;
@@ -1810,18 +1834,25 @@ kernel void wf_intersect(
 // each compaction dispatch. The driver in commit #6 handles that.
 
 kernel void wf_compact_by_material(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device const int                           *matIdx        [[buffer(9)]],
-    device const GpuMaterial                   *materials     [[buffer(14)]],
-    device atomic_uint                         *queueCounters [[buffer(19)]],
-    device uint                                *queueDiffuse  [[buffer(20)]],
-    device uint                                *queueMirror   [[buffer(21)]],
-    device uint                                *queueGlass    [[buffer(22)]],
-    device uint                                *queueEmissive [[buffer(23)]],
-    uint                                        gid           [[thread_position_in_grid]])
+    constant Uniforms                          &u              [[buffer(0)]],
+    device const int                           *matIdx         [[buffer(9)]],
+    device const GpuMaterial                   *materials      [[buffer(14)]],
+    device atomic_uint                         *queueCounters  [[buffer(19)]],
+    device uint                                *queueDiffuse   [[buffer(20)]],
+    device uint                                *queueMirror    [[buffer(21)]],
+    device uint                                *queueGlass     [[buffer(22)]],
+    device uint                                *queueEmissive  [[buffer(23)]],
+    device const atomic_uint                   *rayCountAtomic [[buffer(29)]],
+    uint                                        gid            [[thread_position_in_grid]])
 {
-    uint rayCount = uint(u.width) * uint(u.height) * max(1u, uint(u.sampleCount));
-    bool inBounds = (gid < rayCount);
+    // Bounds = baseRayCount + (forks claimed so far). Same expansion as
+    // wf_intersect; fork slots produced by earlier bounces get classified
+    // into per-material queues by this kernel so their shading kernels
+    // see them. SIMD prefix-sum scans still execute over all 32 lanes
+    // (out-of-bounds and dead-ray threads participate with pred=0).
+    uint baseRayCount = uint(u.baseRayCount);
+    uint forkCount    = atomic_load_explicit(rayCountAtomic, memory_order_relaxed);
+    bool inBounds = (gid < baseRayCount + forkCount);
 
     // Classify this thread's ray. Out-of-bounds threads and dead-ray
     // threads (matIdx == -1) participate in the SIMD prefix-sum scans
@@ -2217,8 +2248,14 @@ kernel void wf_shade_glass(
                         lambdas[slot]            = float4(lams.w, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.w, 0.0f, 0.0f, 0.0f);
                     }
+                    // Fork mode: forks carry the missing 3/4 share of
+                    // the spectral integral; primary continues at its
+                    // unamplified hero throughput. No *= 4 here.
+                } else {
+                    // Terminate mode: scale survivor by N=4 to keep the
+                    // hero=N estimator unbiased (PBRT-v4 convention).
+                    spThru.x *= 4.0f;
                 }
-                spThru.x *= 4.0f;
             }
             spThru.y = 0.0f;
             spThru.z = 0.0f;
@@ -2453,12 +2490,39 @@ kernel void wf_shade_diffuse(
 // divides by total contributions (aaSamples * samples) the same way
 // non-adaptive megakernel multi-pass does.
 
+// Per-fork scatter kernel for spectralFork mode. Dispatched at the
+// post-pass fork count read from rayCountAtomic. Each thread reads one
+// fork slot's color and atomic-CAS-adds it into the per-pixel fork
+// accumulator buffer keyed on pixelIdx. The writeback kernel then sums
+// primary gather + perPixelAccum to get the pass's total per-pixel
+// contribution. Terminate mode skips this dispatch entirely.
+kernel void wf_scatter_forks(
+    constant Uniforms                          &u              [[buffer(0)]],
+    device const packed_float3                 *color          [[buffer(4)]],
+    device const uint                          *pixelIdx       [[buffer(5)]],
+    device const atomic_uint                   *rayCountAtomic [[buffer(29)]],
+    device atomic_uint                         *perPixelAccum  [[buffer(30)]],
+    uint                                        gid            [[thread_position_in_grid]])
+{
+    uint forkCount = atomic_load_explicit(rayCountAtomic, memory_order_relaxed);
+    if (gid >= forkCount) return;
+
+    uint slot = uint(u.baseRayCount) + gid;
+    float3 c = float3(color[slot]);
+    uint pix = pixelIdx[slot];
+
+    atomic_add_float(&perPixelAccum[pix * 3u + 0u], c.r);
+    atomic_add_float(&perPixelAccum[pix * 3u + 1u], c.g);
+    atomic_add_float(&perPixelAccum[pix * 3u + 2u], c.b);
+}
+
 kernel void wf_output_writeback(
-    constant Uniforms                          &u             [[buffer(0)]],
-    device const packed_float3                 *color         [[buffer(4)]],
-    device Welford                             *pixelWelford  [[buffer(26)]],
-    texture2d<float, access::read_write>        output        [[texture(0)]],
-    uint2                                       gid           [[thread_position_in_grid]])
+    constant Uniforms                          &u                 [[buffer(0)]],
+    device const packed_float3                 *color             [[buffer(4)]],
+    device Welford                             *pixelWelford      [[buffer(26)]],
+    device const atomic_uint                   *perPixelAccum     [[buffer(30)]],
+    texture2d<float, access::read_write>        output            [[texture(0)]],
+    uint2                                       gid               [[thread_position_in_grid]])
 {
     if (gid.x >= uint(u.width) || gid.y >= uint(u.height)) return;
     uint pixelIdx   = gid.y * uint(u.width) + gid.x;
@@ -2475,6 +2539,17 @@ kernel void wf_output_writeback(
     for (uint s = 0u; s < samples; s++) {
         uint rayIdx = s * pixelCount + pixelIdx;
         sumThisPass += float3(color[rayIdx]);
+    }
+    // In fork mode the wf_scatter_forks kernel populated perPixelAccum
+    // with fork-ray color contributions for this pass; add them to the
+    // primary gather. Atomic loads (relaxed) since the scatter dispatch
+    // completed before this kernel runs (command-buffer ordering).
+    if (u.spectralFork != 0) {
+        uint base = pixelIdx * 3u;
+        float fr = as_type<float>(atomic_load_explicit(&perPixelAccum[base + 0u], memory_order_relaxed));
+        float fg = as_type<float>(atomic_load_explicit(&perPixelAccum[base + 1u], memory_order_relaxed));
+        float fb = as_type<float>(atomic_load_explicit(&perPixelAccum[base + 2u], memory_order_relaxed));
+        sumThisPass += float3(fr, fg, fb);
     }
 
     if (u.useAdaptive != 0) {
@@ -2854,6 +2929,15 @@ namespace
         // at zero and is harmless.
         id<MTLBuffer> rayCountAtomic;
 
+        // Per-pixel fork-color accumulator. In fork mode, the scatter
+        // kernel atomic-adds each fork ray's color contribution into
+        // this buffer keyed on the fork's pixelIdx. The writeback
+        // kernel then sums per-pixel primary gather + this accumulator
+        // to get the pass's per-pixel total. Sized 3 * pixelCount uints
+        // (interpreted as float bits via as_type for the atomic CAS).
+        // Blit-zeroed before each pipeline pass.
+        id<MTLBuffer> perPixelAccum;
+
         NSUInteger rayCount = 0;
         bool valid = false;
     };
@@ -2925,6 +3009,10 @@ namespace
         // by the host per pass.
         wf.rayCountAtomic = alloc(sizeof(uint32_t));
 
+        // Per-pixel fork-color accumulator. 3 uints per pixel (RGB
+        // interpreted as float bits via the atomic_add_float helper).
+        wf.perPixelAccum = alloc(pixelCount * 3 * sizeof(uint32_t));
+
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
                     wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
                     wf.matIdx && wf.hit && wf.normal &&
@@ -2932,7 +3020,7 @@ namespace
                     wf.queueGlass && wf.queueEmissive &&
                     wf.queueCounters && wf.pixelWelford &&
                     wf.lambdas && wf.spectralThroughput &&
-                    wf.rayCountAtomic);
+                    wf.rayCountAtomic && wf.perPixelAccum);
         return wf;
     }
 
@@ -3036,6 +3124,7 @@ struct MetalRenderer::Impl
     id<MTLComputePipelineState> pipelineWfShadeGlass    = nil;
     id<MTLComputePipelineState> pipelineWfShadeDiffuse  = nil;
     id<MTLComputePipelineState> pipelineWfWriteback     = nil;
+    id<MTLComputePipelineState> pipelineWfScatterForks  = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -3262,6 +3351,26 @@ namespace
         if (!im.pipelineWfWriteback)
         {
             std::cerr << "MetalRenderer: wavefront output-writeback pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        // Fork-scatter kernel: dispatched in spectralFork mode after
+        // all bounces complete, before writeback. Adds each fork ray's
+        // color contribution to a per-pixel atomic-CAS accumulator
+        // keyed on the fork's pixelIdx.
+        id<MTLFunction> fnWfScatterForks = [im.library newFunctionWithName:@"wf_scatter_forks"];
+        if (!fnWfScatterForks)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'wf_scatter_forks' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineWfScatterForks = [im.device newComputePipelineStateWithFunction:fnWfScatterForks error:&err];
+        if (!im.pipelineWfScatterForks)
+        {
+            std::cerr << "MetalRenderer: wavefront fork-scatter pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
@@ -4007,6 +4116,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     [enc setBuffer:_impl->bvhBuf      offset:0 atIndex:16];
                     [enc setBuffer:_impl->lightBuf    offset:0 atIndex:17];
                     [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:18];
+                    [enc setBuffer:wfBufs.rayCountAtomic offset:0 atIndex:29];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 }
@@ -4023,6 +4133,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     [enc setBuffer:wfBufs.queueMirror       offset:0 atIndex:21];
                     [enc setBuffer:wfBufs.queueGlass        offset:0 atIndex:22];
                     [enc setBuffer:wfBufs.queueEmissive     offset:0 atIndex:23];
+                    [enc setBuffer:wfBufs.rayCountAtomic    offset:0 atIndex:29];
                     [enc dispatchThreadgroups:threadgroups1D threadsPerThreadgroup:threadsPerGroup1D];
                     [enc endEncoding];
                 }
@@ -4095,16 +4206,56 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                               /*needsColor=*/true);
             }
 
+            // ---- Fork-scatter (spectralFork mode only) ----
+            // Atomic-CAS-adds each fork ray's color contribution into
+            // the per-pixel accumulator keyed on pixelIdx. Skipped in
+            // terminate mode where no forks exist and writeback gathers
+            // primaries directly. Per-pass blit-zero of perPixelAccum
+            // happens here so terminate-mode runs don't pay the fill
+            // cost.
+            if (spectralForkActive)
+            {
+                {
+                    id<MTLBlitCommandEncoder> blit = [cmdbuf blitCommandEncoder];
+                    NSUInteger accumBytes = pixelCount * 3 * sizeof(uint32_t);
+                    [blit fillBuffer:wfBufs.perPixelAccum
+                               range:NSMakeRange(0, accumBytes)
+                               value:0];
+                    [blit endEncoding];
+                }
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+                    [enc setComputePipelineState:_impl->pipelineWfScatterForks];
+                    [enc setBuffer:uniformsBuf            offset:p * uniformsStride atIndex:0];
+                    [enc setBuffer:wfBufs.color           offset:0 atIndex:4];
+                    [enc setBuffer:wfBufs.pixelIdx        offset:0 atIndex:5];
+                    [enc setBuffer:wfBufs.rayCountAtomic  offset:0 atIndex:29];
+                    [enc setBuffer:wfBufs.perPixelAccum   offset:0 atIndex:30];
+                    // Dispatch at the worst-case fork count (3 *
+                    // baseRayCount) and bounds-check inside the kernel
+                    // against the atomic. Saves a counter readback.
+                    NSUInteger forkDispatch = bufferSlots - baseRayCount;
+                    NSUInteger forkGroups =
+                        (forkDispatch + linearThreadsPerGroup - 1) / linearThreadsPerGroup;
+                    if (forkGroups < 1) forkGroups = 1;
+                    MTLSize fg = MTLSizeMake(forkGroups, 1, 1);
+                    [enc dispatchThreadgroups:fg threadsPerThreadgroup:threadsPerGroup1D];
+                    [enc endEncoding];
+                }
+            }
+
             // ---- Output writeback ----
             // Per-pixel reduction over the samplesPerPass rays for this
             // pixel, summing colors into the output texture with the
-            // first-touch / accumulate convention.
+            // first-touch / accumulate convention. Adds fork-scatter
+            // accumulator on top in spectralFork mode.
             {
                 id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                 [enc setComputePipelineState:_impl->pipelineWfWriteback];
                 [enc setBuffer:uniformsBuf offset:p * uniformsStride atIndex:0];
                 [enc setBuffer:wfBufs.color offset:0 atIndex:4];
                 [enc setBuffer:wfBufs.pixelWelford offset:0 atIndex:26];
+                [enc setBuffer:wfBufs.perPixelAccum offset:0 atIndex:30];
                 [enc setTexture:_impl->outputTex atIndex:0];
                 [enc dispatchThreadgroups:threadgroups2D threadsPerThreadgroup:threadsPerGroup];
                 [enc endEncoding];
