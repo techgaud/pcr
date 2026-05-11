@@ -73,6 +73,13 @@ public:
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
 
+    // Architecture toggle. Field exists so Gui/main.cpp and Cli/Main.cpp
+    // compile against either backend with the same surface. OpenGL only
+    // has the megakernel path; setting useWavefront=true on this backend
+    // is a no-op (no fallback warning needed since wavefront-on-OpenGL
+    // isn't planned). The Metal backend honors the field.
+    bool useWavefront = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

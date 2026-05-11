@@ -103,6 +103,7 @@ int main(int argc, char *argv[])
     uint64_t seed = 0;
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
+    bool useWavefront = false;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -247,6 +248,13 @@ int main(int argc, char *argv[])
                  "--threadgroup-x.")
         ->default_str(std::to_string(pcr::kDefaultThreadgroupY))
         ->check(CLI::PositiveNumber);
+    options->add_flag("--wavefront", useWavefront,
+                 "Use the wavefront path tracer architecture (rays "
+                 "rebatched per-material between bounces) instead of "
+                 "the default megakernel single-kernel architecture. "
+                 "Currently a no-op fallback to megakernel with a "
+                 "stderr warning until the wavefront kernels ship; "
+                 "see TODO.md. Metal backend only.");
 #endif
 
     CLI11_PARSE(app, argc, argv);
@@ -427,9 +435,11 @@ int main(int argc, char *argv[])
 #if PCR_USE_GPU
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;
+    renderer.useWavefront = useWavefront;
 #else
     (void)threadgroupX;
     (void)threadgroupY;
+    (void)useWavefront;
 #endif
     renderer.render(sceneData, start, outputDir);
 

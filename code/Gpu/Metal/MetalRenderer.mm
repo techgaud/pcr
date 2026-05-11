@@ -2103,6 +2103,30 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
+    // Wavefront architecture fallback. The kernels haven't been written
+    // yet; the flag exists in the renderer / CLI / GUI surface so the
+    // plumbing is real and stable, but selecting wavefront today falls
+    // back to megakernel with a one-time stderr warning per render so
+    // the user is never silently surprised by getting megakernel when
+    // they asked for wavefront. The TODO.md "wavefront baseline" item
+    // is what flips this from fallback to real dispatch.
+    bool effectiveWavefront = useWavefront;
+    if (useWavefront)
+    {
+        std::cerr << "MetalRenderer: --wavefront / useWavefront=true was "
+                  << "requested but the wavefront kernels are not yet "
+                  << "implemented. Falling back to megakernel for this "
+                  << "render. See TODO.md for status." << std::endl;
+        if (useAdaptive)
+        {
+            std::cerr << "MetalRenderer: note that adaptive sampling will "
+                      << "be unavailable in wavefront mode when the "
+                      << "wavefront kernels ship; see TODO.md item #1."
+                      << std::endl;
+        }
+        effectiveWavefront = false;
+    }
+
     if (!initMetal(*_impl, _width, _height)) return;
 
     float totalLightArea = 0.f;
@@ -2570,6 +2594,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     addText("OIDN",          useOIDN     ? "1" : "0");
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
+    // Architecture records what ACTUALLY ran, not what was requested.
+    // useWavefront=true falls back to megakernel until the wavefront
+    // kernels ship; effectiveWavefront reflects the post-fallback choice
+    // so the metadata is honest.
+    addText("Architecture",  effectiveWavefront ? "wavefront" : "megakernel");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

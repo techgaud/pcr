@@ -118,6 +118,12 @@ struct JobConfig
     std::string lutChoice = "off";
     int  threadgroupX = pcr::kDefaultThreadgroupX;
     int  threadgroupY = pcr::kDefaultThreadgroupY;
+
+    // Architecture toggle. false = megakernel (default). true = wavefront.
+    // Persisted, plumbed through the renderer, but the GUI radio button
+    // for switching it stays hidden until wavefront kernels actually
+    // exist. CLI exposes --wavefront for early testing of the plumbing.
+    bool useWavefront = false;
 };
 
 struct JobResult
@@ -258,6 +264,11 @@ struct Settings
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
 
+    // Architecture toggle. false = megakernel, true = wavefront. Persisted
+    // even though the GUI doesn't surface a switch yet so future flips of
+    // the GUI radio don't lose state across launches.
+    bool useWavefront = false;
+
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
     // persisted regardless so flipping spectral on later restores the
@@ -309,6 +320,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.lutChoice     = s.lutChoice;
     j.threadgroupX  = s.threadgroupX;
     j.threadgroupY  = s.threadgroupY;
+    j.useWavefront  = s.useWavefront;
     return j;
 }
 
@@ -337,6 +349,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.lutChoice     = j.lutChoice;
     s.threadgroupX  = j.threadgroupX;
     s.threadgroupY  = j.threadgroupY;
+    s.useWavefront  = j.useWavefront;
 }
 
 // Short single-line summary for the queue UI row. "<scene>  WxH  d?/s?/S?
@@ -354,6 +367,7 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useMIS)        tags += " mis";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
+    if (j.useWavefront)  tags += " wave";
     std::snprintf(buf, sizeof(buf),
                   "%s  %dx%d  d%d/s%d/S%d%s  tg%dx%d",
                   j.sceneName.c_str(), j.width, j.height,
@@ -414,6 +428,7 @@ static void loadSettings(Settings &s)
         s.heroSamples   = j.value("heroSamples",   s.heroSamples);
         s.threadgroupX  = j.value("threadgroupX",  s.threadgroupX);
         s.threadgroupY  = j.value("threadgroupY",  s.threadgroupY);
+        s.useWavefront  = j.value("useWavefront",  s.useWavefront);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -482,6 +497,7 @@ static json buildSettingsJson(const Settings &s)
     j["heroSamples"]   = s.heroSamples;
     j["threadgroupX"]  = s.threadgroupX;
     j["threadgroupY"]  = s.threadgroupY;
+    j["useWavefront"]  = s.useWavefront;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -762,6 +778,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 #if PCR_USE_GPU
         renderer.threadgroupX  = settings.threadgroupX;
         renderer.threadgroupY  = settings.threadgroupY;
+        renderer.useWavefront  = settings.useWavefront;
 #endif
         if (live)
         {
@@ -1578,20 +1595,21 @@ int main(int, char **)
         pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 64,   1, 4);
 
 #if PCR_USE_GPU
-        // GPU Tuning: Metal compute threadgroup shape. Gated behind the
-        // Debug-mode toggle because the empirical A/B in v1.4.1 narrowed
-        // the answer to 8x8 across both RGB and spectral at multiple
-        // sample counts (5-7% better than the next-best, 35-40% better
-        // than 16x16/32x32). The selector stays for future A/B if the
-        // kernel shape changes meaningfully (e.g. wavefront refactor),
-        // but day-to-day the default Just Works.
+        // Architecture: dispatch-level GPU choices that change HOW the
+        // renderer runs (not what it computes). Gated behind the Debug-
+        // mode toggle because the day-to-day defaults are A/B-locked and
+        // the selectors only matter when re-running A/Bs or testing new
+        // architectures. Currently houses the threadgroup-shape preset
+        // row; the megakernel/wavefront radio joins this section once
+        // the wavefront kernels ship.
         //
         // Metal backend only - OpenGL bakes local_size into the GLSL
-        // string and ignores these fields. Read ThreadgroupX/Y from the
-        // PNG tEXt metadata after a render to confirm what shipped.
+        // string and ignores these fields. Read ThreadgroupX/Y and
+        // Architecture from the PNG tEXt metadata after a render to
+        // confirm what shipped.
         if (settings.debugMode)
         {
-            ImGui::SeparatorText("GPU Tuning (debug)");
+            ImGui::SeparatorText("Architecture (debug)");
             ImGui::TextUnformatted("Threadgroup:");
             // Presets ordered by total threads. Three are below Apple's
             // SIMD width of 32 (2x2, 4x4, 8x4) so they partially or fully

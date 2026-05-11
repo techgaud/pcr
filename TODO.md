@@ -2,6 +2,44 @@
 
 Deferred work, with enough context to pick up cold later.
 
+## Adaptive sampling in wavefront mode
+
+**Status:** explicit limitation as of the wavefront baseline. `useAdaptive` is silently honored only when `useWavefront=false` (megakernel multi-pass). When `useWavefront=true`, the adaptive flag is ignored and a stderr warning fires.
+
+### Why deferred
+
+Megakernel adaptive keeps per-pixel Welford state in a device buffer, updated at AA-iteration boundaries (the last batch of each aaIdx fires the convergence check). Wavefront has no AA-iteration boundary per-pixel because rays from different pixels interleave through the shading kernels, so the existing Welford-update trigger doesn't map across cleanly.
+
+### Two paths forward (pick one when revisiting)
+
+1. **Run wavefront within each AA iteration.** One full wavefront pipeline run per aaIdx. Welford updates between passes, same per-pixel device buffer pattern as megakernel multi-pass. Preserves the existing adaptive semantics and convergence threshold. Cost: each pipeline run has 1/aaSamples the rays-in-flight that a one-shot wavefront run would have, so some of wavefront's ray-parallelism gain is given back. Probably still net positive for divergence-heavy scenes.
+
+2. **Per-ray Welford in the ray state struct.** Each ray carries running mean/M2/count for its destination pixel. Convergence is checked when a ray terminates (no hit or depth exceeded), at which point a "this pixel is done" flag is set in a per-pixel mask. Subsequent primary-ray generation skips done pixels. More complex (Welford state now lives on the hot ray-state path), but preserves wavefront's one-shot pipeline.
+
+### When to revisit
+
+Right after the wavefront baseline ships and proves itself on non-adaptive renders. Top of the TODO list because Nate uses adaptive often in spectral mode where the convergence early-exit is significant.
+
+## A/B test multi-level prefix-sum vs SIMD-group-batched atomic for queue compaction
+
+**Status:** wavefront ships with SIMD-group-batched atomic queue compaction (per AMD GPUOpen "Fast Compaction with mbcnt", adapted to Metal's `simd_prefix_exclusive_sum()` intrinsic). One atomic per SIMD group instead of per thread, ~32x reduction in atomic traffic. Apple's WWDC22 "Scale compute workloads across Apple GPUs" specifically flags global atomics as a bottleneck on multi-core M-series GPUs, which makes the SIMD-group-batched pattern the safe-and-simple default.
+
+### Why deferred
+
+Multi-level prefix-sum compaction (full Blelloch scan, no atomics) is the production-grade choice for large ray counts. But it's ~3x the code (per-SIMD scan + per-threadgroup combine + cross-threadgroup combine + final scatter) and only meaningful when atomic contention actually dominates. At pcr's 1080² scale (~1.17M rays / 32 = ~36K atomics per SIMD-batched queue counter), contention should be bounded. Worth measuring before committing to the larger refactor.
+
+### Implementation outline
+
+1. Add a `--queue-compaction` mode flag to the GPU CLI: `simd-batched` (current default) or `prefix-sum`.
+2. Wrap the queue-write path in each shading kernel behind a macro / function pointer so both modes share the same call site.
+3. Implement the full Blelloch scan against `simd_prefix_inclusive_sum()` for per-SIMD, threadgroup memory + barrier for per-threadgroup combine, and a second dispatch for cross-threadgroup combine.
+4. Render the same scene+settings with both modes via the GUI queue (batching feature from v1.4.1), compare wallclock + GPU power draw.
+5. If prefix-sum is consistently faster by >5%, promote it to default. Otherwise document the result and remove the prefix-sum kernels.
+
+### When to revisit
+
+After wavefront ships and we have actual M1 Ultra wallclock numbers for the SIMD-batched baseline. Likely materializes only if pcr starts pushing 4K+ renders where queue scales are 10-100x larger and atomic contention may show up.
+
 ## macOS signed + notarized .dmg distribution
 
 **Status:** not started. The current macOS release flow ships a per-OS bundle ZIP. macOS Gatekeeper blocks any binary downloaded from the internet that isn't notarized; users have to `xattr -dr com.apple.quarantine` the extracted folder before launch. A signed and notarized .dmg removes that friction.

@@ -70,6 +70,15 @@ public:
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
 
+    // Architecture toggle. false = megakernel (the v1.4.0+ single-kernel
+    // path tracer with per-pixel multi-pass dispatch). true = wavefront
+    // (rays rebatched per-material between bounces, divergence-free
+    // shading kernels). When wavefront kernels haven't been implemented
+    // yet, setting this to true falls back to megakernel and prints a
+    // stderr warning once per render. Adaptive sampling is not supported
+    // in wavefront mode and is silently ignored when both flags are set.
+    bool useWavefront = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
