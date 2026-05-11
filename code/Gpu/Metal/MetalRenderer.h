@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Vec3f.h"
+#include "GpuDefaults.h"
 #include "../../Scenes/Scene.h"
 
 // Forward declare GLFWwindow so this header doesn't pull in the GLFW
@@ -61,17 +62,13 @@ public:
     int heroSamples = 4;
 
     // Metal compute threadgroup shape for the path_trace_pass{,_adaptive}
-    // kernels. M1 Ultra's SIMD width is 32, so the most-effective values
-    // are multiples of 32 in total threads. Default 32x32 = 1024 threads
-    // (one full threadgroup, maximum spatial reuse). 8x8, 16x16, 32x8
-    // are also common shapes worth A/B-testing for path-tracing
-    // workloads since ray divergence often favors smaller groups (more
-    // concurrent groups per SM, lower stall penalty when one lane
-    // diverges). Validated against MTLComputePipelineState's
-    // maxTotalThreadsPerThreadgroup at dispatch time and clamped to
-    // 16x16 if the chosen shape exceeds the pipeline's limit.
-    int threadgroupX = 32;
-    int threadgroupY = 32;
+    // kernels. Default (8x8 as of v1.4.1) lives in GpuDefaults.h with
+    // the rationale and A/B history; this field is the renderer-side
+    // override knob, populated by the CLI / GUI before render(). Clamps
+    // to 16x16 at dispatch time if the chosen shape exceeds the
+    // pipeline's maxTotalThreadsPerThreadgroup.
+    int threadgroupX = pcr::kDefaultThreadgroupX;
+    int threadgroupY = pcr::kDefaultThreadgroupY;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,

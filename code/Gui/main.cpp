@@ -71,6 +71,7 @@
 #include "portable-file-dialogs.h"
 
 #include "Includes/DllSearch.h"
+#include "Includes/GpuDefaults.h"
 #include "Includes/LutDiscovery.h"
 #include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
@@ -115,8 +116,8 @@ struct JobConfig
     bool useOIDN = false;
     int  heroSamples = 4;
     std::string lutChoice = "off";
-    int  threadgroupX = 32;
-    int  threadgroupY = 32;
+    int  threadgroupX = pcr::kDefaultThreadgroupX;
+    int  threadgroupY = pcr::kDefaultThreadgroupY;
 };
 
 struct JobResult
@@ -250,13 +251,12 @@ struct Settings
     int heroSamples = 4;
 
     // Metal compute threadgroup shape. Effective on Apple Silicon
-    // backends only; OpenGL ignores them. Common A/B shapes: 8x8
-    // (small, more concurrent groups, better for divergent paths),
-    // 16x16, 32x8 (wide, favors horizontal cache locality), 32x32
-    // (current default, maximum spatial reuse). The GUI surfaces these
-    // as preset buttons next to the quality presets.
-    int threadgroupX = 32;
-    int threadgroupY = 32;
+    // backends only; OpenGL ignores them. Default lives in
+    // GpuDefaults.h (8x8 as of v1.4.1, picked by A/B). The GUI's
+    // debug-mode tuning panel surfaces a row of preset buttons for
+    // re-running the A/B if the kernel shape changes.
+    int threadgroupX = pcr::kDefaultThreadgroupX;
+    int threadgroupY = pcr::kDefaultThreadgroupY;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -1578,55 +1578,59 @@ int main(int, char **)
         pcrSliderInt("Shadow",  &settings.shadowSamples, 1, 64,   1, 4);
 
 #if PCR_USE_GPU
-        // GPU Tuning: Metal compute threadgroup shape. Hot-tunable A/B
-        // knob, not a quality/aesthetic choice; effective only on the
-        // Metal backend (OpenGL bakes local_size into the GLSL string
-        // and ignores these fields). Multiples of 32 in total threads
-        // align with M1 Ultra's SIMD width; smaller groups tend to win
-        // on divergent path-tracing workloads, larger groups tend to
-        // win on coherent compute. Read ThreadgroupX/Y from the PNG
-        // tEXt metadata after a render to confirm what shipped.
-        ImGui::SeparatorText("GPU Tuning");
-        ImGui::TextUnformatted("Threadgroup:");
-        // Threadgroup presets ordered by total threads. Three are below
-        // Apple's SIMD width of 32 (2x2 = 4, 4x4 = 16, 8x4 = 32) so they
-        // partially or fully fill a single SIMD group; the rest are
-        // multiples of 32 for clean SIMD packing. Sub-SIMD presets are
-        // included so empirical A/B can measure whether the extra
-        // concurrency from more in-flight groups outweighs the lane-
-        // utilization loss when each group is smaller than a SIMD.
-        struct TgPreset { const char *label; int x; int y; };
-        static const TgPreset kTgPresets[] = {
-            {"2x2",   2,  2},   // 4 threads, ⅛ SIMD - extreme small-group probe
-            {"4x4",   4,  4},   // 16 threads, ½ SIMD
-            {"8x4",   8,  4},   // 32 threads, exactly 1 SIMD group
-            {"8x8",   8,  8},   // 64 threads, 2 SIMD groups (default-equivalent)
-            {"16x16", 16, 16},  // 256 threads, 8 SIMD groups
-            {"32x8",  32, 8},   // 256 threads, wide layout
-            {"32x32", 32, 32},  // 1024 threads, full threadgroup (legacy default)
-        };
-        for (const auto &tp : kTgPresets)
+        // GPU Tuning: Metal compute threadgroup shape. Gated behind the
+        // Debug-mode toggle because the empirical A/B in v1.4.1 narrowed
+        // the answer to 8x8 across both RGB and spectral at multiple
+        // sample counts (5-7% better than the next-best, 35-40% better
+        // than 16x16/32x32). The selector stays for future A/B if the
+        // kernel shape changes meaningfully (e.g. wavefront refactor),
+        // but day-to-day the default Just Works.
+        //
+        // Metal backend only - OpenGL bakes local_size into the GLSL
+        // string and ignores these fields. Read ThreadgroupX/Y from the
+        // PNG tEXt metadata after a render to confirm what shipped.
+        if (settings.debugMode)
         {
-            ImGui::SameLine();
-            bool isActive = (settings.threadgroupX == tp.x &&
-                             settings.threadgroupY == tp.y);
-            if (isActive)
-                ImGui::PushStyleColor(ImGuiCol_Button,
-                                      ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-            if (ImGui::Button(tp.label))
+            ImGui::SeparatorText("GPU Tuning (debug)");
+            ImGui::TextUnformatted("Threadgroup:");
+            // Presets ordered by total threads. Three are below Apple's
+            // SIMD width of 32 (2x2, 4x4, 8x4) so they partially or fully
+            // fill a single SIMD group; the rest are multiples of 32 for
+            // clean SIMD packing. Sub-SIMD presets remain so empirical
+            // A/B can re-measure if the kernel shape changes.
+            struct TgPreset { const char *label; int x; int y; };
+            static const TgPreset kTgPresets[] = {
+                {"2x2",   2,  2},   // 4 threads, ⅛ SIMD - extreme small-group probe
+                {"4x4",   4,  4},   // 16 threads, ½ SIMD
+                {"8x4",   8,  4},   // 32 threads, exactly 1 SIMD group
+                {"8x8",   8,  8},   // 64 threads, 2 SIMD groups (current default)
+                {"16x16", 16, 16},  // 256 threads, 8 SIMD groups
+                {"32x8",  32, 8},   // 256 threads, wide layout
+                {"32x32", 32, 32},  // 1024 threads, full threadgroup
+            };
+            for (const auto &tp : kTgPresets)
             {
-                settings.threadgroupX = tp.x;
-                settings.threadgroupY = tp.y;
+                ImGui::SameLine();
+                bool isActive = (settings.threadgroupX == tp.x &&
+                                 settings.threadgroupY == tp.y);
+                if (isActive)
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+                if (ImGui::Button(tp.label))
+                {
+                    settings.threadgroupX = tp.x;
+                    settings.threadgroupY = tp.y;
+                }
+                if (isActive)
+                    ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%d x %d = %d threads/group (%d SIMD groups)",
+                                      tp.x, tp.y, tp.x * tp.y, (tp.x * tp.y) / 32);
             }
-            if (isActive)
-                ImGui::PopStyleColor();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%d x %d = %d threads/group (%d SIMD groups)",
-                                  tp.x, tp.y, tp.x * tp.y, (tp.x * tp.y) / 32);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(current %dx%d)",
+                                settings.threadgroupX, settings.threadgroupY);
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled("(current %dx%d)",
-                            settings.threadgroupX, settings.threadgroupY);
 #endif
 
         // Mode: pipeline-shaping choices that change WHAT the

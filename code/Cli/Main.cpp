@@ -12,6 +12,7 @@
 
 #include "Includes/CLI11.hpp"
 #include "Includes/DllSearch.h"
+#include "Includes/GpuDefaults.h"
 #include "Includes/LutDiscovery.h"
 #include "Includes/NumGen.h"
 #include "Includes/RGBToSpectrum.h"
@@ -100,8 +101,8 @@ int main(int argc, char *argv[])
     bool useLUT = false;
     std::string lutFile;
     uint64_t seed = 0;
-    int threadgroupX = 32;
-    int threadgroupY = 32;
+    int threadgroupX = pcr::kDefaultThreadgroupX;
+    int threadgroupY = pcr::kDefaultThreadgroupY;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -236,14 +237,15 @@ int main(int argc, char *argv[])
                  "with --threadgroup-y selects the per-dispatch threadgroup "
                  "shape. Effective values on Apple Silicon are multiples of "
                  "32 in total threads (SIMD width = 32); common shapes are "
-                 "8x8, 16x16, 32x8, 32x32. Default 32. Ignored on the "
-                 "OpenGL backend (local_size baked into the GLSL kernel).")
-        ->default_str("32")
+                 "8x8, 16x16, 32x8, 32x32. Default selected by v1.4.1 A/B. "
+                 "Ignored on the OpenGL backend (local_size baked into the "
+                 "GLSL kernel).")
+        ->default_str(std::to_string(pcr::kDefaultThreadgroupX))
         ->check(CLI::PositiveNumber);
     options->add_option("--threadgroup-y", threadgroupY,
                  "Metal compute threadgroup height (in threads). See "
-                 "--threadgroup-x. Default 32.")
-        ->default_str("32")
+                 "--threadgroup-x.")
+        ->default_str(std::to_string(pcr::kDefaultThreadgroupY))
         ->check(CLI::PositiveNumber);
 #endif
 

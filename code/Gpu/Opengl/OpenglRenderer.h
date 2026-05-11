@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Vec3f.h"
+#include "GpuDefaults.h"
 #include "../../Scenes/Scene.h"
 
 // Forward declare GLFWwindow so this header doesn't pull in the GLFW headers.
@@ -68,9 +69,9 @@ public:
     // either backend with the same surface. OpenGL's local_size_xy is
     // baked into the GLSL kernel string at compile time so changing
     // these at runtime has no effect on this backend. The Metal backend
-    // honors them.
-    int threadgroupX = 32;
-    int threadgroupY = 32;
+    // honors them. Defaults centralized in GpuDefaults.h.
+    int threadgroupX = pcr::kDefaultThreadgroupX;
+    int threadgroupY = pcr::kDefaultThreadgroupY;
 
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
