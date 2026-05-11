@@ -201,10 +201,33 @@ static std::vector<Preset> defaultPresets()
     // path.
     picture.useAdaptive = 0;
     picture.useOIDN = 1;
+
+    // Production on GPU: the daily-driver hero render. Same one-click
+    // snap surface as Picture (resolution, square, every quality
+    // technique except adaptive sampling) but at d=4 / s=1024 / S=16
+    // instead of Picture's 6/2048/32. Converges fast enough on M1
+    // Ultra that it's the right starting point for most renders, with
+    // Picture reserved for the slower max-quality runs.
+    Preset production;
+    production.name = "Production";
+    production.depth = 4;
+    production.samples = 1024;
+    production.shadowSamples = 16;
+    production.width = 1080;
+    production.height = 1080;
+    production.snapSquare = 1;
+    production.useDenoise = 1;
+    production.useMIS = 1;
+    production.useRussian = 1;
+    production.useStratified = 1;
+    production.useAA = 1;
+    production.useAdaptive = 0;
+    production.useOIDN = 1;
+
     return {
         {"Quick",      2, 4,    2},
         {"Decent",     4, 16,   4},
-        {"Production", 4, 256,  8},
+        production,
         picture,
     };
 #else
