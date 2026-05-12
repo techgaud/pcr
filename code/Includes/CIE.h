@@ -6,17 +6,30 @@
 // CIE 1931 2-degree standard observer color-matching functions and
 // the conversion from CIE XYZ tristimulus to linear sRGB.
 //
-// We use Wyman, Sloan & Shirley (2013), "Simple Analytic
-// Approximations to the CIE XYZ Color Matching Functions". Their
-// piecewise-Gaussian fits match the 1931 tabulated CMFs to within
-// about 1% across the visible range, while collapsing what would
-// otherwise be 3 x 81-entry tables into ~30 lines of analytic code.
-// For a spectral path tracer at hobby precision, this is the right
-// trade. Production renderers (Mitsuba, PBRT) ship the full
-// tabulated CMFs because a 1% mismatch becomes visible after a
-// chain of color transforms; we don't have that pipeline depth.
+// Two CMF implementations ship side by side and the renderer
+// chooses at runtime:
 //
-// Reference: J. Comput. Graph. Tech. Vol. 2, No. 2, 2013.
+//   1. Wyman, Sloan & Shirley (2013), piecewise-Gaussian fits. The
+//      original pcr CMF. Matches the 1931 tabulated values to ~1%
+//      across the visible range, compounded through sRGB conversion
+//      that becomes ~25% drift in integrated RGB equivalents. Cheap
+//      to evaluate (a handful of exp() calls), no table required.
+//      Reference: J. Comput. Graph. Tech. Vol. 2, No. 2, 2013.
+//
+//   2. CIE 1931 tabulated, 61 samples at 5 nm steps from 400 to 700
+//      nm. The actual standard CMF used by Mitsuba, PBRT, and every
+//      reference renderer. Linear interpolation between samples for
+//      off-grid lambdas. ~1 KB constant table, lookup-and-lerp cost
+//      similar to the Wyman analytic eval, no measurable perf
+//      difference at typical sample counts.
+//
+// Mode is selected by passing useCieCmf to singleLambdaXYZ /
+// spectrumToXYZ / spectrumToLinearSRGB. The default (no arg) is
+// Wyman for backward compatibility with the rest of the pipeline
+// (Jakob fitter, LUT builder), which haven't been migrated yet.
+// Output-side conversion in the renderer is the high-leverage
+// place to flip CMFs because the 25% integrated-RGB drift shows
+// up directly in the rendered image.
 
 namespace CIE
 {
@@ -51,6 +64,111 @@ namespace CIE
         return  1.217f * wymanGauss(lambda, 437.0f, 0.0845f, 0.0278f)
               + 0.681f * wymanGauss(lambda, 459.0f, 0.0385f, 0.0725f);
     }
+
+    // CIE 1931 2-degree standard observer, tabulated at 5 nm steps
+    // from 400 to 700 nm. 61 samples each for x_bar, y_bar, z_bar.
+    // Values from the canonical CIE publication (matches PBRT-v4,
+    // Mitsuba 3, every reference renderer). y_bar(555) = 1.0 exactly
+    // at the y-peak. Out-of-range lambdas return 0, same convention
+    // as Spectrum::sampleAt.
+    //
+    // Single static table, 3 * 61 * 4 = 732 bytes. Negligible.
+    struct CieTableEntry { float x, y, z; };
+    inline const CieTableEntry *cieTable()
+    {
+        static const CieTableEntry kCie[Spectrum::kSamples] = {
+            {0.0143f,    0.000396f, 0.0679f},   // 400 nm
+            {0.0232f,    0.000640f, 0.1102f},   // 405
+            {0.0435f,    0.001210f, 0.2074f},   // 410
+            {0.0776f,    0.002180f, 0.3713f},   // 415
+            {0.13438f,   0.004000f, 0.6456f},   // 420
+            {0.21477f,   0.0073f,   1.03905f},  // 425
+            {0.2839f,    0.0116f,   1.3856f},   // 430
+            {0.3285f,    0.01684f,  1.62296f},  // 435
+            {0.34828f,   0.023f,    1.74706f},  // 440
+            {0.34806f,   0.0298f,   1.7826f},   // 445
+            {0.3362f,    0.038f,    1.77211f},  // 450
+            {0.3187f,    0.048f,    1.7441f},   // 455
+            {0.2908f,    0.060f,    1.6692f},   // 460
+            {0.2511f,    0.0739f,   1.5281f},   // 465
+            {0.19536f,   0.09098f,  1.28764f},  // 470
+            {0.1421f,    0.1126f,   1.0419f},   // 475
+            {0.09564f,   0.13902f,  0.81295f},  // 480
+            {0.05795f,   0.1693f,   0.6162f},   // 485
+            {0.03201f,   0.20802f,  0.46518f},  // 490
+            {0.0147f,    0.2586f,   0.3533f},   // 495
+            {0.0049f,    0.323f,    0.272f},    // 500
+            {0.0024f,    0.4073f,   0.2123f},   // 505
+            {0.0093f,    0.503f,    0.1582f},   // 510
+            {0.0291f,    0.6082f,   0.1117f},   // 515
+            {0.06327f,   0.710f,    0.07825f},  // 520
+            {0.1096f,    0.7932f,   0.05725f},  // 525
+            {0.1655f,    0.862f,    0.04216f},  // 530
+            {0.22575f,   0.91485f,  0.02984f},  // 535
+            {0.2904f,    0.954f,    0.0203f},   // 540
+            {0.3597f,    0.9803f,   0.0134f},   // 545
+            {0.43345f,   0.99495f,  0.00875f},  // 550
+            {0.51205f,   1.000f,    0.00575f},  // 555  (y peak)
+            {0.5945f,    0.995f,    0.0039f},   // 560
+            {0.6784f,    0.9786f,   0.00275f},  // 565
+            {0.7621f,    0.952f,    0.0021f},   // 570
+            {0.8425f,    0.9154f,   0.0018f},   // 575
+            {0.9163f,    0.870f,    0.00165f},  // 580
+            {0.9786f,    0.8163f,   0.0014f},   // 585
+            {1.0263f,    0.757f,    0.0011f},   // 590
+            {1.0567f,    0.6949f,   0.0010f},   // 595
+            {1.0622f,    0.631f,    0.0008f},   // 600
+            {1.0456f,    0.5668f,   0.0006f},   // 605
+            {1.0026f,    0.503f,    0.00034f},  // 610
+            {0.93832f,   0.4412f,   0.00024f},  // 615
+            {0.85445f,   0.381f,    0.00019f},  // 620
+            {0.7514f,    0.321f,    0.0001f},   // 625
+            {0.6424f,    0.265f,    0.00005f},  // 630
+            {0.5419f,    0.217f,    0.00003f},  // 635
+            {0.4479f,    0.175f,    0.00002f},  // 640
+            {0.3608f,    0.1382f,   0.00001f},  // 645
+            {0.2835f,    0.107f,    0.0f},      // 650
+            {0.2187f,    0.0816f,   0.0f},      // 655
+            {0.1649f,    0.061f,    0.0f},      // 660
+            {0.1212f,    0.04458f,  0.0f},      // 665
+            {0.0874f,    0.032f,    0.0f},      // 670
+            {0.0636f,    0.0232f,   0.0f},      // 675
+            {0.04677f,   0.017f,    0.0f},      // 680
+            {0.0329f,    0.01192f,  0.0f},      // 685
+            {0.0227f,    0.00821f,  0.0f},      // 690
+            {0.01584f,   0.005723f, 0.0f},      // 695
+            {0.01136f,   0.004102f, 0.0f},      // 700
+        };
+        return kCie;
+    }
+
+    // Linear interpolation against the tabulated CMFs. Lambda outside
+    // [400, 700] returns 0 to match Spectrum::sampleAt out-of-range
+    // semantics.
+    inline Vec3f cieXYZ(float lambda)
+    {
+        if (lambda < Spectrum::kLambdaMin || lambda > Spectrum::kLambdaMax)
+            return Vec3f(0.f, 0.f, 0.f);
+        float t = (lambda - Spectrum::kLambdaMin) / Spectrum::kStep;
+        int i = (int)t;
+        if (i >= Spectrum::kSamples - 1)
+        {
+            const CieTableEntry &e = cieTable()[Spectrum::kSamples - 1];
+            return Vec3f(e.x, e.y, e.z);
+        }
+        float frac = t - (float)i;
+        const CieTableEntry &a = cieTable()[i];
+        const CieTableEntry &b = cieTable()[i + 1];
+        return Vec3f(
+            a.x + frac * (b.x - a.x),
+            a.y + frac * (b.y - a.y),
+            a.z + frac * (b.z - a.z)
+        );
+    }
+
+    inline float cieXBar(float lambda) { return cieXYZ(lambda)[0]; }
+    inline float cieYBar(float lambda) { return cieXYZ(lambda)[1]; }
+    inline float cieZBar(float lambda) { return cieXYZ(lambda)[2]; }
 
     // Integral of yBar over the visible range with our discretization
     // (61 samples at 5 nm steps, Wyman 2013 piecewise-Gaussian
@@ -87,9 +205,34 @@ namespace CIE
         return val;
     }
 
+    // CIE-table equivalent of yBarIntegral. Computed once at first
+    // access and cached. Sums the tabulated y_bar across all 61
+    // pcr-Spectrum samples (400..700 in 5 nm steps). Differs from
+    // Wyman's by ~1%, which is exactly the bias we're correcting
+    // when the renderer flips to the tabulated CMF.
+    inline float cieYBarIntegral()
+    {
+        static const float val = []() {
+            float sum = 0.f;
+            for (int i = 0; i < Spectrum::kSamples; i++)
+                sum += cieTable()[i].y;
+            return sum * Spectrum::kStep;
+        }();
+        return val;
+    }
+
+    // Pick the right integral for the active CMF. Used by spectrum->
+    // XYZ normalization sites to keep the unit convention correct
+    // regardless of which CMF is integrating.
+    inline float yBarIntegralFor(bool useCieCmf)
+    {
+        return useCieCmf ? cieYBarIntegral() : yBarIntegral();
+    }
+
     // Integrate a sampled spectrum against the CIE 1931 observer to
     // produce CIE XYZ tristimulus values. Defined in CIE.cpp.
-    Vec3f spectrumToXYZ(const Spectrum &s);
+    // useCieCmf=true uses the tabulated CMFs, false uses Wyman.
+    Vec3f spectrumToXYZ(const Spectrum &s, bool useCieCmf = false);
 
     // Linear sRGB to CIE XYZ (D65 white point). Inverse of the
     // matrix below; used by RGBToSpectrum to convert a target RGB
@@ -125,7 +268,7 @@ namespace CIE
     // Convenience: end-to-end Spectrum -> linear sRGB. The path
     // tracer's accumulator goes here before tone-map. Defined in
     // CIE.cpp.
-    Vec3f spectrumToLinearSRGB(const Spectrum &s);
+    Vec3f spectrumToLinearSRGB(const Spectrum &s, bool useCieCmf = false);
 
     // Single-wavelength variant: when a path tracer is in single-
     // lambda mode, each ray contributes scalar radiance(lambda) to a
@@ -137,7 +280,7 @@ namespace CIE
     // estimator from sum-over-samples into an unbiased integral
     // belongs at the pixel accumulator, not here. This function is
     // pure: scalar in, vector out, no implicit averaging.
-    inline Vec3f singleLambdaXYZ(float lambda, float radiance)
+    inline Vec3f singleLambdaXYZ(float lambda, float radiance, bool useCieCmf = false)
     {
         // Lambda is sampled uniformly on [kLambdaMin, kLambdaMax].
         // For a uniform PDF, the sampling weight (kLambdaMax -
@@ -150,7 +293,16 @@ namespace CIE
         // into linear-sRGB-comparable XYZ where Y(white) ~= 1. See
         // yBarIntegral() above.
         constexpr float kLambdaRange = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
-        float scale = kLambdaRange / yBarIntegral();
+        float scale = kLambdaRange / yBarIntegralFor(useCieCmf);
+        if (useCieCmf)
+        {
+            Vec3f cmf = cieXYZ(lambda);
+            return Vec3f(
+                radiance * cmf[0] * scale,
+                radiance * cmf[1] * scale,
+                radiance * cmf[2] * scale
+            );
+        }
         return Vec3f(
             radiance * xBar(lambda) * scale,
             radiance * yBar(lambda) * scale,

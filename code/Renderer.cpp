@@ -253,7 +253,7 @@ void Renderer::render(const Scenes::SceneData &scene,
                             // written below.
                             Vec3f xyz(0.f, 0.f, 0.f);
                             for (int k = 0; k < N; k++)
-                                xyz = xyz + CIE::singleLambdaXYZ(lambdas[k], rad[k]);
+                                xyz = xyz + CIE::singleLambdaXYZ(lambdas[k], rad[k], useCieCmf);
                             c = xyz / (float)N;
                         }
                         else

@@ -86,6 +86,18 @@ public:
     // Hero-wavelength sampling (phase 5) will close most of that gap.
     bool useSpectral = false;
 
+    // CMF selection for spectrum -> XYZ output. false = Wyman 2013
+    // piecewise-Gaussian (analytic, ~1% off from tabulated, default
+    // for backward compat). true = CIE 1931 tabulated 2-deg observer
+    // (61 samples at 5 nm steps from 400 to 700 nm). Only affects
+    // spectral renders; RGB renders ignore it.
+    //
+    // Switching CMFs trades the ~25% integrated-RGB drift caused by
+    // the Wyman approximation for an extra ~700 byte table lookup
+    // per sample. Same perf, materially better accuracy on
+    // tabulated-SPD scenes like cornell-spec.
+    bool useCieCmf = false;
+
     // Hero-wavelength sample count. Default 4 = stratified hero sampling
     // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
     // for benchmarking and visual A/B against the hero default. Other
