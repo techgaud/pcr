@@ -249,6 +249,34 @@ struct Welford {
     int   _pad0;
 };
 
+// ---- Packed ray-state (slot 7) ----------------------------------------
+//
+// Bounce depth and alive flag pack into a single uint to save one Metal
+// buffer-binding slot (Metal caps kernels at 31). Layout:
+//   bits 0..7   : bounceDepth (0..255, plenty of headroom on the typical
+//                 8-16 depth range pcr uses)
+//   bit  8      : alive (0 = dead, 1 = continuing)
+//   bits 9..31  : reserved for future per-ray flags
+//
+// Inline accessors keep call sites readable. Read-modify-write is the
+// pattern when setting one field, since MSL doesn't have sub-uint
+// stores; the load is hot-cached because the kernel just touched the
+// same address.
+constant uint kRayStateAliveBit = 0x100u;
+constant uint kRayStateDepthMask = 0xFFu;
+
+inline bool stateAlive(uint s) { return (s & kRayStateAliveBit) != 0u; }
+inline uint stateDepth(uint s) { return s & kRayStateDepthMask; }
+inline uint statePack(uint depth, bool alive) {
+    return (depth & kRayStateDepthMask) | (alive ? kRayStateAliveBit : 0u);
+}
+inline uint stateSetAlive(uint s, bool alive) {
+    return alive ? (s | kRayStateAliveBit) : (s & ~kRayStateAliveBit);
+}
+inline uint stateSetDepth(uint s, uint depth) {
+    return (s & ~kRayStateDepthMask) | (depth & kRayStateDepthMask);
+}
+
 // Bundle of all device buffers + uniforms threaded through every helper
 // so the GLSL "global" SSBOs translate to a single explicit parameter.
 struct Scene {
@@ -1702,8 +1730,7 @@ kernel void wf_generate_primary_rays(
     device packed_float3       *color              [[buffer(4)]],
     device uint                *pixelIdx           [[buffer(5)]],
     device uint                *rngState           [[buffer(6)]],
-    device uint                *bounceDepth        [[buffer(7)]],
-    device uint                *alive              [[buffer(8)]],
+    device uint                *rayState           [[buffer(7)]],
     device const Welford       *pixelWelford       [[buffer(26)]],
     device float4              *lambdas            [[buffer(27)]],
     device float4              *spectralThroughput [[buffer(28)]],
@@ -1730,8 +1757,7 @@ kernel void wf_generate_primary_rays(
     // the downstream intersect / compaction / shading kernels treat
     // the ray as terminated.
     if (u.useAdaptive != 0 && pixelWelford[pixelIdxLocal].done != 0) {
-        alive[gid] = 0u;
-        bounceDepth[gid] = 0u;
+        rayState[gid] = statePack(0u, false);
         pixelIdx[gid] = pixelIdxLocal;
         return;
     }
@@ -1809,8 +1835,7 @@ kernel void wf_generate_primary_rays(
     }
 
     rngState[gid]    = seed;
-    bounceDepth[gid] = 0;
-    alive[gid]       = 1;
+    rayState[gid]    = statePack(0u, true);
 }
 
 // Wavefront intersect kernel. Reads each ray's origin/direction from the
@@ -1827,14 +1852,14 @@ kernel void wf_generate_primary_rays(
 //   buffer(0)   = uniforms
 //   buffer(1)   = origin (packed_float3, read)
 //   buffer(2)   = dir    (packed_float3, read)
-//   buffer(8)   = alive  (uint, read)
+//   buffer(7)   = rayState (uint, read, packed bounceDepth+alive)
 //   buffer(9)   = matIdx (int, write)
 //   buffer(10)  = hit    (packed_float3, write)
 //   buffer(11)  = normal (packed_float3, write)
 //   buffer(12..18) = scene buffers (spheres, planes, materials,
 //                    triangles, bvh, lights, lightTris)
-// The other RayState fields (throughput, color, pixelIdx, rngState,
-// bounceDepth) aren't accessed here and intentionally aren't bound.
+// The other RayState fields (throughput, color, pixelIdx, rngState)
+// aren't accessed here and intentionally aren't bound.
 //
 // Dispatch geometry: 1D over the linear ray-buffer length
 // (width * height). Threadgroup size is the same threadgroup knob from
@@ -1848,7 +1873,7 @@ kernel void wf_intersect(
     constant Uniforms                          &u              [[buffer(0)]],
     device const packed_float3                 *origin         [[buffer(1)]],
     device const packed_float3                 *dir            [[buffer(2)]],
-    device const uint                          *alive          [[buffer(8)]],
+    device const uint                          *rayState       [[buffer(7)]],
     device int                                 *matIdxOut      [[buffer(9)]],
     device packed_float3                       *hit            [[buffer(10)]],
     device packed_float3                       *normalOut      [[buffer(11)]],
@@ -1870,7 +1895,7 @@ kernel void wf_intersect(
     uint forkCount    = atomic_load_explicit(rayCountAtomic, memory_order_relaxed);
     if (gid >= baseRayCount + forkCount) return;
 
-    if (alive[gid] == 0u) {
+    if (!stateAlive(rayState[gid])) {
         matIdxOut[gid] = -1;
         return;
     }
@@ -2051,8 +2076,7 @@ kernel void wf_compact_by_material(
 //   buffer(3)   throughput (packed_float3, R+W)
 //   buffer(4)   color  (packed_float3, R+W, light accumulator)
 //   buffer(6)   rngState (uint, R+W)
-//   buffer(7)   bounceDepth (uint, R+W)
-//   buffer(8)   alive (uint, W on terminate)
+//   buffer(7)   rayState (uint, R+W, packed bounceDepth+alive)
 //   buffer(9)   matIdx (int, R only - populated by intersect)
 //   buffer(10)  hit    (packed_float3, R only)
 //   buffer(11)  normal (packed_float3, R only)
@@ -2076,7 +2100,7 @@ kernel void wf_shade_emissive(
     constant Uniforms                          &u                  [[buffer(0)]],
     device const packed_float3                 *throughput         [[buffer(3)]],
     device packed_float3                       *color              [[buffer(4)]],
-    device uint                                *alive              [[buffer(8)]],
+    device uint                                *rayState           [[buffer(7)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const GpuMaterial                   *materials          [[buffer(14)]],
     device const uint                          *queue              [[buffer(24)]],
@@ -2105,7 +2129,7 @@ kernel void wf_shade_emissive(
         float3 emissive = materials[mi].emissive.rgb;
         color[gid] = float3(color[gid]) + t * emissive;
     }
-    alive[gid] = 0u;
+    rayState[gid] = stateSetAlive(rayState[gid], false);
 }
 
 // ---- Mirror: perfect specular reflection ---------------------------
@@ -2121,8 +2145,7 @@ kernel void wf_shade_mirror(
     device packed_float3                       *dir                [[buffer(2)]],
     device packed_float3                       *throughput         [[buffer(3)]],
     device uint                                *rngState           [[buffer(6)]],
-    device uint                                *bounceDepth        [[buffer(7)]],
-    device uint                                *alive              [[buffer(8)]],
+    device uint                                *rayState           [[buffer(7)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2146,7 +2169,8 @@ kernel void wf_shade_mirror(
     int mi = matIdx[gid];
     float3 newDir = reflect(rd, N);
     float3 newOrigin = h + N * 1e-3f;
-    uint depth = bounceDepth[gid] + 1u;
+    uint rs = rayState[gid];
+    uint depth = stateDepth(rs) + 1u;
     uint seed = rngState[gid];
 
     // BSDF math splits on RGB vs spectral, but RR + termination is
@@ -2179,8 +2203,7 @@ kernel void wf_shade_mirror(
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
     rngState[gid]    = seed;
-    bounceDepth[gid] = depth;
-    alive[gid]       = alive_after ? 1u : 0u;
+    rayState[gid]    = statePack(depth, alive_after);
 }
 
 // ---- Glass: dielectric refraction via Schlick Fresnel --------------
@@ -2198,8 +2221,7 @@ kernel void wf_shade_glass(
     device packed_float3                       *color              [[buffer(4)]],
     device uint                                *pixelIdx           [[buffer(5)]],
     device uint                                *rngState           [[buffer(6)]],
-    device uint                                *bounceDepth        [[buffer(7)]],
-    device uint                                *alive              [[buffer(8)]],
+    device uint                                *rayState           [[buffer(7)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2252,7 +2274,7 @@ kernel void wf_shade_glass(
     // spectral secondaries.
     bool wasRefraction = (dot(float3(b.origin) - h, N) < 0.0f);
 
-    uint depth = bounceDepth[gid] + 1u;
+    uint depth = stateDepth(rayState[gid]) + 1u;
     bool alive_after = true;
     if (u.useSpectral != 0) {
         float4 lams      = lambdas[gid];
@@ -2300,7 +2322,8 @@ kernel void wf_shade_glass(
                         rayCountAtomic, 3u, memory_order_relaxed);
                     uint forkBase = uint(u.baseRayCount) + slotBase;
                     uint parentPixel = pixelIdx[gid];
-                    uint forkAlive   = (depth >= uint(u.depth)) ? 0u : 1u;
+                    bool forkAlive   = (depth < uint(u.depth));
+                    uint forkStatePacked = statePack(depth, forkAlive);
 
                     float ior_y = cauchyIor(mat.ior, mat.cauchyB, lams.y);
                     DielectricOut by = dielectricBounce(rd, N, h, entering, ior_y, rand(seed));
@@ -2312,8 +2335,7 @@ kernel void wf_shade_glass(
                         color[slot]              = float3(0.0f);
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0xA5A5A5A5u;
-                        bounceDepth[slot]        = depth;
-                        alive[slot]              = forkAlive;
+                        rayState[slot]           = forkStatePacked;
                         lambdas[slot]            = float4(lams.y, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.y, 0.0f, 0.0f, 0.0f);
                     }
@@ -2328,8 +2350,7 @@ kernel void wf_shade_glass(
                         color[slot]              = float3(0.0f);
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0x5A5A5A5Au;
-                        bounceDepth[slot]        = depth;
-                        alive[slot]              = forkAlive;
+                        rayState[slot]           = forkStatePacked;
                         lambdas[slot]            = float4(lams.z, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.z, 0.0f, 0.0f, 0.0f);
                     }
@@ -2344,8 +2365,7 @@ kernel void wf_shade_glass(
                         color[slot]              = float3(0.0f);
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0x3C3C3C3Cu;
-                        bounceDepth[slot]        = depth;
-                        alive[slot]              = forkAlive;
+                        rayState[slot]           = forkStatePacked;
                         lambdas[slot]            = float4(lams.w, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.w, 0.0f, 0.0f, 0.0f);
                     }
@@ -2383,8 +2403,7 @@ kernel void wf_shade_glass(
     origin[gid]      = b.origin;
     dir[gid]         = b.dir;
     rngState[gid]    = seed;
-    bounceDepth[gid] = depth;
-    alive[gid]       = alive_after ? 1u : 0u;
+    rayState[gid]    = statePack(depth, alive_after);
 }
 
 // ---- Diffuse: cosine-weighted hemisphere + NEE direct lighting -----
@@ -2407,8 +2426,7 @@ kernel void wf_shade_diffuse(
     device packed_float3                       *throughput         [[buffer(3)]],
     device packed_float3                       *color              [[buffer(4)]],
     device uint                                *rngState           [[buffer(6)]],
-    device uint                                *bounceDepth        [[buffer(7)]],
-    device uint                                *alive              [[buffer(8)]],
+    device uint                                *rayState           [[buffer(7)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2533,7 +2551,7 @@ kernel void wf_shade_diffuse(
     // Russian roulette: same conditions as megakernel (after bounce 0).
     // RR survival probability uses max(albedo) for RGB and albedoLam.x
     // for spectral (hero wavelength), matching megakernel.
-    uint depth = bounceDepth[gid] + 1u;
+    uint depth = stateDepth(rayState[gid]) + 1u;
     bool alive_after = true;
     if (u.useRussian != 0 && depth >= 2u) {
         float p;
@@ -2563,8 +2581,7 @@ kernel void wf_shade_diffuse(
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
     rngState[gid]    = seed;
-    bounceDepth[gid] = depth;
-    alive[gid]       = alive_after ? 1u : 0u;
+    rayState[gid]    = statePack(depth, alive_after);
 }
 
 // ============================================================
@@ -2973,8 +2990,11 @@ namespace
         id<MTLBuffer> color;        // packed_float3
         id<MTLBuffer> pixelIdx;     // uint
         id<MTLBuffer> rngState;     // uint
-        id<MTLBuffer> bounceDepth;  // uint
-        id<MTLBuffer> alive;        // uint
+        // Packed bounceDepth (low 8 bits) + alive (bit 8). See
+        // kRayStateAliveBit / kRayStateDepthMask in the MSL kernel.
+        // One slot instead of two, freeing slot 8 for future per-ray
+        // state additions (e.g., lastBsdfPdf for BSDF-side MIS).
+        id<MTLBuffer> rayState;     // uint
 
         // Transient hit info (overwritten by intersect each bounce).
         id<MTLBuffer> matIdx;       // int
@@ -3083,8 +3103,7 @@ namespace
         wf.color       = alloc(packedF3Bytes);
         wf.pixelIdx    = alloc(uintBytes);
         wf.rngState    = alloc(uintBytes);
-        wf.bounceDepth = alloc(uintBytes);
-        wf.alive       = alloc(uintBytes);
+        wf.rayState    = alloc(uintBytes);
         wf.matIdx      = alloc(intBytes);
         wf.hit         = alloc(packedF3Bytes);
         wf.normal      = alloc(packedF3Bytes);
@@ -3122,7 +3141,7 @@ namespace
         wf.perPixelAccum = alloc(pixelCount * 3 * sizeof(uint32_t));
 
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
-                    wf.pixelIdx && wf.rngState && wf.bounceDepth && wf.alive &&
+                    wf.pixelIdx && wf.rngState && wf.rayState &&
                     wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
@@ -4167,7 +4186,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             // Buffer layout (packed_float3 SoA, MSL hard-caps buffer
             // index at 30):
             //   0 uniforms; 1..4 origin/dir/throughput/color (packed_float3);
-            //   5..8 pixelIdx/rngState/bounceDepth/alive (uint);
+            //   5..7 pixelIdx/rngState/rayState (uint, rayState packs depth+alive);
             //   9 matIdx (int); 10..11 hit/normal (packed_float3);
             //   12..18 scene; 19 queueCounters; 20..23 four queues;
             //   24 shading queue input; 25 queueLen (counter offset);
@@ -4192,8 +4211,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setBuffer:wfBufs.color       offset:0 atIndex:4];
                 [enc setBuffer:wfBufs.pixelIdx    offset:0 atIndex:5];
                 [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
-                [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
-                [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                [enc setBuffer:wfBufs.rayState    offset:0 atIndex:7];
                 [enc setBuffer:wfBufs.pixelWelford       offset:0 atIndex:26];
                 [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
                 [enc setBuffer:wfBufs.spectralThroughput offset:0 atIndex:28];
@@ -4220,7 +4238,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
                     [enc setBuffer:wfBufs.origin      offset:0 atIndex:1];
                     [enc setBuffer:wfBufs.dir         offset:0 atIndex:2];
-                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                    [enc setBuffer:wfBufs.rayState    offset:0 atIndex:7];
                     [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:9];
                     [enc setBuffer:wfBufs.hit         offset:0 atIndex:10];
                     [enc setBuffer:wfBufs.normal      offset:0 atIndex:11];
@@ -4275,8 +4293,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                     if (needsColor)
                         [enc setBuffer:wfBufs.color   offset:0 atIndex:4];
                     [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
-                    [enc setBuffer:wfBufs.bounceDepth offset:0 atIndex:7];
-                    [enc setBuffer:wfBufs.alive       offset:0 atIndex:8];
+                    [enc setBuffer:wfBufs.rayState    offset:0 atIndex:7];
                     [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:9];
                     [enc setBuffer:wfBufs.hit         offset:0 atIndex:10];
                     [enc setBuffer:wfBufs.normal      offset:0 atIndex:11];
