@@ -2,7 +2,7 @@ name: Build
 
 on:
   push:
-    branches: [main, gui, gpu, dev, mac, spectral, test-suite]
+    branches: [main, gpu-tests, portable-gpu]
     tags: ['v*']
   pull_request:
     branches: [main]
