@@ -397,9 +397,39 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
+            ## Highlights
+
+            Wavefront kernel architecture for the Metal backend on
+            Apple Silicon, with full spectral mode inside the wavefront
+            pipeline. The default backend is now wavefront (was
+            megakernel through v1.4.0), beating megakernel by ~25% on
+            cornell-class workloads at 1080² Picture.
+
+            Glass dispersion in spectral mode now defaults to
+            per-wavelength forking. Four monochromatic sub-paths cover
+            the hero wavelengths at the first dispersive refraction,
+            each refracting at its own Cauchy IOR. The cheaper
+            terminate-secondaries strategy stays available via
+            `--spectral-terminate` or the GUI's Glass radio.
+
+            Mac infrastructure work queued since v1.4.0 also lands:
+            adaptive multi-pass kernel (`useAdaptive=ON` now takes the
+            saturation-friendly path instead of the ~6x slower strip
+            path), spatial chopping for 16K renders, a new
+            `physically-cringe-rendering-cli` headless GPU binary, OIDN
+            device-buffer fix so denoising actually runs on every Mac
+            OIDN render, and `cmake --install` for typeable-from-$PATH
+            install.
+
+            Three new scenes: `closed-cornell-glass`,
+            `closed-cornell-spec` (Cornell box with a fourth wall
+            behind the camera, eliminates dark camera-facing patches
+            in specular reflections), `bright-cornell-glass` (entire
+            ceiling promoted to the area light).
+
             ## Install
 
-            Download the **bundled per-OS zip** for your platform — it
+            Download the **bundled per-OS zip** for your platform. It
             contains the binary plus `Scenes/`, `models/`, `spd/`,
             `luts/`, and `lib/` (OIDN runtime), all pre-arranged. The
             binary needs those folders next to it at startup.
@@ -407,18 +437,22 @@ jobs:
             - **Windows:** `pcr-${{ github.ref_name }}-windows-x64.zip` →
               extract → double-click `physically-cringe-rendering.exe`
               (GPU GUI), `frank-based-rendering.exe` (CPU GUI), or run
-              `frank-based-rendering-cli.exe` from a terminal. SmartScreen
-              warns the first time; click *More info* → *Run anyway*.
+              `frank-based-rendering-cli.exe` /
+              `physically-cringe-rendering-cli.exe` from a terminal.
+              SmartScreen warns the first time. Click *More info* →
+              *Run anyway*.
             - **macOS (Apple Silicon):**
               `pcr-${{ github.ref_name }}-macos-arm64.zip` → extract →
               from a terminal in the extracted folder, run
               `xattr -dr com.apple.quarantine .` to clear the Gatekeeper
               quarantine flag, then double-click
               `physically-cringe-rendering` (Metal-backed GPU GUI) or
-              run `./frank-based-rendering-cli` from terminal.
+              run `./frank-based-rendering-cli` /
+              `./physically-cringe-rendering-cli` from terminal.
             - **Linux:** `pcr-${{ github.ref_name }}-linux-x64.zip` →
-              extract → `chmod +x` if needed → `./physically-cringe-rendering`.
-              GPU GUI needs OpenGL 4.3.
+              extract → `chmod +x` if needed → `./physically-cringe-rendering`
+              (GPU GUI) or `./physically-cringe-rendering-cli`
+              (headless GPU). GPU paths need OpenGL 4.3.
 
             ### Standalone binary downloads
 
@@ -430,8 +464,10 @@ jobs:
             ## Verify a render
 
             Each PNG carries embedded tEXt metadata (Software, Backend,
-            Scene, all render parameters, render time). Read it with
-            `exiftool yourimage.png` (or any tool that handles PNG tEXt
-            chunks) to confirm provenance after the fact.
+            Scene, all render parameters, render time, Architecture,
+            WavefrontMode, WavefrontDispersion, Spectral, HeroSamples).
+            Read it with `exiftool yourimage.png` (or any tool that
+            handles PNG tEXt chunks) to confirm provenance after the
+            fact.
 
             ## Changes
