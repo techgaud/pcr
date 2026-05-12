@@ -1,15 +1,15 @@
 {
   "schema": "1.0",
   "name": "bright-cornell-glass",
-  "version": "1.0.1",
+  "version": "1.0.2",
 
   // cornell-glass with the entire ceiling promoted to the light source
   // AND the box closed by a fourth wall behind the camera. The cream
   // ceiling plane is gone; in its place is one emissive plane covering
-  // the same 4x7 area at y=2 with half the per-unit emissive of v1.0.0
-  // (since the full-ceiling light at the original intensity blew the
-  // tonemap into a wash). Walls, spheres, materials, and camera match
-  // cornell-glass / closed-cornell-glass exactly.
+  // the same 4x7 area at y=2 with 1/8 the per-unit emissive of v1.0.0
+  // (1/4 of v1.0.1, after the v1.0.1 halving still left highlights
+  // washed). Walls, spheres, materials, and camera match cornell-glass
+  // / closed-cornell-glass exactly.
   //
   // Fourth wall at z = +0.5 catches specular-bounce rays that would
   // otherwise escape +Z into the void -- same trick closed-cornell-
@@ -22,7 +22,7 @@
     "cream":     { "albedo": [0.74, 0.74, 0.64] },
     "red":       { "albedo": [0.63, 0.06, 0.05] },
     "green":     { "albedo": [0.13, 0.45, 0.10] },
-    "warmlight": { "emissive": [40.0, 34.0, 24.0] },
+    "warmlight": { "emissive": [10.0, 8.5, 6.0] },
     "mirror":    { "albedo": [0.95, 0.95, 0.95], "metallic": true },
     "glass":     { "albedo": [1.0, 1.0, 1.0], "transparent": true, "ior": 1.5, "cauchyB": 0.013 }
   },
