@@ -2,6 +2,68 @@
 
 Deferred work, with enough context to pick up cold later.
 
+## Indirect dispatch for wavefront shading kernels (Metal)
+
+**Status:** not started. The wavefront shading kernels (wf_shade_emissive, _mirror, _glass, _diffuse) currently dispatch at the worst-case thread count (`baseRayCount` plus the spectral-fork allocation of `3 * baseRayCount`) and bounds-check inside the kernel against the actual queueLen. In spectral-fork mode the worst case is 4x baseRayCount, but actual queue lengths after glass forks dispatch are typically 20-40% of that because forks only spawn on the first dispersive refraction. The wasted threads do bounds-check work and return without contributing.
+
+### Why deferred
+
+Needs A/B vs the current worst-case-with-bounds-check approach. Indirect dispatch reads thread counts from a GPU buffer at dispatch time, eliminating wasted threads but adding an indirect-args buffer barrier between wf_compact_by_material and each shading kernel. M-series barrier cost might eat the savings; the only way to know is measure.
+
+### Implementation outline
+
+1. Allocate a per-pass MTLBuffer of size `4 * sizeof(MTLDispatchThreadgroupsIndirectArguments)` (12 bytes per dispatch: groupsX, groupsY, groupsZ). One slot per material type.
+2. New MSL kernel `wf_compute_indirect_args` dispatched once after `wf_compact_by_material`. Reads `queueCounters[matType]`, divides by `linearThreadsPerGroup`, ceiling-up, writes the result to the indirect buffer.
+3. Replace `[enc dispatchThreadgroups:groups threadsPerThreadgroup:tpg]` for each shading kernel with `[enc dispatchThreadgroupsWithIndirectBuffer:indirectBuf indirectBufferOffset:matType*12 threadsPerThreadgroup:tpg]`.
+4. Add `useIndirectDispatch` to MetalRenderer + GUI Debug menu (matches the threadgroup-debug placement convention) + `--indirect-dispatch` CLI flag.
+5. PNG metadata: `IndirectDispatch: 0|1` when wavefront ran.
+
+### Risk
+
+Medium. The indirect-args buffer barrier between the compute kernel and the dispatch is implicit in MTL command-buffer ordering, but the dispatch needs to read the args via the buffer not via host. Easy to get the offset arithmetic wrong. Validation: A/B on cornell-spec spectral wavefront fork at production samples, look for wallclock improvement >5% before promoting.
+
+### When to revisit
+
+Next perf session. Sized correctly this is the highest-impact Mac wavefront perf win on the shelf today.
+
+### Starting points
+
+- MetalRenderer.mm:4034 (current per-pass dispatch loop)
+- MetalRenderer.mm:1836 (wf_compact_by_material; needs a sibling kernel right after it)
+- MetalRenderer.mm:3334 (shading pipeline build sites; the indirect dispatch use mirrors the existing dispatch call shape)
+
+## BSDF-side MIS (light + BSDF balance heuristic)
+
+**Status:** not started. The current MIS is light-side only -- the existing `--mis` flag adds `pdfLight^2 / (pdfLight^2 + pdfBrdf^2)` weighting to direct-light contributions but does not symmetrically weight emissive returns from indirect bounces. Project-knowledge.md calls this out explicitly: "would require restructuring the recursion to track 'we just sampled via BRDF, and hit a light'". Adding the BSDF side closes the variance-reduction gap.
+
+### Why deferred
+
+Touches all four backends (CPU, OpenGL, Metal megakernel, Metal wavefront) and the recursion/iteration structure of each. CPU is recursive `castRay`/`castRaySpectral`; OpenGL/Metal megakernel use iterative bounce loops with explicit state; Metal wavefront tracks state in SoA buffers per ray. Each implementation needs an additional `lastBsdfPdf` carried across bounces, plus an emissive-hit weighting branch on the indirect return path. Risk of variance spikes if the pdf bookkeeping is wrong on first-bounce emissive hits or post-specular paths (where pdf = delta).
+
+### Implementation outline
+
+1. Per-bounce state: `float lastBsdfPdf` initialized to `+infinity` (treated as "primary ray, no BSDF sampled yet" -> light-side weight collapses to 1, BSDF-side to 0, matching current direct-light-only behavior on primary hits).
+2. After cosine-weighted hemisphere sample for indirect, update `lastBsdfPdf = cosTheta / PI`.
+3. After specular bounce (mirror, glass-refraction), set `lastBsdfPdf = +infinity` so the next emissive hit gets the BSDF-side weight = 1 -- specular paths effectively bypass MIS because the BSDF is delta-distributed.
+4. At an emissive hit during indirect: compute `pdfLight = dist^2 / (cosLightOut * totalLightArea)`, weight the emissive contribution by `pdfBsdf^2 / (pdfBsdf^2 + pdfLight^2)`. Add to radiance the weighted contribution alongside the existing primary-or-current-hit emissive accumulation.
+5. Behind a `useBsdfMis` flag (Settings + JobConfig + CLI `--mis-bsdf` + GUI checkbox below the existing MIS checkbox, grayed out when MIS is off).
+6. PNG metadata: `BsdfMIS: 0|1`. Only meaningful when `MIS: 1`.
+
+### Implementation locations
+
+- CPU `castRay` (Renderer.cpp): track `lastBsdfPdf` as a parameter through recursion; weight emissive return paths.
+- OpenGL GLSL `tracePath` (lines ~700-810 in OpenglRenderer.cpp) and `tracePathSpectral` (~919-1010). Both already iterate, so just carry an extra local.
+- Metal megakernel `tracePath` (lines ~700-790), `tracePathSpectral` (~915-1010), `tracePathSpectralSingle` (~800-905). Same pattern.
+- Metal wavefront: add a `lastBsdfPdf` SoA buffer to the ray state (one more buffer index, may need to repack to stay under Metal's 31-buffer limit). Each shading kernel writes it after its sampling step. wf_shade_emissive reads it at the start to compute the BSDF-MIS weight on incoming throughput.
+
+### Risk
+
+High. BSDF-side MIS is famously easy to get wrong. Specular paths and primary rays are the two edge cases. Validation: A/B `cornell` (RGB) and `cornell-spec` (spectral) at fixed seed and matched sample count, expect lower variance in the cream-wall-with-small-light region. Compare against a pbrt reference if available.
+
+### When to revisit
+
+After indirect dispatch lands and proves out. BSDF-side MIS is the next biggest variance-reduction win for the spectral wavefront default path.
+
 ## OIDN buffer-access bug (denoising silently disabled on Apple Silicon)
 
 **Status:** confirmed bug. Every OIDN-enabled render on Apple Silicon prints `OIDN filter error: image data not accessible by the device, please use OIDNBuffer or device allocator for storage` to stderr and produces output WITHOUT the OIDN denoise applied. The renderer doesn't bail, it just skips the denoise step, so the user gets the raw HDR + tone-map (or the bilateral fallback when `useDenoise` is also on). Visually: more noise than the user expected on every OIDN-enabled render to date.
