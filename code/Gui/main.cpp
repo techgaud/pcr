@@ -1921,8 +1921,8 @@ int main(int, char **)
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("CIE 1931 = canonical tabulated standard\n"
                               "observer. Wyman 2013 = analytic piecewise-\n"
-                              "Gaussian fit, ~1% off CIE, compounds to\n"
-                              "~25% drift in integrated RGB equivalents.\n"
+                              "Gaussian fit, ~1%% off CIE, compounds to\n"
+                              "~25%% drift in integrated RGB equivalents.\n"
                               "Spectral mode only. Recorded in PNG\n"
                               "metadata as CMF: cie or CMF: wyman.");
 
