@@ -1,18 +1,25 @@
 # tests
 
-Automated regression suite for `pcr`. Two flavors:
+Automated regression suite for `pcr`. Three flavors:
 
 - **Unit tests** under `tests/unit/`. Plain `int main()` files registered
   with CTest. Cover Spectrum, CIE color, Optics, RGBToSpectrum (Jakob
   upsampler + LUT), and BVH (build + traversal). Full ctest run is ~4 s
   on Linux; the LUT build in `test_rgbtospec` dominates at ~4 s.
-- **Render-diff tests** under `tests/render/`. Drive `frank-based-rendering-cli`
-  with a fixed seed across 15 (scene, mode, technique) tuples and
-  pixel-compare against golden PNGs.
+- **CPU render-diff tests** under `tests/render/`. Drive `frank-based-rendering-cli`
+  with a fixed seed across 17 (scene, mode, technique) tuples and
+  pixel-compare against golden PNGs. Linux-only, runs on every push.
+- **GPU render-diff tests** under `tests/render-gpu/`. Drive
+  `physically-cringe-rendering-cli` against a 17-tuple matrix covering
+  megakernel vs wavefront A/B, fork vs terminate dispersion, spectral
+  hero=4 vs hero=1, and the wavefront-stratified regression marker.
+  Mac-only, gated on goldens being present so the first scaffold push
+  doesn't fail before they're baked.
 
-CI runs both on every push to `main`, `dev`, `gui`, `gpu`, `test-suite`.
-The spectral branch skips the tests job (it has its own narrower GPU-only
-matrix).
+CI runs the unit + CPU render-diff suite on every push. The GPU
+render-diff suite runs as a step inside the existing macos build job,
+again on every push (only billed runtime on private repos, free on
+this public repo).
 
 ## Running locally
 
@@ -24,8 +31,12 @@ cmake --build code/Build -j
 # Unit tests via ctest.
 ctest --test-dir code/Build --output-on-failure
 
-# Render-diff tests. Builds nothing extra; expects code/Build/frank-based-rendering-cli.
+# CPU render-diff tests. Builds nothing extra; expects code/Build/frank-based-rendering-cli.
 tests/render/run.sh
+
+# GPU render-diff tests (Apple Silicon Mac only; needs the GPU CLI built).
+cmake --build code/Build -j --target physically-cringe-rendering-cli
+tests/render-gpu/run.sh
 ```
 
 `tests/render/run.sh` honors two env vars:
@@ -122,11 +133,19 @@ to the `foreach(t IN ITEMS ...)` list in `tests/CMakeLists.txt`. Reuse
 the PASS/FAIL print + `g_failed` pattern from the existing files for
 consistent CI logs.
 
-**Render-diff test.** Add a tuple to the `TUPLES=()` array in **both**
+**CPU render-diff test.** Add a tuple to the `TUPLES=()` array in **both**
 `tests/render/run.sh` and `tests/render/regenerate-golden.sh` (the array
 is duplicated to keep each script self-contained). Then run
 `tests/render/regenerate-golden.sh` to produce the new golden, eyeball,
 and commit.
+
+**GPU render-diff test.** Same pattern under `tests/render-gpu/`. Goldens
+must be baked on Apple Silicon since the suite tests the Metal backend.
+The Mac running the bake should have nothing else competing for the
+GPU (an in-flight render or shader compilation can perturb timing-
+dependent atomic-CAS reductions enough to nudge a few pixels). Bake,
+eyeball, commit. See `tests/render-gpu/golden/README.md` for the full
+regen flow.
 
 ## File layout
 
@@ -140,10 +159,15 @@ tests/
 │   ├── spectrum.cpp             # 61-sample container, interp, arithmetic
 │   ├── bvh.cpp                  # build + traversal vs brute-force
 │   └── optics.cpp               # Schlick, Cauchy IOR, dielectric bounce
-└── render/
-    ├── run.sh                   # diff against goldens
-    ├── regenerate-golden.sh     # rebuild goldens
-    ├── diff.py                  # PNG pixel diff (PIL)
-    ├── golden/                  # reference images, committed
+├── render/
+│   ├── run.sh                   # diff against goldens
+│   ├── regenerate-golden.sh     # rebuild goldens
+│   ├── diff.py                  # PNG pixel diff (PIL), shared with render-gpu
+│   ├── golden/                  # reference images, committed
+│   └── output/                  # run.sh writes here, gitignored
+└── render-gpu/
+    ├── run.sh                   # GPU-CLI variant, looser tolerance
+    ├── regenerate-golden.sh     # M1+ Mac bake
+    ├── golden/                  # GPU reference images, committed
     └── output/                  # run.sh writes here, gitignored
 ```

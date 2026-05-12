@@ -5,4 +5,5 @@ frank-based-rendering.json
 physically-cringe-rendering.json
 imgui.ini
 tests/render/output/
+tests/render-gpu/output/
 

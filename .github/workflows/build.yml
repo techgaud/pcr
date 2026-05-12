@@ -196,6 +196,36 @@ jobs:
       - name: Smoke test (CLI)
         run: ./code/Build/frank-based-rendering-cli -d 2 -s 4 -S 2
 
+      # GPU render-diff suite. Drives physically-cringe-rendering-cli
+      # through the 17-tuple matrix in tests/render-gpu/run.sh and
+      # tolerance-diffs against goldens committed under
+      # tests/render-gpu/golden/. Goldens are baked locally on the
+      # owner's M1 Ultra; this step runs against macos-latest's
+      # virtualized M-series GPU. Tolerance is set (--abs-tol 2,
+      # --pct-budget 0.05) to absorb atomic-CAS reduction ordering
+      # drift between the bake machine and the runner.
+      #
+      # First-bake-pending guard: if tests/render-gpu/golden/ contains
+      # no PNGs, run.sh exits 0 with a "no goldens, skipping" notice
+      # rather than failing the job. That keeps this scaffolding
+      # commit green until the owner bakes and commits goldens.
+      - name: Install Pillow (PIL) for GPU render-diff
+        run: python3 -m pip install --user Pillow
+
+      - name: Run GPU render-diff tests
+        run: tests/render-gpu/run.sh
+
+      # Surface produced PNGs on failure so the developer can pull them
+      # down and eyeball next to the goldens. Output dir is gitignored.
+      - name: Upload GPU render output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-gpu-output
+          path: tests/render-gpu/output/
+          if-no-files-found: warn
+          retention-days: 14
+
       # All three binaries now build on macOS: physically-cringe-rendering
       # uses the Metal backend (Gpu/Metal/MetalRenderer.mm) selected by
       # CMake on Apple platforms.
