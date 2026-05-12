@@ -110,6 +110,9 @@ struct JobConfig
     bool useStratified = false;
     bool useACES = false;
     bool useSpectral = false;
+    // false = Wyman 2013 piecewise-Gaussian (default, ~1% off CIE).
+    // true = CIE 1931 tabulated. Spectral renders only.
+    bool useCieCmf = false;
     bool useAA = false;
     int  aaSamples = 4;
     bool useAdaptive = false;
@@ -268,6 +271,9 @@ struct Settings
     // for each axis right now.
     bool useACES = false;
     bool useSpectral = false;
+    // false = Wyman 2013 (default), true = CIE 1931 tabulated.
+    // Spectral renders only.
+    bool useCieCmf = false;
     bool useAA = false;
     int aaSamples = 4;
     bool useAdaptive = false;
@@ -339,6 +345,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.useStratified = s.useStratified;
     j.useACES       = s.useACES;
     j.useSpectral   = s.useSpectral;
+    j.useCieCmf     = s.useCieCmf;
     j.useAA         = s.useAA;
     j.aaSamples     = s.aaSamples;
     j.useAdaptive   = s.useAdaptive;
@@ -370,6 +377,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.useStratified = j.useStratified;
     s.useACES       = j.useACES;
     s.useSpectral   = j.useSpectral;
+    s.useCieCmf     = j.useCieCmf;
     s.useAA         = j.useAA;
     s.aaSamples     = j.aaSamples;
     s.useAdaptive   = j.useAdaptive;
@@ -427,6 +435,11 @@ static void renderJobSummary(const JobConfig &j)
     };
 
     if (j.useSpectral)   tag("spec");
+    // CMF only meaningful in spectral renders. Wyman is the default;
+    // tag the cie alternative so the queue row makes the choice
+    // visible at a glance. Same convention as the wavefront fork/
+    // terminate suffix below.
+    if (j.useSpectral && j.useCieCmf) tag("cie");
     if (j.useAA) {
         char aa[16]; std::snprintf(aa, sizeof(aa), "aa%d", j.aaSamples);
         tag(aa);
@@ -467,6 +480,7 @@ static std::string summarizeJob(const JobConfig &j)
     char buf[256];
     std::string tags;
     if (j.useSpectral)   tags += " spec";
+    if (j.useSpectral && j.useCieCmf) tags += " cie";
     if (j.useAA)         { char t[16]; std::snprintf(t, sizeof(t), " aa%d", j.aaSamples); tags += t; }
     if (j.useAdaptive)   tags += " adapt";
     if (j.useOIDN)       tags += " oidn";
@@ -532,6 +546,7 @@ static void loadSettings(Settings &s)
         s.useStratified = j.value("useStratified", s.useStratified);
         s.useACES       = j.value("useACES",       s.useACES);
         s.useSpectral   = j.value("useSpectral",   s.useSpectral);
+        s.useCieCmf     = j.value("useCieCmf",     s.useCieCmf);
         s.useAA         = j.value("useAA",         s.useAA);
         s.aaSamples     = j.value("aaSamples",     s.aaSamples);
         s.useAdaptive   = j.value("useAdaptive",   s.useAdaptive);
@@ -603,6 +618,7 @@ static json buildSettingsJson(const Settings &s)
     j["useStratified"] = s.useStratified;
     j["useACES"]       = s.useACES;
     j["useSpectral"]   = s.useSpectral;
+    j["useCieCmf"]     = s.useCieCmf;
     j["useAA"]         = s.useAA;
     j["aaSamples"]     = s.aaSamples;
     j["useAdaptive"]   = s.useAdaptive;
@@ -886,6 +902,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useStratified = settings.useStratified;
         renderer.useACES       = settings.useACES;
         renderer.useSpectral   = settings.useSpectral;
+        renderer.useCieCmf     = settings.useCieCmf;
         renderer.heroSamples   = settings.heroSamples;
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
@@ -1874,6 +1891,25 @@ int main(int, char **)
                               "convergence than RGB at equal sample count;\n"
                               "AA samples >= 16 recommended. Output filename\n"
                               "gets -spectral.");
+
+        // CMF selection. Spectrum -> XYZ conversion can use the cheap
+        // Wyman 2013 piecewise-Gaussian fit (default, ~1% off true CIE)
+        // or the canonical CIE 1931 tabulated 2-deg observer. The
+        // toggle is always visible but only affects spectral-mode
+        // output; RGB renders ignore it (same convention as the
+        // wavefront-dispersion radio).
+        ImGui::TextUnformatted("CMF:     ");
+        ImGui::SameLine();
+        if (ImGui::RadioButton("Wyman 2013", !settings.useCieCmf)) settings.useCieCmf = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("CIE 1931", settings.useCieCmf)) settings.useCieCmf = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("CIE 1931 = canonical tabulated standard\n"
+                              "observer. Wyman 2013 = analytic piecewise-\n"
+                              "Gaussian fit, ~1% off CIE, compounds to\n"
+                              "~25% drift in integrated RGB equivalents.\n"
+                              "Spectral mode only. Recorded in PNG\n"
+                              "metadata as CMF: cie or CMF: wyman.");
 
         // LUT section. Only meaningful when spectral mode is on - the
         // active LUT influences how RGBToSpectrum::fitSigmoidCoefficients

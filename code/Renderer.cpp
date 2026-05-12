@@ -445,6 +445,8 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Adaptive",   useAdaptive ? "1" : "0");
     addText("OIDN",       useOIDN     ? "1" : "0");
     addText("Spectral",   useSpectral ? "1" : "0");
+    if (useSpectral)
+        addText("CMF", useCieCmf ? "cie" : "wyman");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

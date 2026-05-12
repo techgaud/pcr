@@ -109,6 +109,9 @@ int main(int argc, char *argv[])
     // noisier terminate strategy. CLI variable inverted from the
     // renderer's spectralFork field for naming-matches-flag clarity.
     bool spectralTerminate = false;
+    // false = Wyman 2013 piecewise-Gaussian (default, ~1% off CIE 1931).
+    // true = CIE 1931 tabulated 2-deg observer. Spectral mode only.
+    bool useCieCmf = false;
 
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
@@ -202,6 +205,14 @@ int main(int argc, char *argv[])
                  "to 4 internally. Ignored in RGB mode.")
         ->default_str("4")
         ->check(CLI::Range(1, 4));
+    options->add_flag("--cmf-cie", useCieCmf,
+                 "Use the CIE 1931 tabulated 2-deg standard observer for "
+                 "spectrum->XYZ output integration instead of the default "
+                 "Wyman 2013 piecewise-Gaussian fit. Wyman approximates "
+                 "the tabulated CMFs to ~1% per wavelength, compounding "
+                 "to ~25% drift in integrated RGB equivalents. CIE removes "
+                 "that bias for tabulated-SPD scenes (cornell-spec etc.); "
+                 "no measurable perf difference. Ignored in RGB mode.");
     options->add_option("--seed", seed,
                  "Fixed PRNG seed for bit-deterministic renders. When set "
                  "to non-zero, all per-thread Monte Carlo PRNG state "
@@ -457,6 +468,7 @@ int main(int argc, char *argv[])
     renderer.useOIDN      = useOIDN;
     renderer.useSpectral  = useSpectral;
     renderer.heroSamples  = heroSamples;
+    renderer.useCieCmf    = useCieCmf;
 #if PCR_USE_GPU
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;

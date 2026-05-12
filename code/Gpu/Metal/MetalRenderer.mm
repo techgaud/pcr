@@ -213,12 +213,23 @@ struct Uniforms {
     int   sampleCount;
     int   batchEndOfAa;
     int   spectralFork;
+    // 0 = Wyman 2013 piecewise-Gaussian CMF (default, ~1% off CIE 1931
+    // and the historical pcr behavior). 1 = CIE 1931 tabulated 2-deg
+    // observer (61 samples at 5 nm steps from 400 to 700 nm).
+    // Affects spectral-mode output only; RGB renders ignore it.
+    int   useCieCmf;
     // Number of "natural" ray slots per pass (pixelCount * sampleCount).
     // In fork mode the SoA buffers are allocated at 4*baseRayCount and
     // fork sub-rays live at slot indices >= baseRayCount; the glass
     // kernel atomically claims slots starting at this offset. Equal to
     // bufferSlots in non-fork mode.
     int   baseRayCount;
+    // Pad up to 160 bytes (multiple of 16) so MSL buffer offsets stay
+    // aligned for vectorized loads. The static_assert downstream
+    // catches drift. Future flags slot in by replacing pads.
+    int   _pad0;
+    int   _pad1;
+    int   _pad2;
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -330,10 +341,96 @@ float3 cieObserverAt(float lambda) {
     return float3(xb, yb, zb);
 }
 
-float3 singleLambdaXYZ(float lambda, float radiance) {
-    const float kYBarIntegral = 106.895210f;
+// CIE 1931 2-deg standard observer, tabulated at 5 nm steps from 400 to
+// 700 nm. 61 entries. Indexed by (lambda - 400) / 5, linearly
+// interpolated between adjacent rows. Out-of-range lambdas return 0,
+// same convention as the host-side cieXYZ() in CIE.h.
+constant float3 kCieTableMSL[61] = {
+    float3(0.0143,    0.000396, 0.0679),
+    float3(0.0232,    0.000640, 0.1102),
+    float3(0.0435,    0.001210, 0.2074),
+    float3(0.0776,    0.002180, 0.3713),
+    float3(0.13438,   0.004000, 0.6456),
+    float3(0.21477,   0.0073,   1.03905),
+    float3(0.2839,    0.0116,   1.3856),
+    float3(0.3285,    0.01684,  1.62296),
+    float3(0.34828,   0.023,    1.74706),
+    float3(0.34806,   0.0298,   1.7826),
+    float3(0.3362,    0.038,    1.77211),
+    float3(0.3187,    0.048,    1.7441),
+    float3(0.2908,    0.060,    1.6692),
+    float3(0.2511,    0.0739,   1.5281),
+    float3(0.19536,   0.09098,  1.28764),
+    float3(0.1421,    0.1126,   1.0419),
+    float3(0.09564,   0.13902,  0.81295),
+    float3(0.05795,   0.1693,   0.6162),
+    float3(0.03201,   0.20802,  0.46518),
+    float3(0.0147,    0.2586,   0.3533),
+    float3(0.0049,    0.323,    0.272),
+    float3(0.0024,    0.4073,   0.2123),
+    float3(0.0093,    0.503,    0.1582),
+    float3(0.0291,    0.6082,   0.1117),
+    float3(0.06327,   0.710,    0.07825),
+    float3(0.1096,    0.7932,   0.05725),
+    float3(0.1655,    0.862,    0.04216),
+    float3(0.22575,   0.91485,  0.02984),
+    float3(0.2904,    0.954,    0.0203),
+    float3(0.3597,    0.9803,   0.0134),
+    float3(0.43345,   0.99495,  0.00875),
+    float3(0.51205,   1.000,    0.00575),
+    float3(0.5945,    0.995,    0.0039),
+    float3(0.6784,    0.9786,   0.00275),
+    float3(0.7621,    0.952,    0.0021),
+    float3(0.8425,    0.9154,   0.0018),
+    float3(0.9163,    0.870,    0.00165),
+    float3(0.9786,    0.8163,   0.0014),
+    float3(1.0263,    0.757,    0.0011),
+    float3(1.0567,    0.6949,   0.0010),
+    float3(1.0622,    0.631,    0.0008),
+    float3(1.0456,    0.5668,   0.0006),
+    float3(1.0026,    0.503,    0.00034),
+    float3(0.93832,   0.4412,   0.00024),
+    float3(0.85445,   0.381,    0.00019),
+    float3(0.7514,    0.321,    0.0001),
+    float3(0.6424,    0.265,    0.00005),
+    float3(0.5419,    0.217,    0.00003),
+    float3(0.4479,    0.175,    0.00002),
+    float3(0.3608,    0.1382,   0.00001),
+    float3(0.2835,    0.107,    0.0),
+    float3(0.2187,    0.0816,   0.0),
+    float3(0.1649,    0.061,    0.0),
+    float3(0.1212,    0.04458,  0.0),
+    float3(0.0874,    0.032,    0.0),
+    float3(0.0636,    0.0232,   0.0),
+    float3(0.04677,   0.017,    0.0),
+    float3(0.0329,    0.01192,  0.0),
+    float3(0.0227,    0.00821,  0.0),
+    float3(0.01584,   0.005723, 0.0),
+    float3(0.01136,   0.004102, 0.0),
+};
+
+float3 cieObserverAtTabulated(float lambda) {
+    if (lambda < kLambdaMin || lambda > kLambdaMax) return float3(0.0, 0.0, 0.0);
+    float t = (lambda - kLambdaMin) * 0.2f;  // /5
+    int i = int(t);
+    if (i >= 60) return kCieTableMSL[60];
+    float frac = t - float(i);
+    return mix(kCieTableMSL[i], kCieTableMSL[i + 1], frac);
+}
+
+float3 singleLambdaXYZ(float lambda, float radiance, int useCieCmf) {
+    // Both integrals are precomputed to keep this branch free of
+    // host data. Wyman value matches the historical hardcoded
+    // constant; CIE value computed from the tabulated y_bar samples
+    // via sum(y_bar) * kStep = 21.36092 * 5 = 106.8046.
+    const float kWymanYBarIntegral = 106.895210f;
+    const float kCieYBarIntegral   = 106.8046f;
+    if (useCieCmf != 0) {
+        return cieObserverAtTabulated(lambda) * radiance
+             * (kLambdaMax - kLambdaMin) / kCieYBarIntegral;
+    }
     return cieObserverAt(lambda) * radiance
-         * (kLambdaMax - kLambdaMin) / kYBarIntegral;
+         * (kLambdaMax - kLambdaMin) / kWymanYBarIntegral;
 }
 
 // Sum singleLambdaXYZ over the four hero wavelengths and apply the 1/4
@@ -341,11 +438,11 @@ float3 singleLambdaXYZ(float lambda, float radiance) {
 // produces from the same (lambdas, perWavelengthRadiance) tuple. The
 // wavefront shading kernels feed this into the per-pixel CIE XYZ
 // accumulator stored in the color buffer.
-float3 heroLambdasXYZ(float4 lambdas, float4 perWavelengthRadiance) {
-    float3 xyz = singleLambdaXYZ(lambdas.x, perWavelengthRadiance.x)
-               + singleLambdaXYZ(lambdas.y, perWavelengthRadiance.y)
-               + singleLambdaXYZ(lambdas.z, perWavelengthRadiance.z)
-               + singleLambdaXYZ(lambdas.w, perWavelengthRadiance.w);
+float3 heroLambdasXYZ(float4 lambdas, float4 perWavelengthRadiance, int useCieCmf) {
+    float3 xyz = singleLambdaXYZ(lambdas.x, perWavelengthRadiance.x, useCieCmf)
+               + singleLambdaXYZ(lambdas.y, perWavelengthRadiance.y, useCieCmf)
+               + singleLambdaXYZ(lambdas.z, perWavelengthRadiance.z, useCieCmf)
+               + singleLambdaXYZ(lambdas.w, perWavelengthRadiance.w, useCieCmf);
     return xyz * 0.25f;
 }
 
@@ -1141,7 +1238,7 @@ kernel void path_trace(
                     float3 origin = float3(u.originX, u.originY, u.originZ);
                     float rad = tracePathSpectralSingle(S, origin, dir, lambda,
                                                         u.depth, 0, seed);
-                    accum += singleLambdaXYZ(lambda, rad);
+                    accum += singleLambdaXYZ(lambda, rad, u.useCieCmf);
                 } else {
                     float kSpan = kLambdaMax - kLambdaMin;
                     float kStride = kSpan / 4.0f;
@@ -1151,10 +1248,10 @@ kernel void path_trace(
                     lambdas.z = lambdas.x + kStride * 2.0f; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
                     lambdas.w = lambdas.x + kStride * 3.0f; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
                     float4 rad = tracePathSpectral(S, jpix, r1, r2, lambdas, seed);
-                    float3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
-                               + singleLambdaXYZ(lambdas.y, rad.y)
-                               + singleLambdaXYZ(lambdas.z, rad.z)
-                               + singleLambdaXYZ(lambdas.w, rad.w);
+                    float3 xyz = singleLambdaXYZ(lambdas.x, rad.x, u.useCieCmf)
+                               + singleLambdaXYZ(lambdas.y, rad.y, u.useCieCmf)
+                               + singleLambdaXYZ(lambdas.z, rad.z, u.useCieCmf)
+                               + singleLambdaXYZ(lambdas.w, rad.w, u.useCieCmf);
                     accum += xyz * 0.25f;
                 }
             } else {
@@ -1299,7 +1396,7 @@ kernel void path_trace_pass(
                 float3 origin = float3(u.originX, u.originY, u.originZ);
                 float rad = tracePathSpectralSingle(S, origin, dir, lambda,
                                                     u.depth, 0, seed);
-                accum += singleLambdaXYZ(lambda, rad);
+                accum += singleLambdaXYZ(lambda, rad, u.useCieCmf);
             } else {
                 float kSpan = kLambdaMax - kLambdaMin;
                 float kStride = kSpan / 4.0f;
@@ -1309,10 +1406,10 @@ kernel void path_trace_pass(
                 lambdas.z = lambdas.x + kStride * 2.0f; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
                 lambdas.w = lambdas.x + kStride * 3.0f; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
                 float4 rad = tracePathSpectral(S, jpix, r1, r2, lambdas, seed);
-                float3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
-                           + singleLambdaXYZ(lambdas.y, rad.y)
-                           + singleLambdaXYZ(lambdas.z, rad.z)
-                           + singleLambdaXYZ(lambdas.w, rad.w);
+                float3 xyz = singleLambdaXYZ(lambdas.x, rad.x, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.y, rad.y, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.z, rad.z, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.w, rad.w, u.useCieCmf);
                 accum += xyz * 0.25f;
             }
         } else {
@@ -1478,7 +1575,7 @@ kernel void path_trace_pass_adaptive(
                 float3 origin = float3(u.originX, u.originY, u.originZ);
                 float rad = tracePathSpectralSingle(S, origin, dir, lambda,
                                                     u.depth, 0, seed);
-                batchSum += singleLambdaXYZ(lambda, rad);
+                batchSum += singleLambdaXYZ(lambda, rad, u.useCieCmf);
             } else {
                 float kSpan = kLambdaMax - kLambdaMin;
                 float kStride = kSpan / 4.0f;
@@ -1488,10 +1585,10 @@ kernel void path_trace_pass_adaptive(
                 lambdas.z = lambdas.x + kStride * 2.0f; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
                 lambdas.w = lambdas.x + kStride * 3.0f; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
                 float4 rad = tracePathSpectral(S, jpix, r1, r2, lambdas, seed);
-                float3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
-                           + singleLambdaXYZ(lambdas.y, rad.y)
-                           + singleLambdaXYZ(lambdas.z, rad.z)
-                           + singleLambdaXYZ(lambdas.w, rad.w);
+                float3 xyz = singleLambdaXYZ(lambdas.x, rad.x, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.y, rad.y, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.z, rad.z, u.useCieCmf)
+                           + singleLambdaXYZ(lambdas.w, rad.w, u.useCieCmf);
                 batchSum += xyz * 0.25f;
             }
         } else {
@@ -2002,7 +2099,7 @@ kernel void wf_shade_emissive(
         float4 lams   = lambdas[gid];
         float4 spThru = spectralThroughput[gid];
         float4 emit   = emissiveAt4(materials[mi], lams);
-        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, spThru * emit);
+        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, spThru * emit, u.useCieCmf);
     } else {
         float3 t = throughput[gid];
         float3 emissive = materials[mi].emissive.rgb;
@@ -2428,7 +2525,7 @@ kernel void wf_shade_diffuse(
     // does for the same (lambdas, perWavelengthRadiance) tuple.
     if (u.useSpectral != 0) {
         float4 specRad = spThru * directLoSpec;
-        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, specRad);
+        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, specRad, u.useCieCmf);
     } else {
         color[gid] = float3(color[gid]) + t * directLoRGB;
     }
@@ -2784,13 +2881,20 @@ namespace
         // GpuDefaults.h kDefaultSpectralFork for the trade-off. Only
         // consulted in useWavefront + useSpectral mode.
         int   spectralFork;
+        // CMF selection: 0 = Wyman 2013 (default), 1 = CIE 1931
+        // tabulated. Only consulted in spectral mode. RGB ignores.
+        int   useCieCmf;
         // pixelCount * samplesPerPass. Glass-fork code computes fork
         // slot indices as baseRayCount + atomic_offset, since fork
         // sub-rays live above the base ray range in the SoA buffers.
         int   baseRayCount;
+        // Padding so sizeof matches the MSL Uniforms (160 bytes).
+        int   _pad0;
+        int   _pad1;
+        int   _pad2;
     };
-    static_assert(sizeof(Uniforms) == 144,
-                  "Uniforms must be 144 bytes (multiple of 16) so per-pass "
+    static_assert(sizeof(Uniforms) == 160,
+                  "Uniforms must be 160 bytes (multiple of 16) so per-pass "
                   "buffer offsets are 16-aligned for MSL vectorized loads");
 
     // Per-pixel state for the adaptive multi-pass kernel. Layout matches
@@ -3749,6 +3853,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.useSpectral      = useSpectral ? 1 : 0;
     uBase.heroSamples      = std::clamp(heroSamples, 1, 4);
     uBase.spectralFork     = spectralFork ? 1 : 0;
+    uBase.useCieCmf        = useCieCmf ? 1 : 0;
+    uBase._pad0            = 0;
+    uBase._pad1            = 0;
+    uBase._pad2            = 0;
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
 
@@ -4513,6 +4621,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     addText("Spectral",      useSpectral ? "1" : "0");
     if (useSpectral)
         addText("HeroSamples", std::to_string(std::clamp(heroSamples, 1, 4)));
+    // CMF only meaningful in spectral renders; key omitted from RGB
+    // metadata to match the WavefrontDispersion convention below.
+    if (useSpectral)
+        addText("CMF", useCieCmf ? "cie" : "wyman");
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
     // Architecture records what ACTUALLY ran, not what was requested

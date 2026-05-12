@@ -237,6 +237,7 @@ uniform int   uUseAdaptive;   // 0/1; meaningful only when uAaSamples > 1
 uniform int   uWriteAux;      // 0/1; populate uAlbedoOut + uNormalOut for OIDN
 uniform int   uUseSpectral;   // 0 = RGB path tracer, 1 = hero-wavelength spectral
 uniform int   uHeroSamples;   // 4 = hero default; 1 = single-wavelength legacy
+uniform int   uUseCieCmf;     // 0 = Wyman 2013, 1 = CIE 1931 tabulated 2-deg observer
 
 const float PI = 3.14159265358979323846;
 
@@ -414,20 +415,94 @@ vec3 cieObserverAt(float lambda) {
     return vec3(xb, yb, zb);
 }
 
+// CIE 1931 2-deg standard observer tabulated at 5 nm steps from
+// 400 to 700 nm. 61 entries. Mirrors the host-side cieTable() in
+// CIE.h byte-for-byte.
+const vec3 kCieTableGLSL[61] = vec3[61](
+    vec3(0.0143,    0.000396, 0.0679),
+    vec3(0.0232,    0.000640, 0.1102),
+    vec3(0.0435,    0.001210, 0.2074),
+    vec3(0.0776,    0.002180, 0.3713),
+    vec3(0.13438,   0.004000, 0.6456),
+    vec3(0.21477,   0.0073,   1.03905),
+    vec3(0.2839,    0.0116,   1.3856),
+    vec3(0.3285,    0.01684,  1.62296),
+    vec3(0.34828,   0.023,    1.74706),
+    vec3(0.34806,   0.0298,   1.7826),
+    vec3(0.3362,    0.038,    1.77211),
+    vec3(0.3187,    0.048,    1.7441),
+    vec3(0.2908,    0.060,    1.6692),
+    vec3(0.2511,    0.0739,   1.5281),
+    vec3(0.19536,   0.09098,  1.28764),
+    vec3(0.1421,    0.1126,   1.0419),
+    vec3(0.09564,   0.13902,  0.81295),
+    vec3(0.05795,   0.1693,   0.6162),
+    vec3(0.03201,   0.20802,  0.46518),
+    vec3(0.0147,    0.2586,   0.3533),
+    vec3(0.0049,    0.323,    0.272),
+    vec3(0.0024,    0.4073,   0.2123),
+    vec3(0.0093,    0.503,    0.1582),
+    vec3(0.0291,    0.6082,   0.1117),
+    vec3(0.06327,   0.710,    0.07825),
+    vec3(0.1096,    0.7932,   0.05725),
+    vec3(0.1655,    0.862,    0.04216),
+    vec3(0.22575,   0.91485,  0.02984),
+    vec3(0.2904,    0.954,    0.0203),
+    vec3(0.3597,    0.9803,   0.0134),
+    vec3(0.43345,   0.99495,  0.00875),
+    vec3(0.51205,   1.000,    0.00575),
+    vec3(0.5945,    0.995,    0.0039),
+    vec3(0.6784,    0.9786,   0.00275),
+    vec3(0.7621,    0.952,    0.0021),
+    vec3(0.8425,    0.9154,   0.0018),
+    vec3(0.9163,    0.870,    0.00165),
+    vec3(0.9786,    0.8163,   0.0014),
+    vec3(1.0263,    0.757,    0.0011),
+    vec3(1.0567,    0.6949,   0.0010),
+    vec3(1.0622,    0.631,    0.0008),
+    vec3(1.0456,    0.5668,   0.0006),
+    vec3(1.0026,    0.503,    0.00034),
+    vec3(0.93832,   0.4412,   0.00024),
+    vec3(0.85445,   0.381,    0.00019),
+    vec3(0.7514,    0.321,    0.0001),
+    vec3(0.6424,    0.265,    0.00005),
+    vec3(0.5419,    0.217,    0.00003),
+    vec3(0.4479,    0.175,    0.00002),
+    vec3(0.3608,    0.1382,   0.00001),
+    vec3(0.2835,    0.107,    0.0),
+    vec3(0.2187,    0.0816,   0.0),
+    vec3(0.1649,    0.061,    0.0),
+    vec3(0.1212,    0.04458,  0.0),
+    vec3(0.0874,    0.032,    0.0),
+    vec3(0.0636,    0.0232,   0.0),
+    vec3(0.04677,   0.017,    0.0),
+    vec3(0.0329,    0.01192,  0.0),
+    vec3(0.0227,    0.00821,  0.0),
+    vec3(0.01584,   0.005723, 0.0),
+    vec3(0.01136,   0.004102, 0.0)
+);
+
+vec3 cieObserverAtTabulated(float lambda) {
+    if (lambda < kLambdaMin || lambda > kLambdaMax) return vec3(0.0);
+    float t = (lambda - kLambdaMin) * 0.2;  // /5
+    int i = int(t);
+    if (i >= 60) return kCieTableGLSL[60];
+    float frac = t - float(i);
+    return mix(kCieTableGLSL[i], kCieTableGLSL[i + 1], frac);
+}
+
 // Single-lambda XYZ contribution. Mirrors CIE::singleLambdaXYZ on
-// the CPU side. The kLambdaMax-kLambdaMin scaling cancels with the
-// uniform-pdf weight in the per-pixel estimator so absolute
-// brightness matches the full-spectrum case. The 1/kYBarIntegral
-// term converts back from the physical reflectance convention used
-// in the spectrum buffers (s = 1 for a perfect white reflector) into
-// linear-sRGB-comparable XYZ where Y(white) ~= 1; see CIE.h on the
-// CPU side. The hardcoded 106.895 is the integral of the Wyman 2013
-// yBar approximation over 400-700 nm at 5 nm steps, the same
-// quantity CIE::yBarIntegral() computes at startup.
+// the CPU side. Branches on uUseCieCmf to pick the Wyman fit
+// (default) or the tabulated CIE 1931 observer.
 vec3 singleLambdaXYZ(float lambda, float radiance) {
-    const float kYBarIntegral = 106.895210;
+    const float kWymanYBarIntegral = 106.895210;
+    const float kCieYBarIntegral   = 106.8046;
+    if (uUseCieCmf != 0) {
+        return cieObserverAtTabulated(lambda) * radiance
+             * (kLambdaMax - kLambdaMin) / kCieYBarIntegral;
+    }
     return cieObserverAt(lambda) * radiance
-         * (kLambdaMax - kLambdaMin) / kYBarIntegral;
+         * (kLambdaMax - kLambdaMin) / kWymanYBarIntegral;
 }
 
 // CIE XYZ to linear sRGB (D65). Standard 3x3 from IEC 61966-2-1.
@@ -2011,6 +2086,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // Other values clamp to 4 in the shader's branch test (uHeroSamples
     // <= 1 triggers the single-wavelength path; everything else hero).
     setI("uHeroSamples",    std::clamp(heroSamples, 1, 4));
+    setI("uUseCieCmf",      useCieCmf ? 1 : 0);
     setI("uAaSamples",      std::max(1, aaSamples));
     setI("uUseAdaptive",    useAdaptive ? 1 : 0);
     setI("uStrata",         useStratified
@@ -2384,6 +2460,8 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     addText("Spectral",      useSpectral ? "1" : "0");
     if (useSpectral)
         addText("HeroSamples", std::to_string(std::clamp(heroSamples, 1, 4)));
+    if (useSpectral)
+        addText("CMF", useCieCmf ? "cie" : "wyman");
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);

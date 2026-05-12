@@ -85,6 +85,12 @@ public:
     // and CLI can set it unconditionally. Value is ignored.
     bool spectralFork = pcr::kDefaultSpectralFork;
 
+    // CMF selection for spectrum -> XYZ output. false = Wyman 2013
+    // piecewise-Gaussian (default). true = CIE 1931 tabulated 2-deg
+    // observer. Only consulted in spectral mode. See CIE.h for the
+    // accuracy / table-size trade-off.
+    bool useCieCmf = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
