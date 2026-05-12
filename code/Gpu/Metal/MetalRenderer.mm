@@ -707,7 +707,11 @@ float3 tracePath(thread const Scene &S, float2 pix, float pr1, float pr2,
         bool entering = dot(rd, N) < 0.0f;
         if (!entering) N = -N;
 
-        GpuMaterial mat = S.materials[matIdx];
+        // Reference (not a copy) so the 560-byte GpuMaterial struct
+        // doesn't get spilled into a thread-local register block. Same
+        // pattern as the 7b69fd0 fix in wf_shade_glass. mat is read-
+        // only below; member access stays as a device load either way.
+        device const GpuMaterial &mat = S.materials[matIdx];
 
         if (any(mat.emissive.rgb > float3(0.0f))) {
             radiance += throughput * mat.emissive.rgb;
@@ -751,7 +755,7 @@ float3 tracePath(thread const Scene &S, float2 pix, float pr1, float pr2,
                     float3 d = sh - shadowOrigin;
                     float occluderDist2 = dot(d, d);
                     if (occluderDist2 < lightDist2 - 1e-3f) {
-                        GpuMaterial om = S.materials[sMat];
+                        device const GpuMaterial &om = S.materials[sMat];
                         if (!any(om.emissive.rgb > float3(0.0f))) occluded = true;
                     }
                 }
@@ -1866,7 +1870,7 @@ kernel void wf_compact_by_material(
         int mIdx = matIdx[gid];
         if (mIdx >= 0)
         {
-            GpuMaterial m = materials[mIdx];
+            device const GpuMaterial &m = materials[mIdx];
             bool hasEmissive = (m.emissive.x > 0.0f ||
                                 m.emissive.y > 0.0f ||
                                 m.emissive.z > 0.0f);
