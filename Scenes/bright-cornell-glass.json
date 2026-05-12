@@ -1,7 +1,7 @@
 {
   "schema": "1.0",
   "name": "bright-cornell-glass",
-  "version": "1.1.0",
+  "version": "1.0.1",
 
   // cornell-glass with the entire ceiling promoted to the light source
   // AND the box closed by a fourth wall behind the camera. The cream
