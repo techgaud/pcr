@@ -120,7 +120,7 @@ struct JobConfig
     int  threadgroupY = pcr::kDefaultThreadgroupY;
 
     // Architecture toggle. Defaults centralized in GpuDefaults.h (true /
-    // false as of v1.4.2 = wavefront-1spp default, picked by A/B). GUI
+    // false as of v1.5.0 = wavefront-1spp default, picked by A/B). GUI
     // exposes the radio under Architecture (debug) for opt-out / mode
     // switching; CLI exposes --no-wavefront for the same.
     bool useWavefront = pcr::kDefaultUseWavefront;
@@ -283,7 +283,7 @@ struct Settings
 
     // Metal compute threadgroup shape. Effective on Apple Silicon
     // backends only; OpenGL ignores them. Default lives in
-    // GpuDefaults.h (8x8 as of v1.4.1, picked by A/B). The GUI's
+    // GpuDefaults.h (8x8 as of v1.5.0, picked by A/B). The GUI's
     // debug-mode tuning panel surfaces a row of preset buttons for
     // re-running the A/B if the kernel shape changes.
     int threadgroupX = pcr::kDefaultThreadgroupX;
@@ -1758,7 +1758,7 @@ int main(int, char **)
                 ImGui::SetTooltip("Rays split across per-material shading "
                                   "kernels. One sample per pipeline run "
                                   "(smaller working set, more dispatches). "
-                                  "v1.4.2 baseline; beat megakernel by "
+                                  "v1.5.0 baseline; beat megakernel by "
                                   "~25%% in early A/B.");
             ImGui::SameLine();
             if (ImGui::RadioButton("Wavefront (multi-spp)", isWfMspp))

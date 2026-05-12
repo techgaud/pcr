@@ -8,7 +8,7 @@ Deferred work, with enough context to pick up cold later.
 
 ### Why deferred
 
-Pre-existing bug that's been silently failing. Orthogonal to the wavefront work that surfaced it. Caught when v1.4.2's wavefront fallback path also tripped the same OIDN warning.
+Pre-existing bug that's been silently failing. Orthogonal to the wavefront work that surfaced it. Caught when v1.5.0's wavefront fallback path also tripped the same OIDN warning.
 
 ### Root cause
 
@@ -85,7 +85,7 @@ Multi-level prefix-sum compaction (full Blelloch scan, no atomics) is the produc
 1. Add a `--queue-compaction` mode flag to the GPU CLI: `simd-batched` (current default) or `prefix-sum`.
 2. Wrap the queue-write path in each shading kernel behind a macro / function pointer so both modes share the same call site.
 3. Implement the full Blelloch scan against `simd_prefix_inclusive_sum()` for per-SIMD, threadgroup memory + barrier for per-threadgroup combine, and a second dispatch for cross-threadgroup combine.
-4. Render the same scene+settings with both modes via the GUI queue (batching feature from v1.4.1), compare wallclock + GPU power draw.
+4. Render the same scene+settings with both modes via the GUI queue (batching feature from v1.5.0), compare wallclock + GPU power draw.
 5. If prefix-sum is consistently faster by >5%, promote it to default. Otherwise document the result and remove the prefix-sum kernels.
 
 ### When to revisit

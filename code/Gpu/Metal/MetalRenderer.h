@@ -62,7 +62,7 @@ public:
     int heroSamples = 4;
 
     // Metal compute threadgroup shape for the path_trace_pass{,_adaptive}
-    // kernels. Default (8x8 as of v1.4.1) lives in GpuDefaults.h with
+    // kernels. Default (8x8 as of v1.5.0) lives in GpuDefaults.h with
     // the rationale and A/B history; this field is the renderer-side
     // override knob, populated by the CLI / GUI before render(). Clamps
     // to 16x16 at dispatch time if the chosen shape exceeds the
@@ -78,7 +78,7 @@ public:
     // stderr warning once per render. Adaptive sampling is not supported
     // in wavefront mode and is silently ignored when both flags are set.
     // Architecture defaults centralized in GpuDefaults.h. useWavefront
-    // = true since v1.4.2 (wavefront beat megakernel ~25% in A/B).
+    // = true since v1.5.0 (wavefront beat megakernel ~25% in A/B).
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
     // Glass dispersion strategy in wavefront-spectral mode. See

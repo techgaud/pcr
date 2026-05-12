@@ -243,7 +243,7 @@ int main(int argc, char *argv[])
                  "with --threadgroup-y selects the per-dispatch threadgroup "
                  "shape. Effective values on Apple Silicon are multiples of "
                  "32 in total threads (SIMD width = 32); common shapes are "
-                 "8x8, 16x16, 32x8, 32x32. Default selected by v1.4.1 A/B. "
+                 "8x8, 16x16, 32x8, 32x32. Default selected by v1.5.0 A/B. "
                  "Ignored on the OpenGL backend (local_size baked into the "
                  "GLSL kernel).")
         ->default_str(std::to_string(pcr::kDefaultThreadgroupX))
@@ -257,7 +257,7 @@ int main(int argc, char *argv[])
                  "Use the wavefront path tracer architecture (rays "
                  "rebatched per-material between bounces) instead of "
                  "the megakernel single-kernel architecture. ON by "
-                 "default since v1.4.2 (wavefront beat megakernel by "
+                 "default since v1.5.0 (wavefront beat megakernel by "
                  "~25% in A/B). --no-wavefront forces megakernel for "
                  "this render. Metal backend only (Apple Silicon); "
                  "the flag is a no-op on Win/Linux OpenGL.");

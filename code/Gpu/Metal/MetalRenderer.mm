@@ -4282,7 +4282,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     else
     {
         // Megakernel dispatch path: existing single-kernel-per-pass
-        // loop. Kept unchanged from v1.4.1 so wavefront vs megakernel
+        // loop. Kept unchanged from v1.5.0 so wavefront vs megakernel
         // is a clean A/B at runtime.
         for (int p = 0; p < totalPasses; p++)
         {
