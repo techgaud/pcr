@@ -4063,7 +4063,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             //   27 lambdas (float4, hero wavelengths, spectral-only);
             //   28 spectralThroughput (float4, per-wavelength scalar
             //      throughput, spectral-only);
-            //   29 rayCountAtomic (atomic uint, spectral-fork-only).
+            //   29 rayCountAtomic (atomic uint, spectral-fork-only);
+            //   30 perPixelAccum (atomic uint[3*pixelCount], fork-only,
+            //      atomic-CAS-add target for the wf_scatter_forks pass
+            //      before writeback gathers it into the output texture).
             // Dispatched 1D over rayCount (= pixelCount * samplesPerPass)
             // so multi-sample-per-pass mode lights up one ray per pixel
             // per sample concurrently.
@@ -4503,6 +4506,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     addText("AASamples",     std::to_string(aaSamples));
     addText("Adaptive",      useAdaptive ? "1" : "0");
     addText("OIDN",          useOIDN     ? "1" : "0");
+    addText("Spectral",      useSpectral ? "1" : "0");
+    if (useSpectral)
+        addText("HeroSamples", std::to_string(std::clamp(heroSamples, 1, 4)));
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
     // Architecture records what ACTUALLY ran, not what was requested
