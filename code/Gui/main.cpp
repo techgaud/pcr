@@ -106,6 +106,9 @@ struct JobConfig
     bool square = true;
     bool useDenoise = false;
     bool useMIS = false;
+    // BSDF-side MIS, wavefront-only extension. Off by default;
+    // requires useMIS to be on and useWavefront true to have any effect.
+    bool useBsdfMis = false;
     bool useRussian = false;
     bool useStratified = false;
     bool useACES = false;
@@ -274,6 +277,8 @@ struct Settings
     // false = Wyman 2013 (default), true = CIE 1931 tabulated.
     // Spectral renders only.
     bool useCieCmf = false;
+    // BSDF-side MIS, wavefront-only. Persisted alongside useMIS.
+    bool useBsdfMis = false;
     bool useAA = false;
     int aaSamples = 4;
     bool useAdaptive = false;
@@ -341,6 +346,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.square        = s.square;
     j.useDenoise    = s.useDenoise;
     j.useMIS        = s.useMIS;
+    j.useBsdfMis    = s.useBsdfMis;
     j.useRussian    = s.useRussian;
     j.useStratified = s.useStratified;
     j.useACES       = s.useACES;
@@ -373,6 +379,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.square        = j.square;
     s.useDenoise    = j.useDenoise;
     s.useMIS        = j.useMIS;
+    s.useBsdfMis    = j.useBsdfMis;
     s.useRussian    = j.useRussian;
     s.useStratified = j.useStratified;
     s.useACES       = j.useACES;
@@ -449,6 +456,10 @@ static void renderJobSummary(const JobConfig &j)
     if (j.useACES)       tag("aces");
     if (j.useDenoise && !j.useOIDN) tag("denoise");
     if (j.useMIS)        tag("mis");
+    // BSDF-side MIS only fires when light-side MIS AND wavefront are
+    // both on; tag only when the combo is active so the queue row
+    // doesn't mislead about silently-ignored flags.
+    if (j.useMIS && j.useWavefront && j.useBsdfMis) tag("mis-bsdf");
     if (j.useRussian)    tag("rr");
     if (j.useStratified) tag("strat");
     if (j.useWavefront) {
@@ -487,6 +498,7 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useACES)       tags += " aces";
     if (j.useDenoise && !j.useOIDN) tags += " denoise";
     if (j.useMIS)        tags += " mis";
+    if (j.useMIS && j.useWavefront && j.useBsdfMis) tags += " mis-bsdf";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
     if (j.useWavefront) {
@@ -542,6 +554,7 @@ static void loadSettings(Settings &s)
         s.darkTheme = j.value("darkTheme", s.darkTheme);
         s.useDenoise   = j.value("useDenoise",   s.useDenoise);
         s.useMIS       = j.value("useMIS",       s.useMIS);
+        s.useBsdfMis   = j.value("useBsdfMis",   s.useBsdfMis);
         s.useRussian   = j.value("useRussian",   s.useRussian);
         s.useStratified = j.value("useStratified", s.useStratified);
         s.useACES       = j.value("useACES",       s.useACES);
@@ -614,6 +627,7 @@ static json buildSettingsJson(const Settings &s)
     j["darkTheme"] = s.darkTheme;
     j["useDenoise"]   = s.useDenoise;
     j["useMIS"]       = s.useMIS;
+    j["useBsdfMis"]   = s.useBsdfMis;
     j["useRussian"]   = s.useRussian;
     j["useStratified"] = s.useStratified;
     j["useACES"]       = s.useACES;
@@ -903,6 +917,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useACES       = settings.useACES;
         renderer.useSpectral   = settings.useSpectral;
         renderer.useCieCmf     = settings.useCieCmf;
+        renderer.useBsdfMis    = settings.useBsdfMis;
         renderer.heroSamples   = settings.heroSamples;
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
@@ -2050,6 +2065,24 @@ int main(int, char **)
         ImGui::SeparatorText("Techniques");
         ImGui::Checkbox("Denoise (5x5 cross-bilateral on output)", &settings.useDenoise);
         ImGui::Checkbox("MIS (light-side balance heuristic, partial)", &settings.useMIS);
+        // BSDF-side MIS is a wavefront-only extension that closes the
+        // partial MIS into the full balance heuristic. Gray it out when
+        // light-side MIS is off (the BSDF side alone is uniformly worse
+        // than no MIS) or when running megakernel (where the kernels
+        // don't read the flag).
+        {
+            const bool wfMisAvailable = settings.useMIS && settings.useWavefront;
+            ImGui::BeginDisabled(!wfMisAvailable);
+            ImGui::Checkbox("MIS BSDF-side (upgrades to full balance heuristic)",
+                            &settings.useBsdfMis);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Adds the symmetric BSDF-side weight to MIS.\n"
+                                  "Closes the variance-reduction loop: light-side\n"
+                                  "and BSDF-side combine via the balance heuristic\n"
+                                  "(power beta=2). Wavefront-only; megakernel\n"
+                                  "ignores. Disabled when MIS or wavefront is off.");
+        }
         ImGui::Checkbox("Russian roulette (terminate paths at depth >= 1)", &settings.useRussian);
         ImGui::Checkbox("Stratified samples (jittered grid first bounce)", &settings.useStratified);
         ImGui::Checkbox("Anti-aliasing (jittered primary rays)", &settings.useAA);

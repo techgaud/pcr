@@ -218,6 +218,13 @@ struct Uniforms {
     // observer (61 samples at 5 nm steps from 400 to 700 nm).
     // Affects spectral-mode output only; RGB renders ignore it.
     int   useCieCmf;
+    // 1 = enable BSDF-side MIS weighting in wf_shade_emissive
+    // (Veach balance heuristic, beta=2 to match the existing
+    // light-side weight). 0 = unweighted Le accumulation (the
+    // pre-BSDF-MIS behavior). Has no effect when useMIS is 0
+    // because the light-side weight at the prior bounce also
+    // collapses to 1, leaving an unbiased single-sample estimator.
+    int   useBsdfMis;
     // Number of "natural" ray slots per pass (pixelCount * sampleCount).
     // In fork mode the SoA buffers are allocated at 4*baseRayCount and
     // fork sub-rays live at slot indices >= baseRayCount; the glass
@@ -229,7 +236,6 @@ struct Uniforms {
     // catches drift. Future flags slot in by replacing pads.
     int   _pad0;
     int   _pad1;
-    int   _pad2;
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -2125,6 +2131,40 @@ kernel void wf_shade_emissive(
 
     int mi = matIdx[gid];
 
+    // BSDF-side MIS weight on the BSDF-sampled emission. The
+    // sentinel value -1 in lastBsdfPdf marks a primary ray or a
+    // just-came-from-specular continuation; in both cases the BSDF
+    // is non-existent or delta-distributed and light sampling can't
+    // produce that direction, so the weight collapses to 1 (no MIS,
+    // unweighted Le).
+    //
+    // For diffuse-sampled paths the weight is the power heuristic
+    // beta=2 (which matches the existing light-side weighting in
+    // wf_shade_diffuse). pdfLight is the light-sampling pdf that
+    // WOULD have been used to reach this exact point on the emitter
+    // (the symmetric counterpart of the light-side weight at the
+    // previous bounce). Recovered from the prior bounce's origin
+    // (the diffuse surface that scattered toward this emitter) plus
+    // this hit's position and surface normal.
+    float w_bsdf = 1.0f;
+    float lastPdf = lastBsdfPdf[gid];
+    if (u.useBsdfMis != 0 && lastPdf >= 0.0f && u.totalLightArea > 0.0f) {
+        float3 ro = float3(origin[gid]);
+        float3 hp = float3(hit[gid]);
+        float3 N  = float3(normalIn[gid]);
+        float3 toLight = hp - ro;
+        float dist2 = max(dot(toLight, toLight), 1e-9f);
+        float invDist = rsqrt(dist2);
+        float3 wi = toLight * invDist;
+        float cosLight = max(0.0f, dot(-wi, N));
+        if (cosLight > 1e-6f) {
+            float pdfLight = dist2 / (cosLight * u.totalLightArea);
+            float pdfB2 = lastPdf * lastPdf;
+            float pdfL2 = pdfLight * pdfLight;
+            w_bsdf = pdfB2 / max(pdfB2 + pdfL2, 1e-12f);
+        }
+    }
+
     if (u.useSpectral != 0) {
         // Spectral terminal contribution: per-wavelength radiance =
         // spectralThroughput * emissiveAt(lambdas), then collapse the
@@ -2134,11 +2174,11 @@ kernel void wf_shade_emissive(
         float4 lams   = lambdas[gid];
         float4 spThru = spectralThroughput[gid];
         float4 emit   = emissiveAt4(materials[mi], lams);
-        color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, spThru * emit, u.useCieCmf);
+        color[gid] = float3(color[gid]) + w_bsdf * heroLambdasXYZ(lams, spThru * emit, u.useCieCmf);
     } else {
         float3 t = throughput[gid];
         float3 emissive = materials[mi].emissive.rgb;
-        color[gid] = float3(color[gid]) + t * emissive;
+        color[gid] = float3(color[gid]) + w_bsdf * t * emissive;
     }
     rayState[gid] = stateSetAlive(rayState[gid], false);
 }
@@ -2937,6 +2977,9 @@ namespace
         // CMF selection: 0 = Wyman 2013 (default), 1 = CIE 1931
         // tabulated. Only consulted in spectral mode. RGB ignores.
         int   useCieCmf;
+        // BSDF-side MIS toggle. 0 = unweighted Le (existing behavior).
+        // 1 = power-heuristic-beta=2 weight against light pdf.
+        int   useBsdfMis;
         // pixelCount * samplesPerPass. Glass-fork code computes fork
         // slot indices as baseRayCount + atomic_offset, since fork
         // sub-rays live above the base ray range in the SoA buffers.
@@ -2944,7 +2987,6 @@ namespace
         // Padding so sizeof matches the MSL Uniforms (160 bytes).
         int   _pad0;
         int   _pad1;
-        int   _pad2;
     };
     static_assert(sizeof(Uniforms) == 160,
                   "Uniforms must be 160 bytes (multiple of 16) so per-pass "
@@ -3924,9 +3966,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.heroSamples      = std::clamp(heroSamples, 1, 4);
     uBase.spectralFork     = spectralFork ? 1 : 0;
     uBase.useCieCmf        = useCieCmf ? 1 : 0;
+    uBase.useBsdfMis       = useBsdfMis ? 1 : 0;
     uBase._pad0            = 0;
     uBase._pad1            = 0;
-    uBase._pad2            = 0;
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
 
@@ -4695,6 +4737,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // metadata to match the WavefrontDispersion convention below.
     if (useSpectral)
         addText("CMF", useCieCmf ? "cie" : "wyman");
+    // BSDF-side MIS only meaningful when the megakernel light-side
+    // MIS is on AND we ran wavefront (megakernel doesn't honor the
+    // flag yet). Recorded so renders are self-describing.
+    if (effectiveWavefront && useMIS)
+        addText("BsdfMIS", useBsdfMis ? "1" : "0");
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
     // Architecture records what ACTUALLY ran, not what was requested

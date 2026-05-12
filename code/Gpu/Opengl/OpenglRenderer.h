@@ -91,6 +91,12 @@ public:
     // accuracy / table-size trade-off.
     bool useCieCmf = false;
 
+    // BSDF-side MIS toggle. Metal-wavefront-only; OpenGL backend
+    // doesn't have wavefront kernels. Carried here for source
+    // compatibility with the Metal renderer so the GUI and CLI can
+    // set it unconditionally. Value is ignored.
+    bool useBsdfMis = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

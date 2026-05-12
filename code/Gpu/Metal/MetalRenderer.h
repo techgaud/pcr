@@ -92,6 +92,11 @@ public:
     // accuracy / table-size trade-off.
     bool useCieCmf = false;
 
+    // BSDF-side MIS toggle. Only consulted in wavefront mode; the
+    // megakernel still ships with light-side-only MIS. Default off so
+    // existing renders are byte-identical until the flag is flipped.
+    bool useBsdfMis = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

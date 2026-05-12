@@ -98,6 +98,12 @@ public:
     // tabulated-SPD scenes like cornell-spec.
     bool useCieCmf = false;
 
+    // BSDF-side MIS extension. Wavefront-Metal-only; the CPU renderer
+    // carries the field for source compatibility with the GPU
+    // renderers so the GUI/CLI can set it unconditionally. Value
+    // ignored on this backend.
+    bool useBsdfMis = false;
+
     // Hero-wavelength sample count. Default 4 = stratified hero sampling
     // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
     // for benchmarking and visual A/B against the hero default. Other
