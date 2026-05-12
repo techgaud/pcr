@@ -1731,6 +1731,7 @@ kernel void wf_generate_primary_rays(
     device uint                *pixelIdx           [[buffer(5)]],
     device uint                *rngState           [[buffer(6)]],
     device uint                *rayState           [[buffer(7)]],
+    device float               *lastBsdfPdf        [[buffer(8)]],
     device const Welford       *pixelWelford       [[buffer(26)]],
     device float4              *lambdas            [[buffer(27)]],
     device float4              *spectralThroughput [[buffer(28)]],
@@ -1758,6 +1759,7 @@ kernel void wf_generate_primary_rays(
     // the ray as terminated.
     if (u.useAdaptive != 0 && pixelWelford[pixelIdxLocal].done != 0) {
         rayState[gid] = statePack(0u, false);
+        lastBsdfPdf[gid] = -1.0f;
         pixelIdx[gid] = pixelIdxLocal;
         return;
     }
@@ -1836,6 +1838,11 @@ kernel void wf_generate_primary_rays(
 
     rngState[gid]    = seed;
     rayState[gid]    = statePack(0u, true);
+    // Primary rays have no prior BSDF sample. Sentinel = -1 bypasses
+    // BSDF-MIS at the first emissive hit (caught either by an early
+    // light visible from the camera, or by a specular bounce
+    // continuation, both of which want the unweighted Le).
+    lastBsdfPdf[gid] = -1.0f;
 }
 
 // Wavefront intersect kernel. Reads each ray's origin/direction from the
@@ -2098,10 +2105,14 @@ kernel void wf_compact_by_material(
 
 kernel void wf_shade_emissive(
     constant Uniforms                          &u                  [[buffer(0)]],
+    device const packed_float3                 *origin             [[buffer(1)]],
     device const packed_float3                 *throughput         [[buffer(3)]],
     device packed_float3                       *color              [[buffer(4)]],
     device uint                                *rayState           [[buffer(7)]],
+    device const float                         *lastBsdfPdf        [[buffer(8)]],
     device const int                           *matIdx             [[buffer(9)]],
+    device const packed_float3                 *hit                [[buffer(10)]],
+    device const packed_float3                 *normalIn           [[buffer(11)]],
     device const GpuMaterial                   *materials          [[buffer(14)]],
     device const uint                          *queue              [[buffer(24)]],
     constant uint                              &queueLen           [[buffer(25)]],
@@ -2146,6 +2157,7 @@ kernel void wf_shade_mirror(
     device packed_float3                       *throughput         [[buffer(3)]],
     device uint                                *rngState           [[buffer(6)]],
     device uint                                *rayState           [[buffer(7)]],
+    device float                               *lastBsdfPdf        [[buffer(8)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2204,6 +2216,13 @@ kernel void wf_shade_mirror(
     dir[gid]         = newDir;
     rngState[gid]    = seed;
     rayState[gid]    = statePack(depth, alive_after);
+    // Mirror reflection is a delta-distributed BSDF (single outgoing
+    // direction with implicit pdf = 1 baked into the throughput
+    // update). Sentinel -1 tells the next wf_shade_emissive to skip
+    // MIS weighting: light sampling can't produce the mirror's
+    // reflected direction in finite probability, so the BSDF-side
+    // weight is 1 by convention.
+    lastBsdfPdf[gid] = -1.0f;
 }
 
 // ---- Glass: dielectric refraction via Schlick Fresnel --------------
@@ -2222,6 +2241,7 @@ kernel void wf_shade_glass(
     device uint                                *pixelIdx           [[buffer(5)]],
     device uint                                *rngState           [[buffer(6)]],
     device uint                                *rayState           [[buffer(7)]],
+    device float                               *lastBsdfPdf        [[buffer(8)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2336,6 +2356,7 @@ kernel void wf_shade_glass(
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0xA5A5A5A5u;
                         rayState[slot]           = forkStatePacked;
+                        lastBsdfPdf[slot]        = -1.0f;
                         lambdas[slot]            = float4(lams.y, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.y, 0.0f, 0.0f, 0.0f);
                     }
@@ -2351,6 +2372,7 @@ kernel void wf_shade_glass(
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0x5A5A5A5Au;
                         rayState[slot]           = forkStatePacked;
+                        lastBsdfPdf[slot]        = -1.0f;
                         lambdas[slot]            = float4(lams.z, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.z, 0.0f, 0.0f, 0.0f);
                     }
@@ -2366,6 +2388,7 @@ kernel void wf_shade_glass(
                         pixelIdx[slot]           = parentPixel;
                         rngState[slot]           = seed ^ 0x3C3C3C3Cu;
                         rayState[slot]           = forkStatePacked;
+                        lastBsdfPdf[slot]        = -1.0f;
                         lambdas[slot]            = float4(lams.w, 0.0f, 0.0f, 0.0f);
                         spectralThroughput[slot] = float4(spThru.w, 0.0f, 0.0f, 0.0f);
                     }
@@ -2404,6 +2427,10 @@ kernel void wf_shade_glass(
     dir[gid]         = b.dir;
     rngState[gid]    = seed;
     rayState[gid]    = statePack(depth, alive_after);
+    // Glass refraction and reflection are both delta-distributed.
+    // Sentinel -1 bypasses BSDF-MIS at the next emissive hit, same
+    // convention as mirror.
+    lastBsdfPdf[gid] = -1.0f;
 }
 
 // ---- Diffuse: cosine-weighted hemisphere + NEE direct lighting -----
@@ -2427,6 +2454,7 @@ kernel void wf_shade_diffuse(
     device packed_float3                       *color              [[buffer(4)]],
     device uint                                *rngState           [[buffer(6)]],
     device uint                                *rayState           [[buffer(7)]],
+    device float                               *lastBsdfPdf        [[buffer(8)]],
     device const int                           *matIdx             [[buffer(9)]],
     device const packed_float3                 *hit                [[buffer(10)]],
     device const packed_float3                 *normalIn           [[buffer(11)]],
@@ -2582,6 +2610,14 @@ kernel void wf_shade_diffuse(
     dir[gid]         = newDir;
     rngState[gid]    = seed;
     rayState[gid]    = statePack(depth, alive_after);
+    // Cosine-weighted hemisphere sample's pdf is cosTheta / PI,
+    // where cosTheta = dot(newDir, N). Stored so the NEXT bounce's
+    // wf_shade_emissive can weight any emission against what light-
+    // sampling would have produced at the diffuse hit. The clamp
+    // ensures we never store a zero pdf which would make the MIS
+    // weight ratio undefined.
+    float cosThetaOut = max(dot(newDir, N), 1e-6f);
+    lastBsdfPdf[gid] = cosThetaOut / PI;
 }
 
 // ============================================================
@@ -2992,9 +3028,23 @@ namespace
         id<MTLBuffer> rngState;     // uint
         // Packed bounceDepth (low 8 bits) + alive (bit 8). See
         // kRayStateAliveBit / kRayStateDepthMask in the MSL kernel.
-        // One slot instead of two, freeing slot 8 for future per-ray
-        // state additions (e.g., lastBsdfPdf for BSDF-side MIS).
+        // One slot instead of two, freeing slot 8 for lastBsdfPdf
+        // (the BSDF-side MIS state carried across bounces).
         id<MTLBuffer> rayState;     // uint
+
+        // BSDF-side MIS state. The BSDF pdf the LAST bounce sampled
+        // its outgoing direction with, used by wf_shade_emissive to
+        // weight the Le contribution against what light sampling
+        // would have produced at the same point. Sentinel encoding:
+        //   -1.0f  : primary ray or just-came-from-specular -> bypass
+        //            MIS (the BSDF was either non-existent or
+        //            delta-distributed; light-side pdf doesn't apply)
+        //   >= 0   : pdf value (cosTheta/PI for the existing cosine-
+        //            weighted hemisphere sample in wf_shade_diffuse)
+        // Allocated unconditionally because the SoA stride must match
+        // ray slot indexing in every kernel. ~4 bytes/ray = 33 MB at
+        // 8K-square ray count, well within unified memory budgets.
+        id<MTLBuffer> lastBsdfPdf;  // float
 
         // Transient hit info (overwritten by intersect each bounce).
         id<MTLBuffer> matIdx;       // int
@@ -3104,6 +3154,7 @@ namespace
         wf.pixelIdx    = alloc(uintBytes);
         wf.rngState    = alloc(uintBytes);
         wf.rayState    = alloc(uintBytes);
+        wf.lastBsdfPdf = alloc(uintBytes);  // float, same size as uint
         wf.matIdx      = alloc(intBytes);
         wf.hit         = alloc(packedF3Bytes);
         wf.normal      = alloc(packedF3Bytes);
@@ -3141,7 +3192,7 @@ namespace
         wf.perPixelAccum = alloc(pixelCount * 3 * sizeof(uint32_t));
 
         wf.valid = (wf.origin && wf.dir && wf.throughput && wf.color &&
-                    wf.pixelIdx && wf.rngState && wf.rayState &&
+                    wf.pixelIdx && wf.rngState && wf.rayState && wf.lastBsdfPdf &&
                     wf.matIdx && wf.hit && wf.normal &&
                     wf.queueDiffuse && wf.queueMirror &&
                     wf.queueGlass && wf.queueEmissive &&
@@ -4212,6 +4263,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 [enc setBuffer:wfBufs.pixelIdx    offset:0 atIndex:5];
                 [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
                 [enc setBuffer:wfBufs.rayState    offset:0 atIndex:7];
+                [enc setBuffer:wfBufs.lastBsdfPdf offset:0 atIndex:8];
                 [enc setBuffer:wfBufs.pixelWelford       offset:0 atIndex:26];
                 [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
                 [enc setBuffer:wfBufs.spectralThroughput offset:0 atIndex:28];
@@ -4294,6 +4346,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                         [enc setBuffer:wfBufs.color   offset:0 atIndex:4];
                     [enc setBuffer:wfBufs.rngState    offset:0 atIndex:6];
                     [enc setBuffer:wfBufs.rayState    offset:0 atIndex:7];
+                    [enc setBuffer:wfBufs.lastBsdfPdf offset:0 atIndex:8];
                     [enc setBuffer:wfBufs.matIdx      offset:0 atIndex:9];
                     [enc setBuffer:wfBufs.hit         offset:0 atIndex:10];
                     [enc setBuffer:wfBufs.normal      offset:0 atIndex:11];
