@@ -32,37 +32,30 @@ Next perf session. Sized correctly this is the highest-impact Mac wavefront perf
 - MetalRenderer.mm:1836 (wf_compact_by_material; needs a sibling kernel right after it)
 - MetalRenderer.mm:3334 (shading pipeline build sites; the indirect dispatch use mirrors the existing dispatch call shape)
 
-## BSDF-side MIS (light + BSDF balance heuristic)
+## BSDF-side MIS in CPU + OpenGL + Metal megakernel
 
-**Status:** not started. The current MIS is light-side only -- the existing `--mis` flag adds `pdfLight^2 / (pdfLight^2 + pdfBrdf^2)` weighting to direct-light contributions but does not symmetrically weight emissive returns from indirect bounces. Project-knowledge.md calls this out explicitly: "would require restructuring the recursion to track 'we just sampled via BRDF, and hit a light'". Adding the BSDF side closes the variance-reduction gap.
+**Status:** wavefront shipped. The wavefront path now ships the full
+balance heuristic (commits c151d0f / 885f17b / 6bcf433 on the mac branch).
+CPU and OpenGL and Metal megakernel are still light-side-only.
 
 ### Why deferred
 
-Touches all four backends (CPU, OpenGL, Metal megakernel, Metal wavefront) and the recursion/iteration structure of each. CPU is recursive `castRay`/`castRaySpectral`; OpenGL/Metal megakernel use iterative bounce loops with explicit state; Metal wavefront tracks state in SoA buffers per ray. Each implementation needs an additional `lastBsdfPdf` carried across bounces, plus an emissive-hit weighting branch on the indirect return path. Risk of variance spikes if the pdf bookkeeping is wrong on first-bounce emissive hits or post-specular paths (where pdf = delta).
+Only wavefront sees production use on Mac per the v1.5.0 A/B (~25%
+faster than megakernel at cornell-class). CPU is for CI tests, OpenGL
+is Win/Linux dev only. Bringing them to parity is consistency work,
+not perf-impact work.
 
 ### Implementation outline
 
-1. Per-bounce state: `float lastBsdfPdf` initialized to `+infinity` (treated as "primary ray, no BSDF sampled yet" -> light-side weight collapses to 1, BSDF-side to 0, matching current direct-light-only behavior on primary hits).
-2. After cosine-weighted hemisphere sample for indirect, update `lastBsdfPdf = cosTheta / PI`.
-3. After specular bounce (mirror, glass-refraction), set `lastBsdfPdf = +infinity` so the next emissive hit gets the BSDF-side weight = 1 -- specular paths effectively bypass MIS because the BSDF is delta-distributed.
-4. At an emissive hit during indirect: compute `pdfLight = dist^2 / (cosLightOut * totalLightArea)`, weight the emissive contribution by `pdfBsdf^2 / (pdfBsdf^2 + pdfLight^2)`. Add to radiance the weighted contribution alongside the existing primary-or-current-hit emissive accumulation.
-5. Behind a `useBsdfMis` flag (Settings + JobConfig + CLI `--mis-bsdf` + GUI checkbox below the existing MIS checkbox, grayed out when MIS is off).
-6. PNG metadata: `BsdfMIS: 0|1`. Only meaningful when `MIS: 1`.
+- CPU `castRay` (Renderer.cpp): track `lastBsdfPdf` as a parameter
+  through recursion; weight emissive return paths.
+- OpenGL GLSL `tracePath` and `tracePathSpectral`: carry one extra
+  local across the iterative bounce loop.
+- Metal megakernel `tracePath` / `tracePathSpectral` / `tracePathSpectralSingle`:
+  same pattern as OpenGL.
 
-### Implementation locations
-
-- CPU `castRay` (Renderer.cpp): track `lastBsdfPdf` as a parameter through recursion; weight emissive return paths.
-- OpenGL GLSL `tracePath` (lines ~700-810 in OpenglRenderer.cpp) and `tracePathSpectral` (~919-1010). Both already iterate, so just carry an extra local.
-- Metal megakernel `tracePath` (lines ~700-790), `tracePathSpectral` (~915-1010), `tracePathSpectralSingle` (~800-905). Same pattern.
-- Metal wavefront: add a `lastBsdfPdf` SoA buffer to the ray state (one more buffer index, may need to repack to stay under Metal's 31-buffer limit). Each shading kernel writes it after its sampling step. wf_shade_emissive reads it at the start to compute the BSDF-MIS weight on incoming throughput.
-
-### Risk
-
-High. BSDF-side MIS is famously easy to get wrong. Specular paths and primary rays are the two edge cases. Validation: A/B `cornell` (RGB) and `cornell-spec` (spectral) at fixed seed and matched sample count, expect lower variance in the cream-wall-with-small-light region. Compare against a pbrt reference if available.
-
-### When to revisit
-
-After indirect dispatch lands and proves out. BSDF-side MIS is the next biggest variance-reduction win for the spectral wavefront default path.
+The wavefront version (see code/Gpu/Metal/MetalRenderer.mm wf_shade_emissive
+around the `w_bsdf` computation) is the working reference.
 
 ## OIDN buffer-access bug (denoising silently disabled on Apple Silicon)
 
