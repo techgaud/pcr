@@ -4416,9 +4416,13 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 };
                 // Diffuse needs the full scene (for NEE shadow rays) and
                 // the color buffer (writes direct-lighting contribution).
-                // Mirror / glass don't accumulate light to color (delta
-                // BSDFs). Emissive writes to color but doesn't need
-                // scene geometry.
+                // Mirror never touches color. Glass writes color only in
+                // spectralFork mode, where it zero-initializes the color
+                // slot for each newly-claimed fork sub-ray; that write is
+                // load-bearing because the writeback scatter kernel later
+                // reads color[forkSlot] and stale values produce
+                // accumulating brightness at scale. Emissive writes to
+                // color but doesn't need scene geometry.
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
                               0 * sizeof(uint32_t), /*fullScene=*/true,
                               /*needsColor=*/true);
@@ -4427,7 +4431,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                               /*needsColor=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
                               2 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/false);
+                              /*needsColor=*/spectralForkActive);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
                               3 * sizeof(uint32_t), /*fullScene=*/false,
                               /*needsColor=*/true);
