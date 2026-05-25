@@ -129,6 +129,13 @@ private:
     unsigned _bvhSSBO = 0;
     unsigned _lightSSBO = 0;
     unsigned _lightTriSSBO = 0;
+    // Caustic photon-map SSBOs. Rebuilt every render() when
+    // useCausticPhotonMap is on (the photon shoot lives on the host
+    // and re-runs per render so scene + light changes are picked up).
+    // Bound to dummy 1-element buffers when off so the shader's
+    // SSBO declarations always resolve.
+    unsigned _photonSSBO     = 0;
+    unsigned _photonCellSSBO = 0;
     bool _initialized = false;
 
     bool initGL();

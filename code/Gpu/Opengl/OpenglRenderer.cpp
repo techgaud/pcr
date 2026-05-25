@@ -41,6 +41,9 @@
 #include "Includes/Denoise.h"
 #include "Includes/OidnDenoise.h"
 #include "Includes/ToneMap.h"
+#include "Photon/PhotonMap.h"
+#include "Photon/PhotonShoot.h"
+#include "Photon/GpuFlatten.h"
 
 #include <cmath>
 
@@ -239,6 +242,20 @@ uniform int   uUseSpectral;   // 0 = RGB path tracer, 1 = hero-wavelength spectr
 uniform int   uHeroSamples;   // 4 = hero default; 1 = single-wavelength legacy
 uniform int   uUseCieCmf;     // 0 = Wyman 2013, 1 = CIE 1931 tabulated 2-deg observer
 
+// Caustic photon-map controls. Mirror the Metal Uniforms fields with
+// the same semantics; see code/Photon/PhotonMap.h for the algorithm.
+//   uUseCausticPhotonMap : 0 = density estimate skipped (SSBOs may still
+//                          be bound to dummies, never read).
+//                          1 = enabled.
+//   uPhotonCellTableMask : (tableSize - 1) for the open-addressed cell
+//                          hash table; tableSize is a power of two so
+//                          the shader can mask instead of mod.
+//   uPhotonRadius        : kernel search radius in scene units (also
+//                          the hash-grid cell size).
+uniform int   uUseCausticPhotonMap;
+uniform int   uPhotonCellTableMask;
+uniform float uPhotonRadius;
+
 const float PI = 3.14159265358979323846;
 
 struct GpuSphere {
@@ -345,6 +362,105 @@ layout(std430, binding = 4) buffer Triangles      { GpuTriangle      triangles[]
 layout(std430, binding = 5) buffer BvhNodes       { GpuBvhNode       bvhNodes[];       };
 layout(std430, binding = 6) buffer Lights         { GpuLight         lights[];         };
 layout(std430, binding = 7) buffer LightTriangles { GpuLightTriangle lightTriangles[]; };
+
+// Caustic photon-map SSBOs. Photon records (36 B) and the open-
+// addressed cell table (12 B). Three things matter for the layout
+// match against the host PCRPhoton / Photon::GpuRecord POD:
+//
+// 1. std430's vec3 has 16-byte alignment, NOT 12, so the obvious
+//    `struct Photon { vec3 position; vec3 wi; vec3 power; }` would
+//    occupy 48 bytes (12 data + 4 pad, per field). Bigger than the
+//    36-byte host POD; SSBO reads would misalign.
+// 2. std430's float arrays have 4-byte alignment per element with no
+//    padding (unlike std140), so `float position[3]` occupies a
+//    contiguous 12 bytes - matching the host's `float position[3]`.
+// 3. Three `float[3]` fields in a row total 36 bytes with no
+//    inter-field padding (struct alignment = max member alignment =
+//    4). Identical to the host POD and the MSL packed_float3 trio.
+//
+// Bracket-indexed access (`p.position[0]`) is slightly more verbose
+// than swizzle access (`p.position.x`) but it's the right tradeoff
+// for cross-backend layout parity. We convert to vec3 once at the
+// top of the inner loop and operate on the vec3 from there.
+struct Photon {
+    float position[3];
+    float wi[3];
+    float power[3];
+};
+struct PhotonCell {
+    uint cellHash;
+    uint offset;
+    uint count;
+};
+layout(std430, binding = 8) buffer Photons     { Photon     photons[];     };
+layout(std430, binding = 9) buffer PhotonCells { PhotonCell photonCells[]; };
+
+const uint kPhotonEmptyCell = 0xFFFFFFFFu;
+
+// Teschner 2003 spatial hash. Mirrors Photon::Map::cellHash and the
+// MSL photonCellHash so the host build, the Metal kernel, and the
+// OpenGL kernel all bucket identical cell coords into the same hash.
+uint photonCellHash(int cx, int cy, int cz) {
+    return uint(cx) * 73856093u
+         ^ uint(cy) * 19349663u
+         ^ uint(cz) * 83492791u;
+}
+
+// Caustic density estimate at a diffuse hit point x with outward
+// normal N and Lambertian reflectance albedo. Same Jensen 1996
+// formulation as the CPU + Metal paths; the only difference is the
+// SSBO accessor syntax.
+//
+// L_o = (albedo / pi) * (1 / (pi r^2)) * sum_p Phi_p
+// over photons p within radius r of x whose travel direction wi
+// strikes the surface front (wi.N < 0).
+vec3 photonDensityEstimate(vec3 x, vec3 N, vec3 albedo) {
+    if (uUseCausticPhotonMap == 0) return vec3(0.0);
+    float r = uPhotonRadius;
+    if (r <= 0.0) return vec3(0.0);
+    float r2 = r * r;
+    float invR = 1.0 / r;
+    uint  mask = uint(uPhotonCellTableMask);
+
+    int cx = int(floor(x.x * invR));
+    int cy = int(floor(x.y * invR));
+    int cz = int(floor(x.z * invR));
+
+    vec3 sumPower = vec3(0.0);
+    for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        // Linear probe. Load factor <=0.5 on the host build, so most
+        // queries either match or hit empty on the first slot. Bounded
+        // to 8 probes to keep pathological collisions from stalling
+        // the kernel.
+        for (int probe = 0; probe < 8; probe++) {
+            PhotonCell cell = photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0u; i < cell.count; i++) {
+                    Photon ph = photons[cell.offset + i];
+                    vec3 pos = vec3(ph.position[0], ph.position[1], ph.position[2]);
+                    vec3 wi  = vec3(ph.wi[0],       ph.wi[1],       ph.wi[2]);
+                    vec3 pw  = vec3(ph.power[0],    ph.power[1],    ph.power[2]);
+                    vec3 d = pos - x;
+                    float dist2 = dot(d, d);
+                    if (dist2 > r2) continue;
+                    if (dot(wi, N) >= 0.0) continue;
+                    sumPower += pw;
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }}}
+
+    float invArea = 1.0 / (PI * r2);
+    float invPi   = 1.0 / PI;
+    return albedo * invPi * sumPower * invArea;
+}
 
 // Spectral helpers, used only when uUseSpectral != 0. Mirror the
 // CPU-side Spectrum / CIE / RGBToSpectrum modules, but cheaper to
@@ -959,6 +1075,13 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
             directLo /= float(uShadowSamples);
         }
         radiance += throughput * directLo;
+
+        // Caustic photon-map contribution. Same per-bounce-throughput
+        // convention as directLo; the density estimate already folds
+        // albedo / PI in. Gated inside photonDensityEstimate on
+        // uUseCausticPhotonMap so an off-mode render pays just a uint
+        // compare and a branch.
+        radiance += throughput * photonDensityEstimate(hit, N, mat.albedo.rgb);
 
         // Russian roulette: at bounce >= 1, terminate with prob (1 - p) where
         // p reflects surface reflectance. Survivors get scaled to compensate.
@@ -1724,6 +1847,12 @@ bool OpenglRenderer::initGL()
     glGenBuffers(1, &_bvhSSBO);
     glGenBuffers(1, &_lightSSBO);
     glGenBuffers(1, &_lightTriSSBO);
+    // Photon-map SSBOs always allocated; render() re-uploads either
+    // the real table or a 1-element dummy each frame depending on the
+    // photon-map flag. Keeps the bindBufferBase calls below
+    // unconditional.
+    glGenBuffers(1, &_photonSSBO);
+    glGenBuffers(1, &_photonCellSSBO);
 
     _initialized = true;
     return true;
@@ -1992,10 +2121,18 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
 {
     lastOutputPath.clear();
 
-    if (useCausticPhotonMap)
+    // Caustic photon-map pre-pass. Spectral mode skips (density estimate
+    // is RGB-only for now; spectral support is a separate session).
+    // Otherwise we shoot photons on the host (reuses the shared
+    // Photon::shootCaustic and the Photon::buildGpuTable helpers; the
+    // Metal backend uses the same path).
+    bool effectivePhotonMap = useCausticPhotonMap;
+    if (effectivePhotonMap && useSpectral)
     {
-        std::cerr << "warning: --photon-map is CPU-only in this release; "
-                     "ignored on the OpenGL backend.\n";
+        std::cerr << "warning: --photon-map disabled in --spectral mode "
+                     "(RGB-only density estimate; spectral support is "
+                     "a later session).\n";
+        effectivePhotonMap = false;
     }
 
     if (!_sharedContext)
@@ -2022,6 +2159,61 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     float totalLightArea = 0.f;
     uploadScene(scene, totalLightArea);
 
+    // Build + upload the caustic photon table. Same shared code path
+    // the Metal backend uses (Photon::shootCaustic + Photon::buildGpuTable).
+    // The SSBOs always get uploaded - either real data when the flag
+    // is on and the build succeeded, or a 1-element dummy when off /
+    // failed - so the SSBO bindings below resolve unconditionally.
+    int   photonTableMask = 0;
+    bool  photonMapActive = false;
+    if (effectivePhotonMap)
+    {
+        uint64_t photonSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        Photon::Map cpuMap = Photon::shootCaustic(scene, photonCount,
+                                                   photonRadius, _maxDepth,
+                                                   photonSeed);
+        Photon::GpuTable gpuTable;
+        if (Photon::buildGpuTable(cpuMap, gpuTable))
+        {
+            photonTableMask = (int)gpuTable.tableMask;
+            photonMapActive = true;
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, _photonSSBO);
+            glBufferData(GL_SHADER_STORAGE_BUFFER,
+                         (GLsizeiptr)(gpuTable.records.size() * sizeof(Photon::GpuRecord)),
+                         gpuTable.records.data(), GL_DYNAMIC_DRAW);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, _photonCellSSBO);
+            glBufferData(GL_SHADER_STORAGE_BUFFER,
+                         (GLsizeiptr)(gpuTable.cells.size() * sizeof(Photon::GpuCell)),
+                         gpuTable.cells.data(), GL_DYNAMIC_DRAW);
+            std::cout << "OpenglRenderer: photon table uploaded ("
+                      << gpuTable.records.size() << " photons, "
+                      << gpuTable.cells.size() << " cells, mask=0x"
+                      << std::hex << gpuTable.tableMask << std::dec
+                      << ")" << std::endl;
+        }
+        else
+        {
+            std::cerr << "OpenglRenderer: photon shoot deposited zero photons "
+                         "(scene has no specular surfaces?); running without "
+                         "caustic density estimate.\n";
+        }
+    }
+    if (!photonMapActive)
+    {
+        // 1-element dummies so the SSBO binding always resolves and
+        // photons[0] / photonCells[0] are valid reads even when the
+        // shader's gate is open by mistake. The cell is initialized
+        // to the empty-slot sentinel so any accidental probe through
+        // it short-circuits immediately.
+        Photon::GpuRecord dummyRec{};
+        Photon::GpuCell   dummyCell{Photon::kEmptyCell, 0u, 0u};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _photonSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(dummyRec), &dummyRec, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _photonCellSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(dummyCell), &dummyCell, GL_DYNAMIC_DRAW);
+    }
+
     glUseProgram(_program);
 
     // Bind output + aux images. uOutput at binding 0 always; uAlbedoOut /
@@ -2039,6 +2231,8 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, _bvhSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, _lightSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, _lightTriSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, _photonSSBO);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, _photonCellSSBO);
 
     // Set uniforms
     auto setI = [&](const char *name, int v) {
@@ -2098,6 +2292,9 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     setI("uStrata",         useStratified
                             ? std::max(1, (int)std::round(std::sqrt((float)_samples)))
                             : 0);
+    setI("uUseCausticPhotonMap",  photonMapActive ? 1 : 0);
+    setI("uPhotonCellTableMask",  photonTableMask);
+    setF("uPhotonRadius",         photonRadius);
 
     // Dispatch in 2D tiles so we stay well under any GPU TDR (Timeout
     // Detection and Recovery) window. Windows defaults to a 2-second TDR;
@@ -2430,6 +2627,11 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // so they live in the PNG metadata only.
     if (useACES)
         filename += "-aces";
+    // Filename tag only when the photon map actually ran (built non-
+    // empty, RGB mode). Matches the PNG metadata gate below so the two
+    // stay self-consistent.
+    if (photonMapActive)
+        filename += "-photon";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -2468,6 +2670,12 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         addText("HeroSamples", std::to_string(std::clamp(heroSamples, 1, 4)));
     if (useSpectral)
         addText("CMF", useCieCmf ? "cie" : "wyman");
+    if (photonMapActive)
+    {
+        addText("PhotonMap",    "1");
+        addText("PhotonCount",  std::to_string(photonCount));
+        addText("PhotonRadius", std::to_string(photonRadius));
+    }
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -2497,5 +2705,7 @@ void OpenglRenderer::destroyGL()
     if (_sphereSSBO)   { glDeleteBuffers(1, &_sphereSSBO);   _sphereSSBO = 0; }
     if (_planeSSBO)    { glDeleteBuffers(1, &_planeSSBO);    _planeSSBO = 0; }
     if (_materialSSBO) { glDeleteBuffers(1, &_materialSSBO); _materialSSBO = 0; }
+    if (_photonSSBO)     { glDeleteBuffers(1, &_photonSSBO);     _photonSSBO = 0; }
+    if (_photonCellSSBO) { glDeleteBuffers(1, &_photonCellSSBO); _photonCellSSBO = 0; }
     _initialized = false;
 }

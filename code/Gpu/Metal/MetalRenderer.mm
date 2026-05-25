@@ -57,6 +57,7 @@
 #include "Includes/RGBToSpectrum.h"
 #include "../../Photon/PhotonMap.h"
 #include "../../Photon/PhotonShoot.h"
+#include "../../Photon/GpuFlatten.h"
 
 namespace fs = std::filesystem;
 
@@ -3184,120 +3185,16 @@ namespace
                   "PCRWelfordState must be 48 bytes to match the MSL Welford struct");
 
     // ---------- Caustic photon-map host PODs ------------------------------
-    // Byte-equivalent to the MSL PCRPhoton / PCRPhotonCell structs above.
-    // Host fills these vectors then ships them to the GPU via
-    // newBufferWithBytes; the kernel reinterprets through the MSL struct
-    // layout.
-
-    struct PCRPhoton
-    {
-        float position[3];
-        float wi[3];
-        float power[3];
-    };
-    static_assert(sizeof(PCRPhoton) == 36,
-                  "PCRPhoton must be 36 bytes (packed_float3 x 3) to match the MSL Photon struct");
-
-    struct PCRPhotonCell
-    {
-        uint32_t cellHash;  // 0xFFFFFFFF = empty
-        uint32_t offset;
-        uint32_t count;
-    };
-    static_assert(sizeof(PCRPhotonCell) == 12,
-                  "PCRPhotonCell must be 12 bytes to match the MSL PhotonCell struct");
-
-    // Same Teschner-2003 hash the MSL photonCellHash uses. Host and GPU
-    // MUST compute identical hashes for identical cell coords so the GPU
-    // table lookup finds the cells the host placed.
-    inline uint32_t pcrPhotonCellHash32(int cx, int cy, int cz)
-    {
-        return uint32_t(cx) * 73856093u
-             ^ uint32_t(cy) * 19349663u
-             ^ uint32_t(cz) * 83492791u;
-    }
-
-    // Flatten a CPU Photon::Map into GPU-ready arrays. Produces:
-    //   - photons sorted-by-cell (a contiguous span per cell so the
-    //     kernel can read `count` photons starting at `offset`)
-    //   - cells: open-addressed hash table with power-of-two size,
-    //     load factor <= 0.5, linear probing on collision.
-    // Returns false (and clears outputs) when the input map is empty;
-    // caller should treat that as "photon mapping is effectively off
-    // this render" and bind dummy buffers.
-    struct PCRPhotonGpuTable
-    {
-        std::vector<PCRPhoton>     photons;
-        std::vector<PCRPhotonCell> cells;
-        uint32_t                   tableMask = 0;  // tableSize - 1
-    };
-
+    // The host PODs + builder live in code/Photon/GpuFlatten.h so the
+    // Metal and OpenGL backends share one source of truth. We pull the
+    // types into this anon namespace under their old PCR* names so the
+    // call sites below don't churn.
+    using PCRPhoton         = Photon::GpuRecord;
+    using PCRPhotonCell     = Photon::GpuCell;
+    using PCRPhotonGpuTable = Photon::GpuTable;
     inline bool buildPhotonGpuTable(const Photon::Map &map, PCRPhotonGpuTable &out)
     {
-        out.photons.clear();
-        out.cells.clear();
-        out.tableMask = 0;
-
-        const auto &records = map.records();
-        if (records.empty()) return false;
-
-        const float invR = 1.0f / map.radius();
-
-        // First pass: re-bucket by 32-bit cell hash. The host
-        // Photon::Map keys its private grid by 64-bit hash; the GPU
-        // table uses 32-bit (matching the MSL kernel). The two may
-        // disagree on bucketing (two 64-bit hashes can fold to the
-        // same 32-bit hash), which is fine - it just merges buckets.
-        std::unordered_map<uint32_t, std::vector<uint32_t>> by32;
-        by32.reserve(records.size() / 4);
-        for (size_t i = 0; i < records.size(); i++)
-        {
-            const auto &r = records[i];
-            int cx = (int)std::floor(r.position[0] * invR);
-            int cy = (int)std::floor(r.position[1] * invR);
-            int cz = (int)std::floor(r.position[2] * invR);
-            uint32_t h = pcrPhotonCellHash32(cx, cy, cz);
-            by32[h].push_back((uint32_t)i);
-        }
-
-        // Round table size up to next power of two with load factor 0.5.
-        uint32_t targetSlots = (uint32_t)by32.size() * 2u;
-        uint32_t tableSize = 16u;
-        while (tableSize < targetSlots) tableSize <<= 1;
-        out.tableMask = tableSize - 1u;
-
-        out.cells.assign(tableSize, PCRPhotonCell{0xFFFFFFFFu, 0u, 0u});
-        out.photons.reserve(records.size());
-
-        // Insert each bucket: copy photons into the flat sorted-by-
-        // cell array; record (cellHash, offset, count) in the table
-        // via linear probing.
-        for (auto &kv : by32)
-        {
-            uint32_t h = kv.first;
-            uint32_t slot = h & out.tableMask;
-            // Open addressing. With load factor <=0.5 the expected
-            // probe is 1.x; bounded loop count guards against insert
-            // pathology that shouldn't happen but would otherwise
-            // blow the build sky-high.
-            for (uint32_t step = 0; step < tableSize; step++)
-            {
-                if (out.cells[slot].cellHash == 0xFFFFFFFFu) break;
-                slot = (slot + 1u) & out.tableMask;
-            }
-            uint32_t startOffset = (uint32_t)out.photons.size();
-            for (uint32_t idx : kv.second)
-            {
-                const auto &r = records[idx];
-                PCRPhoton p;
-                p.position[0] = r.position[0]; p.position[1] = r.position[1]; p.position[2] = r.position[2];
-                p.wi[0]       = r.wi[0];       p.wi[1]       = r.wi[1];       p.wi[2]       = r.wi[2];
-                p.power[0]    = r.power[0];    p.power[1]    = r.power[1];    p.power[2]    = r.power[2];
-                out.photons.push_back(p);
-            }
-            out.cells[slot] = PCRPhotonCell{ h, startOffset, (uint32_t)kv.second.size() };
-        }
-        return true;
+        return Photon::buildGpuTable(map, out);
     }
 
     // ---------- Wavefront ray-state SoA buffers --------------------------
@@ -4316,8 +4213,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         if (buildPhotonGpuTable(cpuMap, gpuTable))
         {
             photonsBuf = [_impl->device
-                newBufferWithBytes:gpuTable.photons.data()
-                            length:gpuTable.photons.size() * sizeof(PCRPhoton)
+                newBufferWithBytes:gpuTable.records.data()
+                            length:gpuTable.records.size() * sizeof(PCRPhoton)
                            options:MTLResourceStorageModeShared];
             cellsBuf = [_impl->device
                 newBufferWithBytes:gpuTable.cells.data()
@@ -4328,7 +4225,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 uBase.useCausticPhotonMap = 1;
                 uBase.photonCellTableMask = (int)gpuTable.tableMask;
                 std::cout << "MetalRenderer: photon table uploaded ("
-                          << gpuTable.photons.size() << " photons, "
+                          << gpuTable.records.size() << " photons, "
                           << gpuTable.cells.size() << " cells, mask=0x"
                           << std::hex << gpuTable.tableMask << std::dec
                           << ")" << std::endl;
