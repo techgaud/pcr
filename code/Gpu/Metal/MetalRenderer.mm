@@ -2657,6 +2657,8 @@ kernel void wf_shade_diffuse(
     device const GpuBvhNode                    *bvhNodes           [[buffer(16)]],
     device const GpuLight                      *lights             [[buffer(17)]],
     device const GpuLightTriangle              *lightTris          [[buffer(18)]],
+    device const PCRPhoton                     *photons            [[buffer(19)]],
+    device const PCRPhotonCell                 *photonCells        [[buffer(20)]],
     device const uint                          *queue              [[buffer(24)]],
     constant uint                              &queueLen           [[buffer(25)]],
     device const float4                        *lambdas            [[buffer(27)]],
@@ -2676,11 +2678,12 @@ kernel void wf_shade_diffuse(
     int mi = matIdx[gid];
     uint seed = rngState[gid];
 
-    // Photon fields nullptr in wavefront. Session 3 will wire the
-    // caustic density estimate into this kernel and start binding
-    // the real photon buffers.
+    // Photon buffers come in at slots 19 / 20 (session 3). Host binds
+    // them via encodeShading(needsPhotons=true) for wf_shade_diffuse;
+    // photonDensityEstimate below gates on u.useCausticPhotonMap so an
+    // off-mode render pays a single uint compare and a branch.
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris, nullptr, nullptr };
+                lights, lightTris, photons, photonCells };
 
     // Cached per-wavelength albedo for spectral mode. Used for both
     // NEE BSDF terms and the indirect throughput update so we only
@@ -2769,6 +2772,17 @@ kernel void wf_shade_diffuse(
         color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, specRad, u.useCieCmf);
     } else {
         color[gid] = float3(color[gid]) + t * directLoRGB;
+    }
+
+    // Caustic photon-map density estimate. Skipped in spectral mode
+    // (the density estimate is RGB-power-based; spectral support is
+    // a later pass). The density estimate function itself short-
+    // circuits when u.useCausticPhotonMap is 0, so an off-mode RGB
+    // render pays just a couple of branches.
+    if (u.useSpectral == 0) {
+        color[gid] = float3(color[gid])
+                   + t * photonDensityEstimate(S, S.photons, S.photonCells,
+                                                h, N, albedo);
     }
 
     // Russian roulette: same conditions as megakernel (after bounce 0).
@@ -4285,14 +4299,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // is satisfied regardless of mode (we hit a bug last week
     // (commit 4a970dc) where an unset kernel binding silently
     // corrupted output at scale; same lesson applies here).
-    if (effectivePhotonMap && effectiveWavefront)
-    {
-        std::cerr << "warning: --photon-map disabled in wavefront mode "
-                     "for now (session 3 will wire the density estimate "
-                     "into wf_shade_diffuse); running without caustic "
-                     "density estimate.\n";
-        effectivePhotonMap = false;
-    }
+    // Wavefront now supports the density estimate (session 3 wired
+    // it into wf_shade_diffuse). The photon-map build below is the
+    // same path used by the megakernel; only the dispatch-side
+    // binding differs.
     id<MTLBuffer> photonsBuf = nil;
     id<MTLBuffer> cellsBuf   = nil;
     if (effectivePhotonMap)
@@ -4762,7 +4772,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                                          id<MTLBuffer> queueBuf,
                                          NSUInteger counterOffset,
                                          bool needsFullScene,
-                                         bool needsColor) {
+                                         bool needsColor,
+                                         bool needsPhotons) {
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:pipeline];
                     [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
@@ -4787,6 +4798,16 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                         [enc setBuffer:_impl->lightBuf    offset:0 atIndex:17];
                         [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:18];
                     }
+                    if (needsPhotons)
+                    {
+                        // Slots 19 / 20 carry the photon table to
+                        // wf_shade_diffuse. Only that kernel declares them
+                        // as parameters; binding them on the other shading
+                        // kernels would trip API validation (unused
+                        // binding) so we gate per-dispatch like needsColor.
+                        [enc setBuffer:photonsBuf offset:0 atIndex:19];
+                        [enc setBuffer:cellsBuf   offset:0 atIndex:20];
+                    }
                     [enc setBuffer:queueBuf            offset:0 atIndex:24];
                     [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
                     [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
@@ -4801,6 +4822,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 };
                 // Diffuse needs the full scene (for NEE shadow rays) and
                 // the color buffer (writes direct-lighting contribution).
+                // It also queries the photon map at every shaded ray,
+                // so the photon buffers are bound here at slots 19/20.
                 // Mirror never touches color. Glass writes color only in
                 // spectralFork mode, where it zero-initializes the color
                 // slot for each newly-claimed fork sub-ray; that write is
@@ -4810,16 +4833,17 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 // color but doesn't need scene geometry.
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
                               0 * sizeof(uint32_t), /*fullScene=*/true,
-                              /*needsColor=*/true);
+                              /*needsColor=*/true,  /*needsPhotons=*/true);
                 encodeShading(_impl->pipelineWfShadeMirror,   wfBufs.queueMirror,
                               1 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/false);
+                              /*needsColor=*/false, /*needsPhotons=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
                               2 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/spectralForkActive);
+                              /*needsColor=*/spectralForkActive,
+                              /*needsPhotons=*/false);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
                               3 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/true);
+                              /*needsColor=*/true,  /*needsPhotons=*/false);
             }
 
             // ---- Fork-scatter (spectralFork mode only) ----
