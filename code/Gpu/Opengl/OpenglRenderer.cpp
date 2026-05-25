@@ -2134,12 +2134,12 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
                      "a later session).\n";
         effectivePhotonMap = false;
     }
-    if (useCausticPhotonProgressive && effectivePhotonMap)
-    {
-        std::cerr << "warning: --photon-progressive is CPU-only in this "
-                     "release; the OpenGL backend runs a single classical "
-                     "pass and ignores --photon-passes.\n";
-    }
+    // Progressive photon mapping: wrap the photon-shoot + dispatch +
+    // readback block in an outer loop; accumulate HDR per pass on the
+    // host; OIDN / tone-map / PNG runs once on the averaged result.
+    // Spectral and "no photon map" cases collapse to numProgPasses=1.
+    bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
+    int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
 
     if (!_sharedContext)
     {
@@ -2165,6 +2165,28 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     float totalLightArea = 0.f;
     uploadScene(scene, totalLightArea);
 
+    // Progressive accumulator. In non-progressive mode it stays
+    // unused; the existing single-pass hdr buffer flows downstream
+    // unchanged.
+    std::vector<Vec3f> progAccum;
+    if (effectiveProgressive)
+        progAccum.assign((size_t)_width * _height, Vec3f(0.f, 0.f, 0.f));
+    // OIDN aux populated only on first progressive iteration (same
+    // primary rays + same first hit across iters, so no point doing
+    // the readback N times).
+    std::vector<Vec3f> progAlbedoBuf, progNormalBuf;
+    uint64_t baseProgSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // hdr decl moved outside the loop so it survives the iteration
+    // boundary (the post-loop divide replaces it with the averaged
+    // progAccum).
+    std::vector<Vec3f> hdr;
+
+    for (int progPass = 0; progPass < numProgPasses; progPass++)
+    {
+    if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+        break;
+
     // Build + upload the caustic photon table. Same shared code path
     // the Metal backend uses (Photon::shootCaustic + Photon::buildGpuTable).
     // The SSBOs always get uploaded - either real data when the flag
@@ -2174,8 +2196,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     bool  photonMapActive = false;
     if (effectivePhotonMap)
     {
-        uint64_t photonSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t photonSeed = baseProgSeed + (uint64_t)progPass;
         Photon::Map cpuMap = Photon::shootCaustic(scene, photonCount,
                                                    photonRadius, _maxDepth,
                                                    photonSeed);
@@ -2546,21 +2567,52 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
             out[i] = Vec3f(tmp[i * 4 + 0], tmp[i * 4 + 1], tmp[i * 4 + 2]);
         return out;
     };
-    std::vector<Vec3f> hdr = readbackToVec3(_outputTex);
+    hdr = readbackToVec3(_outputTex);
     if (!checkGl("readback color")) {
         glfwMakeContextCurrent(nullptr);
         return;
     }
-    std::vector<Vec3f> albedoBuf, normalBuf;
-    if (useOIDN)
+    // OIDN aux only on the first progressive iteration. Primary-ray
+    // first hits are deterministic across iters; later passes would
+    // re-write identical values.
+    if (useOIDN && progPass == 0)
     {
-        albedoBuf = readbackToVec3(_albedoTex);
-        normalBuf = readbackToVec3(_normalTex);
+        progAlbedoBuf = readbackToVec3(_albedoTex);
+        progNormalBuf = readbackToVec3(_normalTex);
         if (!checkGl("readback aux")) {
             glfwMakeContextCurrent(nullptr);
             return;
         }
     }
+
+    if (effectiveProgressive)
+    {
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            progAccum[i][0] += hdr[i][0];
+            progAccum[i][1] += hdr[i][1];
+            progAccum[i][2] += hdr[i][2];
+        }
+    }
+    } // end of progressive-pass loop
+
+    if (effectiveProgressive && numProgPasses > 0)
+    {
+        float invN = 1.0f / (float)numProgPasses;
+        hdr.assign((size_t)_width * _height, Vec3f(0.f, 0.f, 0.f));
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            hdr[i][0] = progAccum[i][0] * invN;
+            hdr[i][1] = progAccum[i][1] * invN;
+            hdr[i][2] = progAccum[i][2] * invN;
+        }
+        std::cout << "OpenglRenderer: progressive averaging across "
+                  << numProgPasses << " passes complete." << std::endl;
+    }
+    // Hand the captured aux to the OIDN block below under the names
+    // it expects.
+    std::vector<Vec3f> &albedoBuf = progAlbedoBuf;
+    std::vector<Vec3f> &normalBuf = progNormalBuf;
 
     glfwMakeContextCurrent(nullptr);
 
@@ -2635,9 +2687,10 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         filename += "-aces";
     // Filename tag only when the photon map actually ran (built non-
     // empty, RGB mode). Matches the PNG metadata gate below so the two
-    // stay self-consistent.
-    if (photonMapActive)
-        filename += "-photon";
+    // stay self-consistent. Progressive mode appends "-prog" so A/B
+    // sorting groups classical vs progressive cleanly.
+    if (effectivePhotonMap)
+        filename += effectiveProgressive ? "-photon-prog" : "-photon";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -2676,11 +2729,16 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         addText("HeroSamples", std::to_string(std::clamp(heroSamples, 1, 4)));
     if (useSpectral)
         addText("CMF", useCieCmf ? "cie" : "wyman");
-    if (photonMapActive)
+    if (effectivePhotonMap)
     {
         addText("PhotonMap",    "1");
         addText("PhotonCount",  std::to_string(photonCount));
         addText("PhotonRadius", std::to_string(photonRadius));
+        if (effectiveProgressive)
+        {
+            addText("PhotonProgressive", "1");
+            addText("PhotonPasses",      std::to_string(numProgPasses));
+        }
     }
 
     std::vector<unsigned char> pngBuffer;

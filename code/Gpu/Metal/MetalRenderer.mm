@@ -4046,12 +4046,15 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                      "a later session).\n";
         effectivePhotonMap = false;
     }
-    if (useCausticPhotonProgressive && effectivePhotonMap)
-    {
-        std::cerr << "warning: --photon-progressive is CPU-only in this "
-                     "release; the Metal backend runs a single classical "
-                     "pass and ignores --photon-passes.\n";
-    }
+    // Progressive photon mapping: shoot fresh photons + run the
+    // entire dispatch pipeline N times, average the resulting HDR
+    // framebuffers on the host. The outer loop below wraps the
+    // photon-shoot + GPU dispatch + readback + normalize block;
+    // OIDN / tone-map / PNG runs once at the end on the averaged HDR.
+    // Spectral and "photon map didn't build" cases collapse to a
+    // single pass.
+    bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
+    int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
     // Wavefront integration lands in session 3. Decision pushed below
     // the architecture-selection block so we use the post-fallback
     // effectiveWavefront value, not the raw flag.
@@ -4206,12 +4209,43 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // it into wf_shade_diffuse). The photon-map build below is the
     // same path used by the megakernel; only the dispatch-side
     // binding differs.
+
+    // Progressive accumulator. In non-progressive mode this stays
+    // unused and the existing single-pass behavior runs once. In
+    // progressive mode the per-pass normalized HDR is summed here
+    // and divided by numProgPasses below the loop.
+    std::vector<Vec3f> progAccum;
+    if (effectiveProgressive)
+        progAccum.assign((size_t)_width * _height, Vec3f(0.f, 0.f, 0.f));
+    // OIDN aux is deterministic per primary-ray first hit, so we
+    // capture it only on the first progressive iteration. Subsequent
+    // iterations leave the buffers alone; the values are the same
+    // anyway (same primary rays + same first hit).
+    std::vector<Vec3f> progAlbedoBuf, progNormalBuf;
+    uint64_t baseProgSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    // The hdr / readback / normalize block at the bottom of the
+    // loop body writes into this variable each iteration; the
+    // last iteration's value flows into the OIDN / tone-map path
+    // below (after being replaced with the progressive average,
+    // if applicable).
+    std::vector<Vec3f> hdr;
+
+    for (int progPass = 0; progPass < numProgPasses; progPass++)
+    {
+    if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+        break;
+
     id<MTLBuffer> photonsBuf = nil;
     id<MTLBuffer> cellsBuf   = nil;
     if (effectivePhotonMap)
     {
-        uint64_t photonSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
+        // Per-progressive-pass seed: baseProgSeed offset by the pass
+        // index. Different passes get decorrelated photon trails so
+        // the averaging gets 1/sqrt(N) variance reduction. In non-
+        // progressive mode this still works (numProgPasses=1, single
+        // shoot with baseProgSeed).
+        uint64_t photonSeed = baseProgSeed + (uint64_t)progPass;
         Photon::Map cpuMap = Photon::shootCaustic(scene, photonCount,
                                                    photonRadius, _maxDepth,
                                                    photonSeed);
@@ -4931,12 +4965,15 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             out[i] = Vec3f(tmp[i * 4 + 0], tmp[i * 4 + 1], tmp[i * 4 + 2]);
         return out;
     };
-    std::vector<Vec3f> hdr = readbackToVec3(_impl->outputTex);
-    std::vector<Vec3f> albedoBuf, normalBuf;
-    if (useOIDN)
+    hdr = readbackToVec3(_impl->outputTex);
+    // OIDN aux is captured ONLY on the first progressive iteration.
+    // Primary-ray first hit is deterministic (same camera, same
+    // scene), so subsequent passes would just re-write identical
+    // values; skipping saves a readback per pass.
+    if (useOIDN && progPass == 0)
     {
-        albedoBuf = readbackToVec3(_impl->albedoTex);
-        normalBuf = readbackToVec3(_impl->normalTex);
+        progAlbedoBuf = readbackToVec3(_impl->albedoTex);
+        progNormalBuf = readbackToVec3(_impl->normalTex);
     }
 
     // Multi-pass normalization. For non-adaptive, the kernel accumulates
@@ -4966,6 +5003,40 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             }
         }
     }
+
+    // Progressive accumulate: sum this pass's normalized HDR into the
+    // running progressive sum. In non-progressive mode this branch is
+    // skipped (numProgPasses == 1; the existing single-pass hdr is
+    // what flows downstream).
+    if (effectiveProgressive)
+    {
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            progAccum[i][0] += hdr[i][0];
+            progAccum[i][1] += hdr[i][1];
+            progAccum[i][2] += hdr[i][2];
+        }
+    }
+    } // end of progressive-pass loop
+
+    if (effectiveProgressive && numProgPasses > 0)
+    {
+        float invN = 1.0f / (float)numProgPasses;
+        hdr.assign((size_t)_width * _height, Vec3f(0.f, 0.f, 0.f));
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            hdr[i][0] = progAccum[i][0] * invN;
+            hdr[i][1] = progAccum[i][1] * invN;
+            hdr[i][2] = progAccum[i][2] * invN;
+        }
+        std::cout << "MetalRenderer: progressive averaging across "
+                  << numProgPasses << " passes complete." << std::endl;
+    }
+    // Hand the captured aux to the OIDN block below under the names
+    // it expects. albedoBuf / normalBuf were originally local to the
+    // readback site; now they're carried across progressive passes.
+    std::vector<Vec3f> &albedoBuf = progAlbedoBuf;
+    std::vector<Vec3f> &normalBuf = progNormalBuf;
 
     auto end = std::chrono::steady_clock::now();
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -5021,9 +5092,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         filename += "-aces";
     // Filename tag only when the photon map actually ran (built non-empty,
     // megakernel path, not silently skipped in spectral mode). Matches the
-    // PNG metadata gate below so the two stay self-consistent.
+    // PNG metadata gate below so the two stay self-consistent. Progressive
+    // mode appends "-prog" so A/B sorting groups classical vs progressive
+    // cleanly.
     if (uBase.useCausticPhotonMap != 0)
-        filename += "-photon";
+        filename += effectiveProgressive ? "-photon-prog" : "-photon";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -5076,6 +5149,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         addText("PhotonMap",    "1");
         addText("PhotonCount",  std::to_string(photonCount));
         addText("PhotonRadius", std::to_string(photonRadius));
+        if (effectiveProgressive)
+        {
+            addText("PhotonProgressive", "1");
+            addText("PhotonPasses",      std::to_string(numProgPasses));
+        }
     }
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
