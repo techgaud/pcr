@@ -5094,13 +5094,19 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 // the color buffer (writes direct-lighting contribution).
                 // It also queries the photon map at every shaded ray,
                 // so the photon buffers are bound here at slots 19/20.
-                // Mirror never touches color. Glass writes color only in
-                // spectralFork mode, where it zero-initializes the color
-                // slot for each newly-claimed fork sub-ray; that write is
-                // load-bearing because the writeback scatter kernel later
-                // reads color[forkSlot] and stale values produce
-                // accumulating brightness at scale. Emissive writes to
-                // color but doesn't need scene geometry.
+                // Mirror's kernel doesn't declare color, so it stays
+                // unbound there. Glass DOES declare color [[buffer(4)]]
+                // unconditionally (it zero-inits per-fork color slots in
+                // spectralFork mode — load-bearing because the writeback
+                // scatter later reads color[forkSlot] and stale values
+                // accumulate brightness at scale). The writes only fire in
+                // fork mode, but the binding must exist whenever the kernel
+                // is dispatched or Metal shader validation aborts with
+                // "missing Buffer binding at index 4" on RGB-mode renders
+                // (fork off). So bind color to glass unconditionally; the
+                // earlier `spectralForkActive` gate was runtime-safe (glass
+                // never dereferences color in RGB mode) but tripped
+                // validation. Emissive writes color but needs no geometry.
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
                               0 * sizeof(uint32_t), /*fullScene=*/true,
                               /*needsColor=*/true,  /*needsPhotons=*/true,
@@ -5111,7 +5117,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                               /*needsSppm=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
                               2 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/spectralForkActive,
+                              /*needsColor=*/true,
                               /*needsPhotons=*/false,
                               /*needsSppm=*/false);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
