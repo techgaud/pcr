@@ -282,19 +282,31 @@ struct Welford {
 //   bits 0..7   : bounceDepth (0..255, plenty of headroom on the typical
 //                 8-16 depth range pcr uses)
 //   bit  8      : alive (0 = dead, 1 = continuing)
-//   bits 9..31  : reserved for future per-ray flags
+//   bit  9      : firstDiffuse (SPPM visible-point flag: this ray has not
+//                 yet hit its first diffuse surface. Set by ray-gen on
+//                 every primary, preserved unchanged through specular
+//                 (mirror/glass) bounces, consumed + cleared by
+//                 wf_shade_diffuse where the first diffuse hit becomes the
+//                 per-pixel visible point. Mirrors the megakernel's local
+//                 `firstDiffuseSppm` bool, which the SoA can't hold across
+//                 the split-kernel pipeline.)
+//   bits 10..31 : reserved for future per-ray flags
 //
 // Inline accessors keep call sites readable. Read-modify-write is the
 // pattern when setting one field, since MSL doesn't have sub-uint
 // stores; the load is hot-cached because the kernel just touched the
 // same address.
 constant uint kRayStateAliveBit = 0x100u;
+constant uint kRayStateFirstDiffuseBit = 0x200u;
 constant uint kRayStateDepthMask = 0xFFu;
 
 inline bool stateAlive(uint s) { return (s & kRayStateAliveBit) != 0u; }
+inline bool stateFirstDiffuse(uint s) { return (s & kRayStateFirstDiffuseBit) != 0u; }
 inline uint stateDepth(uint s) { return s & kRayStateDepthMask; }
-inline uint statePack(uint depth, bool alive) {
-    return (depth & kRayStateDepthMask) | (alive ? kRayStateAliveBit : 0u);
+inline uint statePack(uint depth, bool alive, bool firstDiffuse) {
+    return (depth & kRayStateDepthMask)
+         | (alive ? kRayStateAliveBit : 0u)
+         | (firstDiffuse ? kRayStateFirstDiffuseBit : 0u);
 }
 inline uint stateSetAlive(uint s, bool alive) {
     return alive ? (s | kRayStateAliveBit) : (s & ~kRayStateAliveBit);
@@ -2066,7 +2078,7 @@ kernel void wf_generate_primary_rays(
     // the downstream intersect / compaction / shading kernels treat
     // the ray as terminated.
     if (u.useAdaptive != 0 && pixelWelford[pixelIdxLocal].done != 0) {
-        rayState[gid] = statePack(0u, false);
+        rayState[gid] = statePack(0u, false, false);
         lastBsdfPdf[gid] = -1.0f;
         pixelIdx[gid] = pixelIdxLocal;
         return;
@@ -2145,7 +2157,11 @@ kernel void wf_generate_primary_rays(
     }
 
     rngState[gid]    = seed;
-    rayState[gid]    = statePack(0u, true);
+    // firstDiffuse = true: every primary starts before its first diffuse
+    // hit, so the first diffuse surface it reaches is this pixel's SPPM
+    // visible point. wf_shade_diffuse consumes the bit; specular bounces
+    // pass it through.
+    rayState[gid]    = statePack(0u, true, true);
     // Primary rays have no prior BSDF sample. Sentinel = -1 bypasses
     // BSDF-MIS at the first emissive hit (caught either by an early
     // light visible from the camera, or by a specular bounce
@@ -2561,7 +2577,9 @@ kernel void wf_shade_mirror(
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
     rngState[gid]    = seed;
-    rayState[gid]    = statePack(depth, alive_after);
+    // Specular bounce: pass the SPPM firstDiffuse bit through unchanged
+    // (a mirror hit is not the visible point).
+    rayState[gid]    = statePack(depth, alive_after, stateFirstDiffuse(rs));
     // Mirror reflection is a delta-distributed BSDF (single outgoing
     // direction with implicit pdf = 1 baked into the throughput
     // update). Sentinel -1 tells the next wf_shade_emissive to skip
@@ -2641,6 +2659,12 @@ kernel void wf_shade_glass(
     bool wasRefraction = (dot(float3(b.origin) - h, N) < 0.0f);
 
     uint depth = stateDepth(rayState[gid]) + 1u;
+    // Glass is specular: the SPPM firstDiffuse bit passes through unchanged
+    // to both the continuing primary and any spectral fork sub-rays (all
+    // still pre-diffuse). SPPM itself is RGB-only, so forks (spectral-only)
+    // never carry a live visible point, but we thread the bit anyway to
+    // keep the packing well-formed.
+    bool fd = stateFirstDiffuse(rayState[gid]);
     bool alive_after = true;
     if (u.useSpectral != 0) {
         float4 lams      = lambdas[gid];
@@ -2689,7 +2713,7 @@ kernel void wf_shade_glass(
                     uint forkBase = uint(u.baseRayCount) + slotBase;
                     uint parentPixel = pixelIdx[gid];
                     bool forkAlive   = (depth < uint(u.depth));
-                    uint forkStatePacked = statePack(depth, forkAlive);
+                    uint forkStatePacked = statePack(depth, forkAlive, fd);
 
                     float ior_y = cauchyIor(mat.ior, mat.cauchyB, lams.y);
                     DielectricOut by = dielectricBounce(rd, N, h, entering, ior_y, rand(seed));
@@ -2772,7 +2796,7 @@ kernel void wf_shade_glass(
     origin[gid]      = b.origin;
     dir[gid]         = b.dir;
     rngState[gid]    = seed;
-    rayState[gid]    = statePack(depth, alive_after);
+    rayState[gid]    = statePack(depth, alive_after, fd);
     // Glass refraction and reflection are both delta-distributed.
     // Sentinel -1 bypasses BSDF-MIS at the next emissive hit, same
     // convention as mirror.
@@ -2798,6 +2822,7 @@ kernel void wf_shade_diffuse(
     device packed_float3                       *dir                [[buffer(2)]],
     device packed_float3                       *throughput         [[buffer(3)]],
     device packed_float3                       *color              [[buffer(4)]],
+    device const uint                          *pixelIdx           [[buffer(5)]],
     device uint                                *rngState           [[buffer(6)]],
     device uint                                *rayState           [[buffer(7)]],
     device float                               *lastBsdfPdf        [[buffer(8)]],
@@ -2813,6 +2838,12 @@ kernel void wf_shade_diffuse(
     device const GpuLightTriangle              *lightTris          [[buffer(18)]],
     device const PCRPhoton                     *photons            [[buffer(19)]],
     device const PCRPhotonCell                 *photonCells        [[buffer(20)]],
+    // SPPM per-pixel state + per-pass delta at slots 21/22 (not the
+    // megakernel's 11/12 - those slots hold normal + spheres in the
+    // wavefront diffuse kernel). Bound only on this kernel via
+    // encodeShading(needsSppm=true); gated by u.useCausticPhotonSppm.
+    device PCRSppmPixel                        *sppm               [[buffer(21)]],
+    device PCRSppmDelta                        *sppmDelta          [[buffer(22)]],
     device const uint                          *queue              [[buffer(24)]],
     constant uint                              &queueLen           [[buffer(25)]],
     device const float4                        *lambdas            [[buffer(27)]],
@@ -2836,10 +2867,10 @@ kernel void wf_shade_diffuse(
     // them via encodeShading(needsPhotons=true) for wf_shade_diffuse;
     // photonDensityEstimate below gates on u.useCausticPhotonMap so an
     // off-mode render pays a single uint compare and a branch. SPPM
-    // is megakernel-only as of session 7; nullptr the trailing fields
-    // here (wavefront SPPM lands in a follow-up session).
+    // buffers (sppm/sppmDelta, slots 21/22) feed sppmContributeAtVisible-
+    // Point at the first diffuse hit; gated by u.useCausticPhotonSppm.
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris, photons, photonCells, nullptr, nullptr };
+                lights, lightTris, photons, photonCells, sppm, sppmDelta };
 
     // Cached per-wavelength albedo for spectral mode. Used for both
     // NEE BSDF terms and the indirect throughput update so we only
@@ -2930,15 +2961,29 @@ kernel void wf_shade_diffuse(
         color[gid] = float3(color[gid]) + t * directLoRGB;
     }
 
-    // Caustic photon-map density estimate. Skipped in spectral mode
-    // (the density estimate is RGB-power-based; spectral support is
-    // a later pass). The density estimate function itself short-
-    // circuits when u.useCausticPhotonMap is 0, so an off-mode RGB
-    // render pays just a couple of branches.
+    // Caustic photon-map contribution. Skipped in spectral mode (the
+    // estimate is RGB-power-based; spectral support is a later pass).
+    // Two mutually exclusive modes, matching the megakernel tracePath:
+    //   - SPPM on: the FIRST diffuse hit per primary (firstDiffuse bit
+    //     set) is this pixel's visible point. Accumulate photon flux
+    //     into the per-pixel sppmDelta; the host-side per-pass update +
+    //     final composite turn it into radiance. Later diffuse hits on
+    //     the same path contribute nothing. Note: like the megakernel,
+    //     the raw surface albedo (not throughput*albedo) feeds the
+    //     estimate - sppmContributeAtVisiblePoint applies albedo/PI.
+    //   - SPPM off: classical density estimate adds radiance directly.
+    // Both inner functions short-circuit when u.useCausticPhotonMap is
+    // 0, so an off-mode RGB render pays just a couple of branches.
     if (u.useSpectral == 0) {
-        color[gid] = float3(color[gid])
-                   + t * photonDensityEstimate(S, S.photons, S.photonCells,
-                                                h, N, albedo);
+        if (u.useCausticPhotonSppm != 0) {
+            if (stateFirstDiffuse(rayState[gid])) {
+                sppmContributeAtVisiblePoint(S, pixelIdx[gid], h, N, albedo);
+            }
+        } else {
+            color[gid] = float3(color[gid])
+                       + t * photonDensityEstimate(S, S.photons, S.photonCells,
+                                                    h, N, albedo);
+        }
     }
 
     // Russian roulette: same conditions as megakernel (after bounce 0).
@@ -2974,7 +3019,9 @@ kernel void wf_shade_diffuse(
     origin[gid]      = newOrigin;
     dir[gid]         = newDir;
     rngState[gid]    = seed;
-    rayState[gid]    = statePack(depth, alive_after);
+    // firstDiffuse cleared: this diffuse hit is (or would have been) the
+    // SPPM visible point, so any later diffuse hit on this path is not.
+    rayState[gid]    = statePack(depth, alive_after, false);
     // Cosine-weighted hemisphere sample's pdf is cosTheta / PI,
     // where cosTheta = dot(newDir, N). Stored so the NEXT bounce's
     // wf_shade_emissive can weight any emission against what light-
@@ -4239,22 +4286,14 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
     int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
 
-    // SPPM (Hachisuka & Jensen 2009): layered on progressive. As of
-    // session 7 this ships on the Metal megakernel only; wavefront
-    // SPPM is a follow-up session. When the user asks for SPPM in
-    // wavefront mode we warn + fall back to plain progressive.
+    // SPPM (Hachisuka & Jensen 2009): layered on progressive. Ships on
+    // CPU + both Metal paths (megakernel and wavefront). Wavefront SPPM
+    // tracks the per-primary visible point via the rayState firstDiffuse
+    // bit (see the packing comment near the top of the MSL source) and
+    // requires 1-sample-per-pass to keep the per-pixel delta accumulation
+    // race-free; that 1-spp constraint is enforced just below the
+    // architecture-selection block, once effectiveWavefront is final.
     bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
-    if (effectiveSppm && effectiveWavefront)
-    {
-        std::cerr << "warning: --photon-sppm not yet implemented on the "
-                     "Metal wavefront path; running plain progressive. "
-                     "Use --no-wavefront to get full SPPM via the "
-                     "megakernel.\n";
-        effectiveSppm = false;
-    }
-    // Wavefront integration lands in session 3. Decision pushed below
-    // the architecture-selection block so we use the post-fallback
-    // effectiveWavefront value, not the raw flag.
 
     if (scene.areaLights.empty())
     {
@@ -4295,6 +4334,22 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                       << std::endl;
             effectiveWavefront = false;
         }
+    }
+
+    // Wavefront SPPM requires 1-sample-per-pass: the per-pixel SPPM delta
+    // write in wf_shade_diffuse (sppmContributeAtVisiblePoint) is atomic-
+    // free and assumes one ray per pixel per pipeline run. Multi-sample-
+    // per-pass packs samplesPerPass rays onto each pixel within a single
+    // run, racing the `sppmDelta +=`. The samplesPerPass=1 override fires
+    // unconditionally for wavefront SPPM in the dispatch-budget block
+    // below; warn here if the user explicitly asked for multi-sample so
+    // the override isn't a silent surprise.
+    if (effectiveSppm && effectiveWavefront && wavefrontMultiSample)
+    {
+        std::cerr << "MetalRenderer: wavefront SPPM forces 1-sample-per-pass "
+                     "(multi-sample-per-pass would race the per-pixel SPPM "
+                     "accumulation); ignoring multi-sample for this render."
+                  << std::endl;
     }
 
     if (!initMetal(*_impl, _width, _height)) return;
@@ -4654,7 +4709,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // regardless of resolution.
     if (effectiveWavefront)
     {
-        if (!wavefrontMultiSample)
+        // SPPM forces 1-spp regardless of the multi-sample toggle (the
+        // atomic-free per-pixel SPPM accumulation races under multi-spp;
+        // warned about above).
+        if (!wavefrontMultiSample || effectiveSppm)
             samplesPerPass = 1;
         tilesY = 1;
     }
@@ -4972,7 +5030,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                                          NSUInteger counterOffset,
                                          bool needsFullScene,
                                          bool needsColor,
-                                         bool needsPhotons) {
+                                         bool needsPhotons,
+                                         bool needsSppm) {
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:pipeline];
                     [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
@@ -5007,6 +5066,18 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                         [enc setBuffer:photonsBuf offset:0 atIndex:19];
                         [enc setBuffer:cellsBuf   offset:0 atIndex:20];
                     }
+                    if (needsSppm)
+                    {
+                        // Slots 21 / 22 carry the SPPM per-pixel state +
+                        // delta to wf_shade_diffuse, the only shading
+                        // kernel that declares them. Gated like photons so
+                        // the other kernels don't trip unused-binding
+                        // validation. Always non-null (dummy 1-elem buffer
+                        // when SPPM is off); the kernel reads behind
+                        // u.useCausticPhotonSppm.
+                        [enc setBuffer:sppmBuf      offset:0 atIndex:21];
+                        [enc setBuffer:sppmDeltaBuf offset:0 atIndex:22];
+                    }
                     [enc setBuffer:queueBuf            offset:0 atIndex:24];
                     [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
                     [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
@@ -5032,17 +5103,21 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 // color but doesn't need scene geometry.
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
                               0 * sizeof(uint32_t), /*fullScene=*/true,
-                              /*needsColor=*/true,  /*needsPhotons=*/true);
+                              /*needsColor=*/true,  /*needsPhotons=*/true,
+                              /*needsSppm=*/true);
                 encodeShading(_impl->pipelineWfShadeMirror,   wfBufs.queueMirror,
                               1 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/false, /*needsPhotons=*/false);
+                              /*needsColor=*/false, /*needsPhotons=*/false,
+                              /*needsSppm=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
                               2 * sizeof(uint32_t), /*fullScene=*/false,
                               /*needsColor=*/spectralForkActive,
-                              /*needsPhotons=*/false);
+                              /*needsPhotons=*/false,
+                              /*needsSppm=*/false);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
                               3 * sizeof(uint32_t), /*fullScene=*/false,
-                              /*needsColor=*/true,  /*needsPhotons=*/false);
+                              /*needsColor=*/true,  /*needsPhotons=*/false,
+                              /*needsSppm=*/false);
             }
 
             // ---- Fork-scatter (spectralFork mode only) ----
