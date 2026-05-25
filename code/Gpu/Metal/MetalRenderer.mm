@@ -4231,6 +4231,15 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // if applicable).
     std::vector<Vec3f> hdr;
 
+    // Hoisted out of the progressive loop so the PNG metadata
+    // below the loop (ThreadgroupX / ThreadgroupY tEXt chunks)
+    // can still reference them after the loop closes. Per-iter
+    // values don't change anyway - the threadgroup size is a
+    // function of the renderer + pipeline, not the progressive
+    // iteration.
+    int tgX = 0;
+    int tgY = 0;
+
     for (int progPass = 0; progPass < numProgPasses; progPass++)
     {
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
@@ -4417,8 +4426,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // back to 16x16 if invalid (e.g. user picked something the pipeline
     // can't actually run with). Total threads also has to be > 0; treat
     // a zero in either axis as "use the default".
-    int tgX = (threadgroupX > 0) ? threadgroupX : 32;
-    int tgY = (threadgroupY > 0) ? threadgroupY : 32;
+    tgX = (threadgroupX > 0) ? threadgroupX : 32;
+    tgY = (threadgroupY > 0) ? threadgroupY : 32;
     if (activePipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)(tgX * tgY))
     {
         std::cerr << "MetalRenderer: requested threadgroup "
