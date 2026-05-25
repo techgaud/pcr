@@ -115,6 +115,10 @@ public:
     bool  useCausticPhotonProgressive = false;
     int   photonPasses = 8;
 
+    // True SPPM. See Renderer.h for semantics. Layered on top of
+    // useCausticPhotonProgressive.
+    bool  useCausticPhotonSppm = false;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

@@ -134,6 +134,12 @@ int main(int argc, char *argv[])
     bool useCausticPhotonProgressive = false;
     int  photonPasses = 8;
 
+    // True SPPM (Hachisuka & Jensen 2009). Layers on top of
+    // --photon-progressive; per-pixel adaptive radius shrinkage that
+    // converges to an unbiased estimator. Requires --photon-progressive
+    // (and therefore --photon-map).
+    bool useCausticPhotonSppm = false;
+
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
         ->default_str("cornell");
@@ -288,6 +294,17 @@ int main(int argc, char *argv[])
                  "full eye-path render; results averaged at the end.")
         ->default_str("8")
         ->check(CLI::PositiveNumber);
+    techniques->add_flag("--photon-sppm", useCausticPhotonSppm,
+                 "Stochastic Progressive Photon Mapping (Hachisuka & "
+                 "Jensen 2009). Layered on --photon-progressive. Each "
+                 "pixel tracks a 'visible point' (first diffuse hit "
+                 "along the primary ray) with adaptive per-pixel "
+                 "radius; radius shrinks based on local photon density "
+                 "to converge to an asymptotically unbiased caustic "
+                 "estimate. Slower per-pixel state ops but converges "
+                 "without the kernel-density bias plain progressive "
+                 "and classical leave in. Requires --photon-progressive "
+                 "(and therefore --photon-map).");
 
     options->add_option("--seed", seed,
                  "Fixed PRNG seed for bit-deterministic renders. When set "
@@ -550,6 +567,7 @@ int main(int argc, char *argv[])
     renderer.photonRadius        = photonRadius;
     renderer.useCausticPhotonProgressive = useCausticPhotonProgressive;
     renderer.photonPasses        = photonPasses;
+    renderer.useCausticPhotonSppm        = useCausticPhotonSppm;
 #if PCR_USE_GPU
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;

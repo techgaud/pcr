@@ -25,6 +25,7 @@
 #include "Photon/PhotonMap.h"
 #include "Photon/PhotonShoot.h"
 #include "Photon/DensityEstimate.h"
+#include "Photon/Sppm.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
 #ifndef PCR_BINARY_NAME
@@ -162,6 +163,38 @@ void Renderer::render(const Scenes::SceneData &scene,
         effectiveProgressive = false;
     }
     int numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
+
+    // SPPM layers on top of progressive. When on, the eye path's
+    // first-diffuse-hit density estimate mutates per-pixel state
+    // (delta_tau + M) instead of contributing radiance directly;
+    // the per-pixel update + final composite below handle the
+    // Hachisuka math. SPPM requires progressive (it's nonsensical
+    // with a single pass); spectral disables both already.
+    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
+    std::vector<Photon::SppmPixel> sppmStateVec;
+    std::vector<Photon::SppmDelta> sppmDeltaVec;
+    if (effectiveSppm)
+    {
+        sppmStateVec.resize((size_t)_width * _height);
+        sppmDeltaVec.assign((size_t)_width * _height, Photon::SppmDelta{0.f, 0.f, 0.f, 0.f});
+        // Initialize R to photonRadius (the user's per-render starting
+        // radius). tau and N start at zero; the first pass populates
+        // them via the Hachisuka update with shrink = alpha (the
+        // N == 0 edge case in sppmUpdatePixel).
+        for (auto &px : sppmStateVec)
+        {
+            px.R = photonRadius;
+            px.tauR = px.tauG = px.tauB = 0.f;
+            px.N = 0.f;
+        }
+        _sppmState = sppmStateVec.data();
+        _sppmDelta = sppmDeltaVec.data();
+    }
+    else
+    {
+        _sppmState = nullptr;
+        _sppmDelta = nullptr;
+    }
     std::optional<Photon::Map> causticMap;
     if (useCausticPhotonMap && !effectiveProgressive)
     {
@@ -331,7 +364,14 @@ void Renderer::render(const Scenes::SceneData &scene,
                         }
                         else
                         {
-                            c = castRay(ray, scene.materials, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut);
+                            // pixelIdx threads through so SPPM's per-pixel
+                            // state mutation at the first diffuse hit
+                            // lands in the correct slot. firstDiffuse=true
+                            // because this is the primary ray; later
+                            // recursive calls inside castRay flip it off
+                            // after the first diffuse hit fires.
+                            int sppmPixelIdx = (int)(i * _width + j);
+                            c = castRay(ray, scene.materials, scene.spheres, scene.triangles, scene.triangleBvh, scene.areaLights, totalLightArea, 0, albOut, nrmOut, sppmPixelIdx, true);
                         }
                         if (albOut) albedoBuffer[i * _width + j] = firstAlbedo;
                         if (nrmOut) normalBuffer[i * _width + j] = firstNormal;
@@ -423,6 +463,19 @@ void Renderer::render(const Scenes::SceneData &scene,
             progAccum[i][2] += frameBuffer[i][2];
         }
     }
+
+    // SPPM end-of-pass update: apply the Hachisuka shrinkage per
+    // pixel using the delta accumulated this pass, then zero the
+    // delta buffer for the next pass. The visible point's R / tau /
+    // N persist across passes; the delta is per-pass scratch.
+    if (effectiveSppm)
+    {
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            Photon::sppmUpdatePixel(_sppmState[i], _sppmDelta[i]);
+            _sppmDelta[i] = Photon::SppmDelta{0.f, 0.f, 0.f, 0.f};
+        }
+    }
     } // end of progressive-pass loop
 
     if (effectiveProgressive && numProgPasses > 0)
@@ -442,12 +495,43 @@ void Renderer::render(const Scenes::SceneData &scene,
                   << numProgPasses << " passes complete." << std::endl;
     }
 
+    // SPPM final composite: add the per-pixel caustic radiance
+    // estimate to frameBuffer. The eye-path's direct + indirect
+    // contributions are already there (averaged across progressive
+    // passes); SPPM adds the caustic on top via:
+    //   L_caustic = tau / (pi * R^2 * N_emitted_total)
+    // N_emitted_total = photonCount * numProgPasses (each pass shot
+    // photonCount photons). Pixels that never accumulated any
+    // photons (N == 0) contribute zero, so this is safe on edge
+    // pixels that never saw a caustic hit.
+    if (effectiveSppm)
+    {
+        const float invEmitted = 1.0f /
+            ((float)std::numbers::pi
+             * (float)photonCount * (float)numProgPasses);
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            const Photon::SppmPixel &px = _sppmState[i];
+            if (px.N <= 0.f || px.R <= 0.f) continue;
+            const float invR2 = 1.0f / (px.R * px.R);
+            float scale = invR2 * invEmitted;
+            frameBuffer[i][0] += px.tauR * scale;
+            frameBuffer[i][1] += px.tauG * scale;
+            frameBuffer[i][2] += px.tauB * scale;
+        }
+        std::cout << "Renderer: SPPM final composite complete." << std::endl;
+    }
+
     // Clear the dangling-pointer-prevention: causticMap (the
     // std::optional that owns the storage) goes out of scope at the
     // end of this function. Null _activeCausticMap before that so a
     // future render call doesn't see a stale pointer if something
     // about the call ordering changes.
     _activeCausticMap = nullptr;
+    // Same for the SPPM state pointers; sppmStateVec / sppmDeltaVec
+    // owning containers also go out of scope below.
+    _sppmState = nullptr;
+    _sppmDelta = nullptr;
 
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
     {
@@ -522,7 +606,11 @@ void Renderer::render(const Scenes::SceneData &scene,
     if (useACES)
         filename += "-aces";
     if (useCausticPhotonMap && !useSpectral)
-        filename += effectiveProgressive ? "-photon-prog" : "-photon";
+    {
+        if (effectiveSppm)            filename += "-photon-sppm";
+        else if (effectiveProgressive) filename += "-photon-prog";
+        else                           filename += "-photon";
+    }
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
@@ -571,6 +659,8 @@ void Renderer::render(const Scenes::SceneData &scene,
             addText("PhotonProgressive", "1");
             addText("PhotonPasses",      std::to_string(numProgPasses));
         }
+        if (effectiveSppm)
+            addText("PhotonSppm", "1");
     }
 
     std::vector<unsigned char> pngBuffer;
@@ -600,7 +690,9 @@ Vec3f Renderer::castRay(const Ray &ray,
                         const std::vector<Scenes::AreaLight> &lights,
                         float totalLightArea, int depth,
                         Vec3f *outFirstAlbedo,
-                        Vec3f *outFirstNormal)
+                        Vec3f *outFirstNormal,
+                        int pixelIdx,
+                        bool firstDiffuse)
 {
     int matIdx = -1;
     Vec3f hit, N;
@@ -628,8 +720,12 @@ Vec3f Renderer::castRay(const Ray &ray,
         float cosI = -ray.dir.dot(N);
         Vec3f reflectedDir = ray.dir + N * (2.f * cosI);
         Vec3f reflOrigin = hit + N * 1e-3f;
+        // Specular bounces don't consume firstDiffuse; SPPM's visible
+        // point is the first DIFFUSE hit, so mirror -> mirror -> diffuse
+        // still treats the diffuse as the visible point.
         Vec3f recurse = castRay(Ray(reflectedDir, reflOrigin), materials,
-                                spheres, triangles, bvh, lights, totalLightArea, depth + 1);
+                                spheres, triangles, bvh, lights, totalLightArea, depth + 1,
+                                nullptr, nullptr, pixelIdx, firstDiffuse);
         return Vec3f(recurse[0] * material.albedo[0],
                      recurse[1] * material.albedo[1],
                      recurse[2] * material.albedo[2]);
@@ -640,7 +736,8 @@ Vec3f Renderer::castRay(const Ray &ray,
         auto b = Optics::dielectricBounce(ray.dir, N, hit, entering,
                                           material.ior, NumGen::Epsilon());
         Vec3f recurse = castRay(Ray(b.dir, b.origin), materials,
-                                spheres, triangles, bvh, lights, totalLightArea, depth + 1);
+                                spheres, triangles, bvh, lights, totalLightArea, depth + 1,
+                                nullptr, nullptr, pixelIdx, firstDiffuse);
         return Vec3f(recurse[0] * material.albedo[0],
                      recurse[1] * material.albedo[1],
                      recurse[2] * material.albedo[2]);
@@ -680,11 +777,16 @@ Vec3f Renderer::castRay(const Ray &ray,
             float maxAlbedo = std::max({material.albedo[0], material.albedo[1], material.albedo[2]});
             float p = std::min(0.95f, std::max(0.05f, maxAlbedo));
             if (NumGen::Epsilon() > p) continue;
-            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo / p;
+            // Indirect bounce off a diffuse surface. Pass firstDiffuse=false
+            // so the SPPM density estimate at any further diffuse hit
+            // along this sub-path skips photons (standard SPPM hitpoint
+            // semantics: only the primary ray's first diffuse hit
+            // mutates per-pixel state).
+            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1, nullptr, nullptr, pixelIdx, /*firstDiffuse=*/false) * material.albedo / p;
         }
         else
         {
-            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1) * material.albedo;
+            indirectLo += castRay(randomRay, materials, spheres, triangles, bvh, lights, totalLightArea, depth + 1, nullptr, nullptr, pixelIdx, /*firstDiffuse=*/false) * material.albedo;
         }
     }
     indirectLo /= _samples;
@@ -777,15 +879,81 @@ Vec3f Renderer::castRay(const Ray &ray,
         }
     }
 
-    // Caustic photon-map density estimate. Only contributes on
-    // diffuse surfaces; specular hits returned early above and
-    // never reach here. Skipped when no map is built. When the
-    // surface has zero albedo (e.g. a pure-black material) the
-    // estimate still runs but lands on zero, which is cheap; the
-    // hash-grid query is the only real cost.
+    // Caustic photon-map density estimate. Two modes:
+    //
+    //   1. SPPM is on AND this is the first diffuse hit AND we have
+    //      a valid pixelIdx: query photons within the per-pixel
+    //      adaptive radius, accumulate (BSDF * photon power) into
+    //      the per-pixel delta-tau buffer and increment M. Contribute
+    //      ZERO radiance directly; the SPPM final composite below
+    //      handles the caustic term after Hachisuka shrinkage.
+    //
+    //   2. Otherwise: existing classical density estimate path.
+    //      Returns radiance directly; gets added to the eye-path
+    //      output here. In SPPM mode at non-first-diffuse hits this
+    //      is also where we land but causticLo stays at zero
+    //      (no photon contribution at non-visible-point hits).
+    //
+    // Specular hits returned early above and never reach here, so
+    // SPPM's "first diffuse" check only fires on actual diffuse
+    // surfaces.
     Vec3f causticLo(0.f, 0.f, 0.f);
-    if (_activeCausticMap)
-        causticLo = Photon::densityEstimate(*_activeCausticMap, hit, N, material.albedo);
+    if (_sppmState && firstDiffuse && pixelIdx >= 0)
+    {
+        // SPPM visible-point density estimate. Per-pixel delta is
+        // written from the thread that owns this pixel (the render
+        // worker thread for this primary ray's row stripe), so no
+        // atomics are needed -- writes from other threads can't
+        // collide.
+        const Photon::Map &map = *_activeCausticMap;
+        const float r = _sppmState[pixelIdx].R;
+        const float r2 = r * r;
+        Vec3f sumPower(0.f, 0.f, 0.f);
+        int   M = 0;
+        if (map.size() > 0)
+        {
+            // Note: we run the query at the PER-PIXEL adaptive R,
+            // not the map's global radius. Photon::Map's query uses
+            // its construction-time radius (the cell-size, photonRadius)
+            // for the 3x3x3 neighborhood walk; that radius is the
+            // INITIAL R for all pixels in SPPM mode. As R shrinks
+            // per-pixel below that initial value, the per-pixel r2
+            // filter discards farther photons -- the search structure
+            // is conservative (may visit more photons than needed)
+            // but the dist2 > r2 reject keeps the math correct.
+            map.query(hit, [&](const Photon::Record &p, float distSq) {
+                if (distSq > r2) return;
+                if (p.wi.dot(N) >= 0.f) return;
+                sumPower[0] += p.power[0];
+                sumPower[1] += p.power[1];
+                sumPower[2] += p.power[2];
+                M++;
+            });
+        }
+        // Fold BSDF (Lambert = albedo / pi) into the delta-tau
+        // accumulator. The per-pixel update at end-of-pass will then
+        // apply the Hachisuka shrinkage to fold this into the running
+        // tau; the final composite divides by (pi r^2 * N_emitted).
+        const float invPi = 1.0f / (float)std::numbers::pi;
+        _sppmDelta[pixelIdx].dtauR += material.albedo[0] * invPi * sumPower[0];
+        _sppmDelta[pixelIdx].dtauG += material.albedo[1] * invPi * sumPower[1];
+        _sppmDelta[pixelIdx].dtauB += material.albedo[2] * invPi * sumPower[2];
+        _sppmDelta[pixelIdx].M     += (float)M;
+        // causticLo stays at zero; the SPPM tau / (pi r^2 N_emitted)
+        // composite outside the eye path handles the radiance.
+    }
+    else if (_activeCausticMap)
+    {
+        // Classical / progressive-average density estimate. In SPPM
+        // mode but at a non-first-diffuse hit, _sppmState is non-null
+        // AND firstDiffuse is false, which falls into THIS branch (the
+        // first conditional's firstDiffuse check fails). The right
+        // behavior at that hit is "no photon contribution" -- the
+        // visible point owns the SPPM accounting. So gate the
+        // density estimate on "not SPPM mode."
+        if (!_sppmState)
+            causticLo = Photon::densityEstimate(*_activeCausticMap, hit, N, material.albedo);
+    }
 
     return directLo / _shadowSamples + indirectLo + causticLo;
 }

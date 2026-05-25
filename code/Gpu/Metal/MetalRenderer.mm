@@ -58,6 +58,7 @@
 #include "../../Photon/PhotonMap.h"
 #include "../../Photon/PhotonShoot.h"
 #include "../../Photon/GpuFlatten.h"
+#include "../../Photon/Sppm.h"
 
 namespace fs = std::filesystem;
 
@@ -254,7 +255,7 @@ struct Uniforms {
     int   useCausticPhotonMap;
     int   photonCellTableMask;
     float photonRadius;
-    int   _pad2;
+    int   useCausticPhotonSppm;  // 0 = classical/progressive density estimate; 1 = SPPM visible-point accumulation
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -338,6 +339,29 @@ struct PCRPhotonCell {
 
 constant uint kPhotonEmptyCell = 0xFFFFFFFFu;
 
+// Stochastic Progressive Photon Mapping per-pixel state. Layout
+// matches the host Photon::SppmPixel POD byte-for-byte (5x float = 20
+// bytes). Persists across progressive passes; per-pass deltas land
+// in PCRSppmDelta below and the host-side update kernel applies
+// the Hachisuka shrinkage.
+struct PCRSppmPixel {
+    float R;
+    float tauR;
+    float tauG;
+    float tauB;
+    float N;
+};
+
+// Per-pass scratch. Density estimate at the first diffuse hit of
+// each primary ray atomic-adds (BSDF * photon power) into dtau* and
+// M; the end-of-pass update kernel reads + zeros it.
+struct PCRSppmDelta {
+    float dtauR;
+    float dtauG;
+    float dtauB;
+    float M;
+};
+
 // Teschner 2003 spatial hash. Mirrors Photon::Map::cellHash on the
 // host so cells built CPU-side land in the same GPU slot.
 inline uint photonCellHash(int cx, int cy, int cz) {
@@ -360,6 +384,11 @@ struct Scene {
     // kernel guards reads behind u.useCausticPhotonMap.
     device const PCRPhoton           *photons;
     device const PCRPhotonCell       *photonCells;
+    // SPPM per-pixel state + per-pass delta. Same binding-or-dummy
+    // convention as photons: always non-null; reads guarded by
+    // u.useCausticPhotonSppm.
+    device PCRSppmPixel              *sppm;
+    device PCRSppmDelta              *sppmDelta;
 };
 
 // Caustic density estimate at a diffuse hit point x with outward
@@ -421,6 +450,109 @@ float3 photonDensityEstimate(thread const Scene &S,
     const float invArea = 1.0f / (PI * r2);
     const float invPi   = 1.0f / PI;
     return albedo * invPi * sumPower * invArea;
+}
+
+// SPPM visible-point density estimate. Queries photons within the
+// per-pixel adaptive R (S.sppm[pixelIdx].R), accumulates (BSDF *
+// power) into the per-pixel delta and increments M. Returns void
+// because the caller treats the SPPM contribution as zero radiance
+// at the eye-path hit -- the per-pass update + final composite
+// (host-side) handle the radiance via the Hachisuka shrinkage.
+//
+// No atomics: each thread per pass owns one pixel's writes here
+// (one thread per pixel in megakernel; one ray per pixel in
+// wavefront 1-spp). Wavefront multi-spp would race; the host warns
+// + disables SPPM in that mode.
+void sppmContributeAtVisiblePoint(thread const Scene &S,
+                                  uint pixelIdx,
+                                  float3 hit, float3 N, float3 albedo)
+{
+    if (S.u.useCausticPhotonMap == 0 || S.u.useCausticPhotonSppm == 0) return;
+
+    device PCRSppmPixel &px = S.sppm[pixelIdx];
+    float r = px.R;
+    if (r <= 0.0f) return;
+    float r2 = r * r;
+    float invR = 1.0f / r;
+    uint  mask = uint(S.u.photonCellTableMask);
+
+    int cx = int(floor(hit.x * invR));
+    int cy = int(floor(hit.y * invR));
+    int cz = int(floor(hit.z * invR));
+
+    float3 sumPower = float3(0.0f);
+    float  M        = 0.0f;
+    for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        for (int probe = 0; probe < 8; probe++) {
+            PCRPhotonCell cell = S.photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0; i < cell.count; i++) {
+                    PCRPhoton ph = S.photons[cell.offset + i];
+                    float3 d = float3(ph.position) - hit;
+                    float dist2 = dot(d, d);
+                    if (dist2 > r2) continue;
+                    if (dot(float3(ph.wi), N) >= 0.0f) continue;
+                    sumPower += float3(ph.power);
+                    M += 1.0f;
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }}}
+
+    const float invPi = 1.0f / PI;
+    device PCRSppmDelta &d = S.sppmDelta[pixelIdx];
+    d.dtauR += albedo.r * invPi * sumPower.r;
+    d.dtauG += albedo.g * invPi * sumPower.g;
+    d.dtauB += albedo.b * invPi * sumPower.b;
+    d.M     += M;
+}
+
+// SPPM end-of-pass update kernel. One thread per pixel; applies
+// the Hachisuka 2009 shrinkage:
+//   N_new = N + alpha * M
+//   R_new = R * sqrt(N_new / (N + M))
+//   tau_new = (tau + delta_tau) * (N_new / (N + M))
+// Then zeros the delta slot for the next pass.
+//
+// Alpha = 2/3 baked in here (matches the host Photon::kSppmAlpha).
+constant float kSppmAlpha = 2.0f / 3.0f;
+
+kernel void sppm_pass_update(
+    constant Uniforms                          &u           [[buffer(0)]],
+    device PCRSppmPixel                        *sppm        [[buffer(11)]],
+    device PCRSppmDelta                        *sppmDelta   [[buffer(12)]],
+    uint2                                       gid         [[thread_position_in_grid]])
+{
+    if (gid.x >= uint(u.width) || gid.y >= uint(u.height)) return;
+    uint pixelIdx = gid.y * uint(u.width) + gid.x;
+
+    device PCRSppmDelta &d = sppmDelta[pixelIdx];
+    float M = d.M;
+    if (M > 0.0f) {
+        device PCRSppmPixel &px = sppm[pixelIdx];
+        float N      = px.N;
+        float N_new  = N + kSppmAlpha * M;
+        float shrink = N_new / (N + M);
+        px.R    = px.R * sqrt(shrink);
+        px.tauR = (px.tauR + d.dtauR) * shrink;
+        px.tauG = (px.tauG + d.dtauG) * shrink;
+        px.tauB = (px.tauB + d.dtauB) * shrink;
+        px.N    = N_new;
+    }
+    // Zero the delta for the next pass regardless of whether the
+    // update fired -- a future pass might hit this pixel even if
+    // this one didn't.
+    d.dtauR = 0.0f;
+    d.dtauG = 0.0f;
+    d.dtauB = 0.0f;
+    d.M     = 0.0f;
 }
 
 // ---- Spectrum lookup --------------------------------------------------
@@ -945,7 +1077,11 @@ void sampleAreaLight(thread const Scene &S, thread uint &seed,
 // ---- RGB path tracer ------------------------------------------------
 
 float3 tracePath(thread const Scene &S, float2 pix, float pr1, float pr2,
-                 thread uint &seed) {
+                 thread uint &seed, uint pixelIdx) {
+    // SPPM hitpoint semantics: the first diffuse hit per primary ray
+    // is the visible point. Subsequent diffuse hits along the same
+    // path skip photon contribution entirely. Local bool tracks it.
+    bool firstDiffuseSppm = (S.u.useCausticPhotonSppm != 0);
     float aspect = float(S.u.width) / float(S.u.height);
     float scale = tan(PI / 180.0f * 0.5f * S.u.fov);
     float x = ((2.0f * (pix.x + 0.5f) / float(S.u.width)) - 1.0f) * scale * aspect;
@@ -1037,13 +1173,24 @@ float3 tracePath(thread const Scene &S, float2 pix, float pr1, float pr2,
         }
         radiance += throughput * directLo;
 
-        // Caustic photon-map contribution. Same per-bounce-throughput
-        // convention as directLo. Density estimate gates on the
-        // useCausticPhotonMap uniform flag, so when the photon map is
-        // off this is a single uint compare + branch.
-        radiance += throughput * photonDensityEstimate(
-                        S, S.photons, S.photonCells,
-                        hit, N, mat.albedo.rgb);
+        // Caustic photon-map contribution. Two modes:
+        //   - SPPM on: the first diffuse hit per primary ray writes
+        //     to the per-pixel delta buffer; the per-pass update +
+        //     final composite (host-side) handle the radiance.
+        //     Later diffuse hits skip photons entirely.
+        //   - SPPM off: classical density estimate adds radiance
+        //     directly here, same as the pre-SPPM behavior.
+        if (S.u.useCausticPhotonSppm != 0) {
+            if (firstDiffuseSppm) {
+                sppmContributeAtVisiblePoint(S, pixelIdx, hit, N, mat.albedo.rgb);
+                firstDiffuseSppm = false;
+            }
+            // else: no photon contribution at non-visible-point hits.
+        } else {
+            radiance += throughput * photonDensityEstimate(
+                            S, S.photons, S.photonCells,
+                            hit, N, mat.albedo.rgb);
+        }
 
         if (S.u.useRussian != 0 && bounce >= 1) {
             float p = clamp(max(max(mat.albedo.r, mat.albedo.g), mat.albedo.b), 0.05f, 0.95f);
@@ -1346,13 +1493,15 @@ kernel void path_trace(
     device const GpuLightTriangle              *lightTris    [[buffer(7)]],
     device const PCRPhoton                     *photons      [[buffer(9)]],
     device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
+    device PCRSppmPixel                        *sppm         [[buffer(11)]],
+    device PCRSppmDelta                        *sppmDelta    [[buffer(12)]],
     texture2d<float, access::write>             output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
-                photons, photonCells };
+                photons, photonCells, sppm, sppmDelta };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1432,7 +1581,7 @@ kernel void path_trace(
                     accum += xyz * 0.25f;
                 }
             } else {
-                accum += tracePath(S, jpix, r1, r2, seed);
+                accum += tracePath(S, jpix, r1, r2, seed, uint(pix.y) * uint(u.width) + uint(pix.x));
             }
         }
         accum /= float(u.samples);
@@ -1494,13 +1643,15 @@ kernel void path_trace_pass(
     device const GpuLightTriangle              *lightTris    [[buffer(7)]],
     device const PCRPhoton                     *photons      [[buffer(9)]],
     device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
+    device PCRSppmPixel                        *sppm         [[buffer(11)]],
+    device PCRSppmDelta                        *sppmDelta    [[buffer(12)]],
     texture2d<float, access::read_write>        output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
-                photons, photonCells };
+                photons, photonCells, sppm, sppmDelta };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1593,7 +1744,7 @@ kernel void path_trace_pass(
                 accum += xyz * 0.25f;
             }
         } else {
-            accum += tracePath(S, jpix, r1, r2, seed);
+            accum += tracePath(S, jpix, r1, r2, seed, uint(pix.y) * uint(u.width) + uint(pix.x));
         }
     }
 
@@ -1658,13 +1809,15 @@ kernel void path_trace_pass_adaptive(
     device Welford                             *welford      [[buffer(8)]],
     device const PCRPhoton                     *photons      [[buffer(9)]],
     device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
+    device PCRSppmPixel                        *sppm         [[buffer(11)]],
+    device PCRSppmDelta                        *sppmDelta    [[buffer(12)]],
     texture2d<float, access::read_write>        output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
-                photons, photonCells };
+                photons, photonCells, sppm, sppmDelta };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1775,7 +1928,7 @@ kernel void path_trace_pass_adaptive(
                 batchSum += xyz * 0.25f;
             }
         } else {
-            batchSum += tracePath(S, jpix, r1, r2, seed);
+            batchSum += tracePath(S, jpix, r1, r2, seed, uint(pix.y) * uint(u.width) + uint(pix.x));
         }
     }
 
@@ -2070,7 +2223,7 @@ kernel void wf_intersect(
     // (session 3 will wire the density estimate into wf_shade_diffuse;
     // until then, the megakernel is the only consumer).
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris, nullptr, nullptr };
+                lights, lightTris, nullptr, nullptr, nullptr, nullptr };
 
     float3 hp, N;
     int mi;
@@ -2682,9 +2835,11 @@ kernel void wf_shade_diffuse(
     // Photon buffers come in at slots 19 / 20 (session 3). Host binds
     // them via encodeShading(needsPhotons=true) for wf_shade_diffuse;
     // photonDensityEstimate below gates on u.useCausticPhotonMap so an
-    // off-mode render pays a single uint compare and a branch.
+    // off-mode render pays a single uint compare and a branch. SPPM
+    // is megakernel-only as of session 7; nullptr the trailing fields
+    // here (wavefront SPPM lands in a follow-up session).
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris, photons, photonCells };
+                lights, lightTris, photons, photonCells, nullptr, nullptr };
 
     // Cached per-wavelength albedo for spectral mode. Used for both
     // NEE BSDF terms and the indirect throughput update so we only
@@ -3162,7 +3317,7 @@ namespace
         int   useCausticPhotonMap;
         int   photonCellTableMask;
         float photonRadius;
-        int   _pad2;
+        int   useCausticPhotonSppm;
     };
     static_assert(sizeof(Uniforms) == 176,
                   "Uniforms must be 176 bytes (multiple of 16) so per-pass "
@@ -3196,6 +3351,11 @@ namespace
     {
         return Photon::buildGpuTable(map, out);
     }
+
+    // SPPM host PODs. Same layout as MSL PCRSppmPixel / PCRSppmDelta;
+    // pulled from the shared Photon module.
+    using PCRSppmPixel = Photon::SppmPixel;
+    using PCRSppmDelta = Photon::SppmDelta;
 
     // ---------- Wavefront ray-state SoA buffers --------------------------
     //
@@ -3534,6 +3694,10 @@ struct MetalRenderer::Impl
     id<MTLComputePipelineState> pipelineWfShadeDiffuse  = nil;
     id<MTLComputePipelineState> pipelineWfWriteback     = nil;
     id<MTLComputePipelineState> pipelineWfScatterForks  = nil;
+    // SPPM end-of-pass update kernel. Applies Hachisuka 2009
+    // shrinkage to per-pixel state using the delta accumulated this
+    // pass, then zeros the delta.
+    id<MTLComputePipelineState> pipelineSppmUpdate       = nil;
 
     // Output + OIDN aux. RGBA32Float so the readback path keeps full HDR
     // (matches OpenGL backend's RGBA16F, but Metal's RGBA16Float
@@ -3780,6 +3944,25 @@ namespace
         if (!im.pipelineWfScatterForks)
         {
             std::cerr << "MetalRenderer: wavefront fork-scatter pipeline build failed: "
+                      << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
+                      << std::endl;
+            return false;
+        }
+
+        // SPPM end-of-pass update. Built unconditionally so the
+        // dispatch in the progressive loop can fire it without a
+        // build-time check; the kernel only runs when SPPM is on.
+        id<MTLFunction> fnSppmUpdate = [lib newFunctionWithName:@"sppm_pass_update"];
+        if (!fnSppmUpdate)
+        {
+            std::cerr << "MetalRenderer: MSL kernel 'sppm_pass_update' not found"
+                      << std::endl;
+            return false;
+        }
+        im.pipelineSppmUpdate = [im.device newComputePipelineStateWithFunction:fnSppmUpdate error:&err];
+        if (!im.pipelineSppmUpdate)
+        {
+            std::cerr << "MetalRenderer: SPPM update pipeline build failed: "
                       << (err ? [[err localizedDescription] UTF8String] : "(no error info)")
                       << std::endl;
             return false;
@@ -4055,6 +4238,20 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // single pass.
     bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
     int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
+
+    // SPPM (Hachisuka & Jensen 2009): layered on progressive. As of
+    // session 7 this ships on the Metal megakernel only; wavefront
+    // SPPM is a follow-up session. When the user asks for SPPM in
+    // wavefront mode we warn + fall back to plain progressive.
+    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
+    if (effectiveSppm && effectiveWavefront)
+    {
+        std::cerr << "warning: --photon-sppm not yet implemented on the "
+                     "Metal wavefront path; running plain progressive. "
+                     "Use --no-wavefront to get full SPPM via the "
+                     "megakernel.\n";
+        effectiveSppm = false;
+    }
     // Wavefront integration lands in session 3. Decision pushed below
     // the architecture-selection block so we use the post-fallback
     // effectiveWavefront value, not the raw flag.
@@ -4185,12 +4382,15 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.useBsdfMis       = useBsdfMis ? 1 : 0;
     uBase._pad0            = 0;
     uBase._pad1            = 0;
-    uBase._pad2            = 0;
     // Photon-map uniforms default to "off". Filled in below if the
     // GPU hash table built successfully.
     uBase.useCausticPhotonMap = 0;
     uBase.photonCellTableMask = 0;
     uBase.photonRadius        = photonRadius;
+    // SPPM toggle gates the in-kernel "first diffuse writes to
+    // delta vs. classical density estimate" branch. Stays at 0 if
+    // SPPM is off or fell back to progressive on wavefront.
+    uBase.useCausticPhotonSppm = effectiveSppm ? 1 : 0;
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
 
@@ -4239,6 +4439,59 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // iteration.
     int tgX = 0;
     int tgY = 0;
+
+    // SPPM per-pixel state + delta buffers. Allocated outside the
+    // progressive loop because they persist across iterations (the
+    // shrinkage update integrates each pass into the running R / tau
+    // / N state). When SPPM is off we allocate 1-element dummies so
+    // the kernel bindings always resolve.
+    id<MTLBuffer> sppmBuf      = nil;
+    id<MTLBuffer> sppmDeltaBuf = nil;
+    if (effectiveSppm)
+    {
+        const size_t pixelCount = (size_t)_width * _height;
+        std::vector<PCRSppmPixel> initState(pixelCount,
+            PCRSppmPixel{photonRadius, 0.f, 0.f, 0.f, 0.f});
+        sppmBuf = [_impl->device
+            newBufferWithBytes:initState.data()
+                        length:pixelCount * sizeof(PCRSppmPixel)
+                       options:MTLResourceStorageModeShared];
+        std::vector<PCRSppmDelta> initDelta(pixelCount,
+            PCRSppmDelta{0.f, 0.f, 0.f, 0.f});
+        sppmDeltaBuf = [_impl->device
+            newBufferWithBytes:initDelta.data()
+                        length:pixelCount * sizeof(PCRSppmDelta)
+                       options:MTLResourceStorageModeShared];
+        if (!sppmBuf || !sppmDeltaBuf)
+        {
+            std::cerr << "MetalRenderer: SPPM buffer alloc failed; "
+                         "falling back to non-SPPM progressive.\n";
+            effectiveSppm = false;
+            uBase.useCausticPhotonSppm = 0;
+            sppmBuf = nil; sppmDeltaBuf = nil;
+        }
+        else
+        {
+            std::cout << "MetalRenderer: SPPM state allocated ("
+                      << pixelCount << " pixels, "
+                      << (pixelCount * sizeof(PCRSppmPixel)) / (1024*1024)
+                      << " MB state + delta)" << std::endl;
+        }
+    }
+    if (!sppmBuf)
+    {
+        PCRSppmPixel dummyS{};
+        sppmBuf = [_impl->device
+            newBufferWithBytes:&dummyS length:sizeof(PCRSppmPixel)
+                       options:MTLResourceStorageModeShared];
+    }
+    if (!sppmDeltaBuf)
+    {
+        PCRSppmDelta dummyD{};
+        sppmDeltaBuf = [_impl->device
+            newBufferWithBytes:&dummyD length:sizeof(PCRSppmDelta)
+                       options:MTLResourceStorageModeShared];
+    }
 
     for (int progPass = 0; progPass < numProgPasses; progPass++)
     {
@@ -4898,6 +5151,10 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             // uBase.useCausticPhotonMap.
             [enc setBuffer:photonsBuf offset:0 atIndex:9];
             [enc setBuffer:cellsBuf   offset:0 atIndex:10];
+            // SPPM per-pixel state at slots 11/12. Same convention
+            // as photons: always bound, gated by uBase.useCausticPhotonSppm.
+            [enc setBuffer:sppmBuf      offset:0 atIndex:11];
+            [enc setBuffer:sppmDeltaBuf offset:0 atIndex:12];
             [enc setTexture:_impl->outputTex atIndex:0];
             [enc setTexture:_impl->albedoTex atIndex:1];
             [enc setTexture:_impl->normalTex atIndex:2];
@@ -4926,6 +5183,32 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // after the encoding loop completes.
     if ([pending count] > 0)
         [[pending lastObject] waitUntilCompleted];
+
+    // SPPM end-of-pass update. Runs only when SPPM is on; reads the
+    // per-pixel delta accumulated this pass, applies Hachisuka 2009
+    // shrinkage to per-pixel state, zeros the delta for the next
+    // pass. Synchronous (waitUntilCompleted) so the state is ready
+    // by the time we hit the readback below and the next progressive
+    // iter doesn't start until update finishes.
+    if (effectiveSppm)
+    {
+        id<MTLCommandBuffer> updCmd = [_impl->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [updCmd computeCommandEncoder];
+        [enc setComputePipelineState:_impl->pipelineSppmUpdate];
+        // Reuse uniforms buffer; the kernel reads only u.width / u.height.
+        // Any per-pass uniforms entry works (they all carry the same
+        // width/height); use pass 0 as a stable choice.
+        [enc setBuffer:uniformsBuf offset:0 atIndex:0];
+        [enc setBuffer:sppmBuf      offset:0 atIndex:11];
+        [enc setBuffer:sppmDeltaBuf offset:0 atIndex:12];
+        MTLSize sppmGrid = MTLSizeMake(
+            (NSUInteger)((_width + tgX - 1) / tgX),
+            (NSUInteger)((_height + tgY - 1) / tgY), 1);
+        [enc dispatchThreadgroups:sppmGrid threadsPerThreadgroup:threadsPerGroup];
+        [enc endEncoding];
+        [updCmd commit];
+        [updCmd waitUntilCompleted];
+    }
 
     // Audit cmd buffer outcomes. Apple's compute watchdog (the
     // looser-than-Windows-TDR equivalent) shows up here as
@@ -5041,6 +5324,30 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         std::cout << "MetalRenderer: progressive averaging across "
                   << numProgPasses << " passes complete." << std::endl;
     }
+
+    // SPPM final composite: read back the per-pixel SPPM state and
+    // add the Hachisuka caustic estimate (tau / (pi * R^2 * N_emitted))
+    // to hdr per pixel. The progAccum-averaged hdr already holds the
+    // eye-path direct + indirect contributions; SPPM adds the caustic
+    // on top via the per-pixel-adaptive estimator.
+    if (effectiveSppm && numProgPasses > 0)
+    {
+        const size_t pixelCount = (size_t)_width * _height;
+        const PCRSppmPixel *state =
+            (const PCRSppmPixel *)[sppmBuf contents];
+        const float invEmitted = 1.0f /
+            ((float)M_PI * (float)photonCount * (float)numProgPasses);
+        for (size_t i = 0; i < pixelCount; i++)
+        {
+            const PCRSppmPixel &px = state[i];
+            if (px.N <= 0.f || px.R <= 0.f) continue;
+            float scale = (1.0f / (px.R * px.R)) * invEmitted;
+            hdr[i][0] += px.tauR * scale;
+            hdr[i][1] += px.tauG * scale;
+            hdr[i][2] += px.tauB * scale;
+        }
+        std::cout << "MetalRenderer: SPPM final composite complete." << std::endl;
+    }
     // Hand the captured aux to the OIDN block below under the names
     // it expects. albedoBuf / normalBuf were originally local to the
     // readback site; now they're carried across progressive passes.
@@ -5101,11 +5408,16 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         filename += "-aces";
     // Filename tag only when the photon map actually ran (built non-empty,
     // megakernel path, not silently skipped in spectral mode). Matches the
-    // PNG metadata gate below so the two stay self-consistent. Progressive
-    // mode appends "-prog" so A/B sorting groups classical vs progressive
+    // PNG metadata gate below so the two stay self-consistent. Mode suffix
+    // is "-photon-sppm" (full SPPM) > "-photon-prog" (ensemble progressive)
+    // > "-photon" (classical single pass), so A/B sorting groups variants
     // cleanly.
     if (uBase.useCausticPhotonMap != 0)
-        filename += effectiveProgressive ? "-photon-prog" : "-photon";
+    {
+        if (effectiveSppm)            filename += "-photon-sppm";
+        else if (effectiveProgressive) filename += "-photon-prog";
+        else                           filename += "-photon";
+    }
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -5163,6 +5475,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             addText("PhotonProgressive", "1");
             addText("PhotonPasses",      std::to_string(numProgPasses));
         }
+        if (effectiveSppm)
+            addText("PhotonSppm", "1");
     }
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));

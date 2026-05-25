@@ -144,6 +144,9 @@ struct JobConfig
     // so flipping the photon-map checkbox doesn't lose state.
     bool  useCausticPhotonProgressive = false;
     int   photonPasses = 8;
+    // True SPPM toggle; layered on top of useCausticPhotonProgressive.
+    // Per-pixel adaptive radius shrinkage, asymptotically unbiased.
+    bool  useCausticPhotonSppm = false;
 };
 
 struct JobResult
@@ -328,6 +331,8 @@ struct Settings
     // OpenGL plumbed but runs single-pass with a warning.
     bool  useCausticPhotonProgressive = false;
     int   photonPasses = 8;
+    // True SPPM (Hachisuka & Jensen 2009). Layered on top of progressive.
+    bool  useCausticPhotonSppm = false;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -390,6 +395,7 @@ static JobConfig makeJobConfig(const Settings &s)
     j.photonRadius  = s.photonRadius;
     j.useCausticPhotonProgressive = s.useCausticPhotonProgressive;
     j.photonPasses  = s.photonPasses;
+    j.useCausticPhotonSppm = s.useCausticPhotonSppm;
     return j;
 }
 
@@ -428,6 +434,7 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.photonRadius  = j.photonRadius;
     s.useCausticPhotonProgressive = j.useCausticPhotonProgressive;
     s.photonPasses  = j.photonPasses;
+    s.useCausticPhotonSppm = j.useCausticPhotonSppm;
 }
 
 // Returns nullptr if the job will run with its requested architecture,
@@ -496,8 +503,11 @@ static void renderJobSummary(const JobConfig &j)
     if (j.useStratified) tag("strat");
     if (j.useCausticPhotonMap && !j.useSpectral) {
         if (j.useCausticPhotonProgressive) {
-            char pb[24];
-            std::snprintf(pb, sizeof(pb), "photon-prog%d", j.photonPasses);
+            char pb[32];
+            if (j.useCausticPhotonSppm)
+                std::snprintf(pb, sizeof(pb), "photon-sppm%d", j.photonPasses);
+            else
+                std::snprintf(pb, sizeof(pb), "photon-prog%d", j.photonPasses);
             tag(pb);
         } else {
             tag("photon");
@@ -544,8 +554,11 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useStratified) tags += " strat";
     if (j.useCausticPhotonMap && !j.useSpectral) {
         if (j.useCausticPhotonProgressive) {
-            char pb[24];
-            std::snprintf(pb, sizeof(pb), " photon-prog%d", j.photonPasses);
+            char pb[32];
+            if (j.useCausticPhotonSppm)
+                std::snprintf(pb, sizeof(pb), " photon-sppm%d", j.photonPasses);
+            else
+                std::snprintf(pb, sizeof(pb), " photon-prog%d", j.photonPasses);
             tags += pb;
         } else {
             tags += " photon";
@@ -626,6 +639,8 @@ static void loadSettings(Settings &s)
         s.useCausticPhotonProgressive = j.value("useCausticPhotonProgressive",
                                                 s.useCausticPhotonProgressive);
         s.photonPasses  = j.value("photonPasses",  s.photonPasses);
+        s.useCausticPhotonSppm = j.value("useCausticPhotonSppm",
+                                         s.useCausticPhotonSppm);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -704,6 +719,7 @@ static json buildSettingsJson(const Settings &s)
     j["photonRadius"]  = s.photonRadius;
     j["useCausticPhotonProgressive"] = s.useCausticPhotonProgressive;
     j["photonPasses"]  = s.photonPasses;
+    j["useCausticPhotonSppm"] = s.useCausticPhotonSppm;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -988,6 +1004,7 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.photonRadius       = settings.photonRadius;
         renderer.useCausticPhotonProgressive = settings.useCausticPhotonProgressive;
         renderer.photonPasses       = settings.photonPasses;
+        renderer.useCausticPhotonSppm        = settings.useCausticPhotonSppm;
 #if PCR_USE_GPU
         renderer.threadgroupX  = settings.threadgroupX;
         renderer.threadgroupY  = settings.threadgroupY;
@@ -2232,6 +2249,26 @@ int main(int, char **)
                 ImGui::InputInt("Passes##photonpasses", &settings.photonPasses, 1, 4);
                 if (settings.photonPasses < 1)   settings.photonPasses = 1;
                 if (settings.photonPasses > 256) settings.photonPasses = 256;
+
+                // True SPPM toggle. Layered on progressive. Indented
+                // further to make the dependency visible. Disabled when
+                // progressive is off; setting persists either way.
+                ImGui::Indent();
+                ImGui::Checkbox("SPPM (per-pixel adaptive radius)",
+                                &settings.useCausticPhotonSppm);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stochastic Progressive Photon Mapping\n"
+                                      "(Hachisuka & Jensen 2009). Layered on\n"
+                                      "Progressive. Per-pixel adaptive radius\n"
+                                      "shrinkage converges to an asymptotically\n"
+                                      "unbiased caustic estimate. First diffuse\n"
+                                      "hit per primary ray becomes the visible\n"
+                                      "point; subsequent diffuse hits skip\n"
+                                      "photons (standard SPPM hitpoint\n"
+                                      "semantics). Slower per-pixel-state ops\n"
+                                      "but converges without the kernel-density\n"
+                                      "bias plain progressive leaves in.");
+                ImGui::Unindent();
             }
             ImGui::Unindent();
         }

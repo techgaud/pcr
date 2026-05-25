@@ -18,7 +18,7 @@
 // query a pre-built map without exposing the full PhotonMap header
 // through Renderer.h. The map itself lives as a local in render()
 // while the pointer holds for the duration of the render call.
-namespace Photon { class Map; }
+namespace Photon { class Map; struct SppmPixel; struct SppmDelta; }
 
 // Hero wavelength sampling (Wilkie et al. 2014). Each spectral ray
 // carries N wavelengths through the same path geometry, so the
@@ -141,6 +141,27 @@ public:
     bool  useCausticPhotonProgressive = false;
     int   photonPasses = 8;
 
+    // True SPPM (Hachisuka & Jensen 2009): layered on top of
+    // progressive. Per-pixel adaptive radius shrinkage that
+    // asymptotically eliminates the kernel-density bias.
+    // Implementation:
+    //   - First diffuse hit per primary ray becomes the pixel's
+    //     "visible point." Photon density estimate at the visible
+    //     point accumulates into per-pixel (delta_tau, M) state
+    //     instead of feeding the eye-path radiance directly.
+    //   - Subsequent diffuse hits along the same ray skip photon
+    //     contribution (standard SPPM hitpoint semantics).
+    //   - At end of each progressive pass, per-pixel update:
+    //       N_new = N + alpha * M, alpha = 2/3
+    //       R_new = R * sqrt(N_new / (N + M))
+    //       tau_new = (tau + delta_tau) * (N_new / (N + M))
+    //   - Final composite per pixel:
+    //       L = L_direct_indirect + tau / (pi * R^2 * N_emitted_total)
+    // Requires useCausticPhotonProgressive (SPPM is the progressive
+    // mode's per-pixel-adaptive variant). When SPPM is off but
+    // progressive is on, the simpler ensemble-averaging variant runs.
+    bool  useCausticPhotonSppm = false;
+
     // Hero-wavelength sample count. Default 4 = stratified hero sampling
     // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
     // for benchmarking and visual A/B against the hero default. Other
@@ -178,6 +199,15 @@ private:
     // list. nullptr means "no map active; skip density-estimate."
     const Photon::Map *_activeCausticMap = nullptr;
 
+    // SPPM per-pixel state. Allocated as a local std::vector in
+    // render() when useCausticPhotonSppm is on; the pointer here
+    // lets castRay mutate state at the first diffuse hit without
+    // threading another argument through the recursion. nullptr =
+    // "SPPM not active; classical / progressive density estimate
+    // path runs instead."
+    Photon::SppmPixel *_sppmState = nullptr;   // size pixelCount
+    Photon::SppmDelta *_sppmDelta = nullptr;   // size pixelCount
+
     // Optional out-params capture albedo + shading normal at the FIRST
     // hit (depth==0). Used to populate aux buffers for OIDN; recursive
     // calls inside castRay leave them null so deeper bounces don't
@@ -191,7 +221,18 @@ private:
                   const std::vector<Scenes::AreaLight> &lights,
                   float totalLightArea, int depth,
                   Vec3f *outFirstAlbedo = nullptr,
-                  Vec3f *outFirstNormal = nullptr);
+                  Vec3f *outFirstNormal = nullptr,
+                  // SPPM bookkeeping. pixelIdx identifies which
+                  // per-pixel SPPM state slot this ray's first
+                  // diffuse hit (if any) should mutate; -1 means
+                  // "no SPPM state to mutate" (the recursive call
+                  // path for non-SPPM uses this default). firstDiffuse
+                  // distinguishes the visible point (which mutates
+                  // state) from later diffuse hits along the same
+                  // primary ray (which skip photons entirely under
+                  // SPPM's hitpoint semantics).
+                  int pixelIdx = -1,
+                  bool firstDiffuse = true);
 
     // Hero wavelength variant for spectral mode. Tracks N=4 scalar
     // radiances at correlated wavelengths through the same path

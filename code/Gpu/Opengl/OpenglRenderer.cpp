@@ -2141,6 +2141,19 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
     int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
 
+    // True SPPM (Hachisuka & Jensen 2009) ships on the CPU + Metal-
+    // megakernel paths as of session 7. OpenGL SPPM requires the
+    // same per-pixel state buffers + an end-of-pass update kernel as
+    // Metal but in GLSL; that's a follow-up session. For now we warn
+    // and fall back to plain progressive.
+    if (useCausticPhotonSppm && effectiveProgressive)
+    {
+        std::cerr << "warning: --photon-sppm not yet implemented on the "
+                     "OpenGL backend; running plain progressive instead. "
+                     "Use the CPU CLI (no --no-wavefront needed) or the "
+                     "Metal CLI with --no-wavefront for full SPPM.\n";
+    }
+
     if (!_sharedContext)
     {
         std::cerr << "OpenglRenderer: no shared OpenGL context" << std::endl;
