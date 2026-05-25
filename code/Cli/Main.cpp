@@ -127,6 +127,13 @@ int main(int argc, char *argv[])
     int   photonCount = 1000000;
     float photonRadius = 0.05f;
 
+    // Progressive photon mapping (Hachisuka 2008 PPM, simplified):
+    // averages photonPasses iterations of (fresh photon shoot ->
+    // classical render). Requires --photon-map. CPU + Metal backends
+    // implement; OpenGL warns + runs single-pass for now.
+    bool useCausticPhotonProgressive = false;
+    int  photonPasses = 8;
+
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
         ->default_str("cornell");
@@ -265,6 +272,21 @@ int main(int argc, char *argv[])
                  "scale scenes (~2 unit walls) hit the sweet spot around "
                  "0.03 to 0.08.")
         ->default_str("0.05")
+        ->check(CLI::PositiveNumber);
+    techniques->add_flag("--photon-progressive", useCausticPhotonProgressive,
+                 "Progressive photon mapping (Hachisuka 2008 PPM, "
+                 "simplified). Runs --photon-passes iterations of (fresh "
+                 "photon shoot -> classical render) and averages the HDR "
+                 "framebuffers. Per-pixel variance drops as 1/sqrt(N) "
+                 "with extra passes; total wall time is N times the "
+                 "single-pass case. Requires --photon-map. CPU + Metal "
+                 "backends implement; OpenGL warns and runs single-pass.");
+    techniques->add_option("--photon-passes", photonPasses,
+                 "Number of progressive photon-mapping iterations when "
+                 "--photon-progressive is on. Default 8. Each iteration "
+                 "shoots a fresh batch of --photons photons and runs the "
+                 "full eye-path render; results averaged at the end.")
+        ->default_str("8")
         ->check(CLI::PositiveNumber);
 
     options->add_option("--seed", seed,
@@ -526,6 +548,8 @@ int main(int argc, char *argv[])
     renderer.useCausticPhotonMap = useCausticPhotonMap;
     renderer.photonCount         = photonCount;
     renderer.photonRadius        = photonRadius;
+    renderer.useCausticPhotonProgressive = useCausticPhotonProgressive;
+    renderer.photonPasses        = photonPasses;
 #if PCR_USE_GPU
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;

@@ -2134,6 +2134,12 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
                      "a later session).\n";
         effectivePhotonMap = false;
     }
+    if (useCausticPhotonProgressive && effectivePhotonMap)
+    {
+        std::cerr << "warning: --photon-progressive is CPU-only in this "
+                     "release; the OpenGL backend runs a single classical "
+                     "pass and ignores --photon-passes.\n";
+    }
 
     if (!_sharedContext)
     {

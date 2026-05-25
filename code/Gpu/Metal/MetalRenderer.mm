@@ -4046,6 +4046,12 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                      "a later session).\n";
         effectivePhotonMap = false;
     }
+    if (useCausticPhotonProgressive && effectivePhotonMap)
+    {
+        std::cerr << "warning: --photon-progressive is CPU-only in this "
+                     "release; the Metal backend runs a single classical "
+                     "pass and ignores --photon-passes.\n";
+    }
     // Wavefront integration lands in session 3. Decision pushed below
     // the architecture-selection block so we use the post-fallback
     // effectiveWavefront value, not the raw flag.

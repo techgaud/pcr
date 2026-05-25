@@ -138,6 +138,12 @@ struct JobConfig
     bool  useCausticPhotonMap = false;
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
+
+    // Progressive photon mapping toggle. See Renderer.h for semantics.
+    // Gated on useCausticPhotonMap in the UI; persisted regardless
+    // so flipping the photon-map checkbox doesn't lose state.
+    bool  useCausticPhotonProgressive = false;
+    int   photonPasses = 8;
 };
 
 struct JobResult
@@ -318,6 +324,10 @@ struct Settings
     bool  useCausticPhotonMap = false;
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
+    // Progressive photon mapping. CPU + Metal backends as of session 5;
+    // OpenGL plumbed but runs single-pass with a warning.
+    bool  useCausticPhotonProgressive = false;
+    int   photonPasses = 8;
 
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
@@ -378,6 +388,8 @@ static JobConfig makeJobConfig(const Settings &s)
     j.useCausticPhotonMap = s.useCausticPhotonMap;
     j.photonCount   = s.photonCount;
     j.photonRadius  = s.photonRadius;
+    j.useCausticPhotonProgressive = s.useCausticPhotonProgressive;
+    j.photonPasses  = s.photonPasses;
     return j;
 }
 
@@ -414,6 +426,8 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.useCausticPhotonMap = j.useCausticPhotonMap;
     s.photonCount   = j.photonCount;
     s.photonRadius  = j.photonRadius;
+    s.useCausticPhotonProgressive = j.useCausticPhotonProgressive;
+    s.photonPasses  = j.photonPasses;
 }
 
 // Returns nullptr if the job will run with its requested architecture,
@@ -480,7 +494,15 @@ static void renderJobSummary(const JobConfig &j)
     if (j.useMIS && j.useWavefront && j.useBsdfMis) tag("mis-bsdf");
     if (j.useRussian)    tag("rr");
     if (j.useStratified) tag("strat");
-    if (j.useCausticPhotonMap && !j.useSpectral) tag("photon");
+    if (j.useCausticPhotonMap && !j.useSpectral) {
+        if (j.useCausticPhotonProgressive) {
+            char pb[24];
+            std::snprintf(pb, sizeof(pb), "photon-prog%d", j.photonPasses);
+            tag(pb);
+        } else {
+            tag("photon");
+        }
+    }
     if (j.useWavefront) {
         // Append "-terminate" to the wavefront tag when the cheaper
         // terminate strategy is selected in spectral mode (fork is the
@@ -520,7 +542,15 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useMIS && j.useWavefront && j.useBsdfMis) tags += " mis-bsdf";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
-    if (j.useCausticPhotonMap && !j.useSpectral) tags += " photon";
+    if (j.useCausticPhotonMap && !j.useSpectral) {
+        if (j.useCausticPhotonProgressive) {
+            char pb[24];
+            std::snprintf(pb, sizeof(pb), " photon-prog%d", j.photonPasses);
+            tags += pb;
+        } else {
+            tags += " photon";
+        }
+    }
     if (j.useWavefront) {
         tags += j.wavefrontMultiSample ? " wave-mspp" : " wave-1spp";
         if (j.useSpectral && !j.spectralFork) tags += "-terminate";
@@ -593,6 +623,9 @@ static void loadSettings(Settings &s)
         s.useCausticPhotonMap = j.value("useCausticPhotonMap", s.useCausticPhotonMap);
         s.photonCount   = j.value("photonCount",   s.photonCount);
         s.photonRadius  = j.value("photonRadius",  s.photonRadius);
+        s.useCausticPhotonProgressive = j.value("useCausticPhotonProgressive",
+                                                s.useCausticPhotonProgressive);
+        s.photonPasses  = j.value("photonPasses",  s.photonPasses);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -669,6 +702,8 @@ static json buildSettingsJson(const Settings &s)
     j["useCausticPhotonMap"] = s.useCausticPhotonMap;
     j["photonCount"]   = s.photonCount;
     j["photonRadius"]  = s.photonRadius;
+    j["useCausticPhotonProgressive"] = s.useCausticPhotonProgressive;
+    j["photonPasses"]  = s.photonPasses;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -951,6 +986,8 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.useCausticPhotonMap = settings.useCausticPhotonMap;
         renderer.photonCount        = settings.photonCount;
         renderer.photonRadius       = settings.photonRadius;
+        renderer.useCausticPhotonProgressive = settings.useCausticPhotonProgressive;
+        renderer.photonPasses       = settings.photonPasses;
 #if PCR_USE_GPU
         renderer.threadgroupX  = settings.threadgroupX;
         renderer.threadgroupY  = settings.threadgroupY;
@@ -2172,6 +2209,31 @@ int main(int, char **)
                                   "Larger = smoother but blurrier. Cornell-class\n"
                                   "scenes (~2 unit walls) hit the sweet spot at\n"
                                   "0.03 to 0.08.");
+            // Progressive photon mapping toggle. Indented under the
+            // photon-map row to make the dependency visible. Disabled
+            // when photon mapping itself is off (the setting persists
+            // either way, so toggling photon-map off + on restores
+            // the user's last progressive choice).
+            ImGui::Indent();
+            ImGui::Checkbox("Progressive (average N passes)",
+                            &settings.useCausticPhotonProgressive);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Runs N iterations of (fresh photon shoot ->\n"
+                                  "classical render) and averages the HDR\n"
+                                  "framebuffers. Per-pixel variance drops as\n"
+                                  "1/sqrt(N); total wall time is N times the\n"
+                                  "single-pass case. Hachisuka 2008 PPM,\n"
+                                  "simplified (no per-pixel adaptive radius).\n"
+                                  "CPU + Metal only; OpenGL warns and skips.");
+            if (settings.useCausticPhotonProgressive)
+            {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                ImGui::InputInt("Passes##photonpasses", &settings.photonPasses, 1, 4);
+                if (settings.photonPasses < 1)   settings.photonPasses = 1;
+                if (settings.photonPasses > 256) settings.photonPasses = 256;
+            }
+            ImGui::Unindent();
         }
 
         ImGui::SeparatorText("Output");

@@ -148,8 +148,22 @@ void Renderer::render(const Scenes::SceneData &scene,
     //
     // Spectral mode warning: density-estimate is RGB-only for now,
     // so castRaySpectral skips the lookup. Logged once here.
+    //
+    // In progressive mode the actual Photon::shootCaustic call moves
+    // inside the per-pass loop below (each progressive iteration
+    // shoots fresh photons with a different seed). The single-shot
+    // call here only fires in non-progressive mode.
+    bool effectiveProgressive = useCausticPhotonMap && useCausticPhotonProgressive;
+    if (effectiveProgressive && useSpectral)
+    {
+        // Spectral skips density-estimate, so progressive is a no-op.
+        // Fall back to a single non-progressive pass to avoid wasted
+        // re-shoots that don't contribute.
+        effectiveProgressive = false;
+    }
+    int numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
     std::optional<Photon::Map> causticMap;
-    if (useCausticPhotonMap)
+    if (useCausticPhotonMap && !effectiveProgressive)
     {
         if (useSpectral)
         {
@@ -186,6 +200,37 @@ void Renderer::render(const Scenes::SceneData &scene,
     unsigned int numThreads = (NumGen::getSeed() != 0)
         ? 1u
         : std::thread::hardware_concurrency();
+
+    // Progressive accumulator. In non-progressive mode this stays
+    // empty and the existing single-pass behavior runs once below.
+    // In progressive mode the per-pass HDR framebuffer is summed
+    // here and divided by photonPasses at the end.
+    std::vector<Vec3f> progAccum;
+    if (effectiveProgressive)
+        progAccum.assign((size_t)_width * _height, Vec3f(0, 0, 0));
+
+    uint64_t baseProgSeed = NumGen::getSeed();
+    if (baseProgSeed == 0)
+        baseProgSeed = (uint64_t)std::time(nullptr);
+
+    for (int progPass = 0; progPass < numProgPasses; progPass++)
+    {
+        if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
+            break;
+
+        // Fresh photon shoot per progressive pass. The seed is
+        // baseProgSeed + progPass so different passes get
+        // decorrelated photon trails; combined with the per-pixel
+        // averaging this gives the 1/sqrt(N) variance reduction
+        // that's the whole point of progressive.
+        if (effectiveProgressive)
+        {
+            causticMap.emplace(Photon::shootCaustic(scene, photonCount, photonRadius,
+                                                    _maxDepth,
+                                                    baseProgSeed + (uint64_t)progPass));
+            _activeCausticMap = &*causticMap;
+        }
+
     std::vector<std::thread> threads(numThreads);
 
     for (size_t t = 0; t < numThreads; t++)
@@ -365,6 +410,38 @@ void Renderer::render(const Scenes::SceneData &scene,
     if (snapshotThread.joinable())
         snapshotThread.join();
 
+    // End of this progressive pass. Accumulate the just-rendered
+    // frameBuffer into the running sum. Non-progressive mode leaves
+    // progAccum empty and skips this branch; frameBuffer is already
+    // the final result.
+    if (effectiveProgressive)
+    {
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            progAccum[i][0] += frameBuffer[i][0];
+            progAccum[i][1] += frameBuffer[i][1];
+            progAccum[i][2] += frameBuffer[i][2];
+        }
+    }
+    } // end of progressive-pass loop
+
+    if (effectiveProgressive && numProgPasses > 0)
+    {
+        // Take the per-pixel mean across progressive passes. The
+        // tone-map / OIDN / PNG path below runs once on the averaged
+        // HDR result; intermediate pre-tone-map per-pass buffers are
+        // discarded (they're useful only for the running sum).
+        float invN = 1.0f / (float)numProgPasses;
+        for (size_t i = 0; i < (size_t)_width * _height; i++)
+        {
+            frameBuffer[i][0] = progAccum[i][0] * invN;
+            frameBuffer[i][1] = progAccum[i][1] * invN;
+            frameBuffer[i][2] = progAccum[i][2] * invN;
+        }
+        std::cout << "Renderer: progressive averaging across "
+                  << numProgPasses << " passes complete." << std::endl;
+    }
+
     // Clear the dangling-pointer-prevention: causticMap (the
     // std::optional that owns the storage) goes out of scope at the
     // end of this function. Null _activeCausticMap before that so a
@@ -445,7 +522,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     if (useACES)
         filename += "-aces";
     if (useCausticPhotonMap && !useSpectral)
-        filename += "-photon";
+        filename += effectiveProgressive ? "-photon-prog" : "-photon";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
@@ -489,6 +566,11 @@ void Renderer::render(const Scenes::SceneData &scene,
         addText("PhotonMap",    "1");
         addText("PhotonCount",  std::to_string(photonCount));
         addText("PhotonRadius", std::to_string(photonRadius));
+        if (effectiveProgressive)
+        {
+            addText("PhotonProgressive", "1");
+            addText("PhotonPasses",      std::to_string(numProgPasses));
+        }
     }
 
     std::vector<unsigned char> pngBuffer;

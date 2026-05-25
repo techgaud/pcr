@@ -105,6 +105,12 @@ public:
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
 
+    // Progressive photon mapping. Plumbed through here for CLI / GUI
+    // source compatibility but the OpenGL render path runs a single
+    // pass and warns when progressive is on. Real impl deferred.
+    bool  useCausticPhotonProgressive = false;
+    int   photonPasses = 8;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

@@ -128,6 +128,19 @@ public:
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
 
+    // Progressive photon mapping (Hachisuka 2008 PPM, simplified).
+    // When on, the renderer runs photonPasses iterations of (shoot
+    // fresh photons -> classical render) and averages the resulting
+    // HDR framebuffers. Each pass uses a fresh photon-shoot seed, so
+    // photon coverage across passes is decorrelated; the per-pixel
+    // mean converges as 1/sqrt(N) in noise. Strictly speaking this is
+    // ensemble averaging rather than per-pixel SPPM (no adaptive radius
+    // shrinkage), but it's the tractable cross-backend version and gets
+    // most of the practical variance reduction. Requires
+    // useCausticPhotonMap to be on; ignored otherwise.
+    bool  useCausticPhotonProgressive = false;
+    int   photonPasses = 8;
+
     // Hero-wavelength sample count. Default 4 = stratified hero sampling
     // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
     // for benchmarking and visual A/B against the hero default. Other

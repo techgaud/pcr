@@ -106,6 +106,15 @@ public:
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
 
+    // Progressive photon mapping. See Renderer.h for semantics. On
+    // Metal: each progressive iteration re-shoots photons (fresh seed),
+    // re-uploads the GPU table, and re-runs the existing per-pass
+    // dispatch into outputTex. The HDR framebuffer is read back + summed
+    // on the host between iterations; the final tone-map / OIDN / PNG
+    // path runs once after all iterations.
+    bool  useCausticPhotonProgressive = false;
+    int   photonPasses = 8;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);
