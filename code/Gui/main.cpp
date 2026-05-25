@@ -132,6 +132,12 @@ struct JobConfig
     bool useWavefront = pcr::kDefaultUseWavefront;
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
     bool spectralFork = pcr::kDefaultSpectralFork;
+
+    // Caustic photon mapping. Defaults off so renders are byte-
+    // identical to pre-photon-map behavior until flipped.
+    bool  useCausticPhotonMap = false;
+    int   photonCount  = 1000000;
+    float photonRadius = 0.05f;
 };
 
 struct JobResult
@@ -307,6 +313,12 @@ struct Settings
     bool wavefrontMultiSample = pcr::kDefaultWavefrontMultiSample;
     bool spectralFork = pcr::kDefaultSpectralFork;
 
+    // Caustic photon mapping. CPU + Metal megakernel as of session 2;
+    // wavefront / OpenGL ports land in sessions 3-4.
+    bool  useCausticPhotonMap = false;
+    int   photonCount  = 1000000;
+    float photonRadius = 0.05f;
+
     // LUT for spectral RGB-to-spectrum upsampling. The control only
     // appears in the GUI when useSpectral == true; its setting is
     // persisted regardless so flipping spectral on later restores the
@@ -363,6 +375,9 @@ static JobConfig makeJobConfig(const Settings &s)
     j.useWavefront  = s.useWavefront;
     j.wavefrontMultiSample = s.wavefrontMultiSample;
     j.spectralFork  = s.spectralFork;
+    j.useCausticPhotonMap = s.useCausticPhotonMap;
+    j.photonCount   = s.photonCount;
+    j.photonRadius  = s.photonRadius;
     return j;
 }
 
@@ -396,6 +411,9 @@ static void applyJobConfig(const JobConfig &j, Settings &s)
     s.useWavefront  = j.useWavefront;
     s.wavefrontMultiSample = j.wavefrontMultiSample;
     s.spectralFork  = j.spectralFork;
+    s.useCausticPhotonMap = j.useCausticPhotonMap;
+    s.photonCount   = j.photonCount;
+    s.photonRadius  = j.photonRadius;
 }
 
 // Returns nullptr if the job will run with its requested architecture,
@@ -462,6 +480,7 @@ static void renderJobSummary(const JobConfig &j)
     if (j.useMIS && j.useWavefront && j.useBsdfMis) tag("mis-bsdf");
     if (j.useRussian)    tag("rr");
     if (j.useStratified) tag("strat");
+    if (j.useCausticPhotonMap && !j.useSpectral) tag("photon");
     if (j.useWavefront) {
         // Append "-terminate" to the wavefront tag when the cheaper
         // terminate strategy is selected in spectral mode (fork is the
@@ -501,6 +520,7 @@ static std::string summarizeJob(const JobConfig &j)
     if (j.useMIS && j.useWavefront && j.useBsdfMis) tags += " mis-bsdf";
     if (j.useRussian)    tags += " rr";
     if (j.useStratified) tags += " strat";
+    if (j.useCausticPhotonMap && !j.useSpectral) tags += " photon";
     if (j.useWavefront) {
         tags += j.wavefrontMultiSample ? " wave-mspp" : " wave-1spp";
         if (j.useSpectral && !j.spectralFork) tags += "-terminate";
@@ -570,6 +590,9 @@ static void loadSettings(Settings &s)
         s.useWavefront  = j.value("useWavefront",  s.useWavefront);
         s.wavefrontMultiSample = j.value("wavefrontMultiSample", s.wavefrontMultiSample);
         s.spectralFork  = j.value("spectralFork",  s.spectralFork);
+        s.useCausticPhotonMap = j.value("useCausticPhotonMap", s.useCausticPhotonMap);
+        s.photonCount   = j.value("photonCount",   s.photonCount);
+        s.photonRadius  = j.value("photonRadius",  s.photonRadius);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
@@ -643,6 +666,9 @@ static json buildSettingsJson(const Settings &s)
     j["useWavefront"]  = s.useWavefront;
     j["wavefrontMultiSample"] = s.wavefrontMultiSample;
     j["spectralFork"]  = s.spectralFork;
+    j["useCausticPhotonMap"] = s.useCausticPhotonMap;
+    j["photonCount"]   = s.photonCount;
+    j["photonRadius"]  = s.photonRadius;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
     json arr = json::array();
@@ -922,6 +948,9 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
         renderer.aaSamples     = settings.useAA ? std::max(1, settings.aaSamples) : 1;
         renderer.useAdaptive   = settings.useAdaptive;
         renderer.useOIDN       = settings.useOIDN;
+        renderer.useCausticPhotonMap = settings.useCausticPhotonMap;
+        renderer.photonCount        = settings.photonCount;
+        renderer.photonRadius       = settings.photonRadius;
 #if PCR_USE_GPU
         renderer.threadgroupX  = settings.threadgroupX;
         renderer.threadgroupY  = settings.threadgroupY;
@@ -2104,6 +2133,46 @@ int main(int, char **)
                               "(neural-net denoiser). Uses albedo + shading\n"
                               "normal aux buffers from first hit. Requires\n"
                               "the binary to be built with PCR_USE_OIDN=ON.");
+
+        // Caustic photon mapping (Jensen 1996). The checkbox is enabled
+        // unconditionally; the renderer falls back to a noop if the
+        // active backend / mode doesn't support it (spectral renders
+        // skip it RGB-only; wavefront / OpenGL warn one-time per
+        // render until sessions 3-4 ship). The disabled state would
+        // require knowing each backend's eventual support matrix at
+        // GUI compile time, which is more complexity than it's worth
+        // for a feature flag whose mis-toggle gracefully no-ops.
+        ImGui::Checkbox("Caustic photon mapping (Jensen 1996)",
+                        &settings.useCausticPhotonMap);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pre-pass shoots photons from area lights;\n"
+                              "stores them at the first diffuse surface\n"
+                              "after at least one specular bounce. Eye\n"
+                              "path adds a density estimate at every\n"
+                              "diffuse hit. Big win on caustic-heavy\n"
+                              "scenes (cornell-glass etc). RGB-only;\n"
+                              "spectral renders skip it.");
+        if (settings.useCausticPhotonMap)
+        {
+            // Photon count: log-scale-friendly via the slider. 100k - 10M
+            // covers the range that's interesting on Cornell-scale scenes;
+            // pushing higher mostly costs memory without visible benefit.
+            ImGui::SetNextItemWidth(140);
+            ImGui::InputInt("Photons##photoncount", &settings.photonCount, 100000, 1000000);
+            if (settings.photonCount < 1000) settings.photonCount = 1000;
+            if (settings.photonCount > 50000000) settings.photonCount = 50000000;
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputFloat("Radius##photonradius", &settings.photonRadius, 0.005f, 0.05f, "%.4f");
+            if (settings.photonRadius < 0.001f) settings.photonRadius = 0.001f;
+            if (settings.photonRadius > 1.0f) settings.photonRadius = 1.0f;
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Density-estimate search radius in scene units.\n"
+                                  "Smaller = sharper caustic edges, more noise.\n"
+                                  "Larger = smoother but blurrier. Cornell-class\n"
+                                  "scenes (~2 unit walls) hit the sweet spot at\n"
+                                  "0.03 to 0.08.");
+        }
 
         ImGui::SeparatorText("Output");
         // Cap at 16384 (2^14) - the Apple Silicon MTLTexture max

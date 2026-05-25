@@ -55,6 +55,8 @@
 #include "Includes/ToneMap.h"
 #include "Includes/Spectrum.h"
 #include "Includes/RGBToSpectrum.h"
+#include "../../Photon/PhotonMap.h"
+#include "../../Photon/PhotonShoot.h"
 
 namespace fs = std::filesystem;
 
@@ -236,6 +238,22 @@ struct Uniforms {
     // catches drift. Future flags slot in by replacing pads.
     int   _pad0;
     int   _pad1;
+    // Caustic photon-map controls.
+    //   useCausticPhotonMap: 0 = density estimate skipped entirely
+    //                         (photons / cells buffers may still be
+    //                         bound to dummy placeholders, never read).
+    //                         1 = enabled.
+    //   photonCellTableMask: (tableSize - 1) for the open-addressed
+    //                         cell hash table; tableSize is rounded up
+    //                         to a power of 2 host-side so the kernel
+    //                         can mask instead of mod.
+    //   photonRadius       : kernel search radius in scene units; also
+    //                         the hash-grid cell size. Drives the
+    //                         (1 / pi r^2) density-estimate prefactor.
+    int   useCausticPhotonMap;
+    int   photonCellTableMask;
+    float photonRadius;
+    int   _pad2;
 };
 
 // Per-pixel Welford state for the adaptive multi-pass kernel.
@@ -285,6 +303,48 @@ inline uint stateSetDepth(uint s, uint depth) {
 
 // Bundle of all device buffers + uniforms threaded through every helper
 // so the GLSL "global" SSBOs translate to a single explicit parameter.
+// Caustic photon mapping (Jensen 1996). Host-side counterpart is
+// code/Photon/PhotonMap.h's Photon::Record + the hash-table flattening
+// in MetalRenderer's buildCausticPhotonGpuBuffers helper.
+//
+// PCRPhoton: 36-byte POD identical to host Photon::Record. position
+// and wi and power are packed_float3 (12 bytes each, no alignment
+// padding inside MSL device storage). When the photon map is off,
+// the kernel does not read this buffer; the host binds a 1-slot
+// dummy in that case.
+//
+// PCRPhotonCell: 12-byte open-addressed hash-table slot. cellHash =
+// kPhotonEmptyCell (0xFFFFFFFF) marks unused. cellHash holds the
+// per-(cx,cy,cz) Teschner hash; offset + count delimit a contiguous
+// run of photons in the photons buffer that fall into this cell.
+//
+// Lookup chases the table with linear probing; load factor stays
+// <=0.5 host-side (rounded up to a power of two) so the expected
+// probe count is tiny. Probes are bounded to 8 steps below for
+// pathological collisions; missed lookups silently lose those
+// photons rather than infinite-loop the kernel.
+struct PCRPhoton {
+    packed_float3 position;
+    packed_float3 wi;
+    packed_float3 power;
+};
+
+struct PCRPhotonCell {
+    uint cellHash;
+    uint offset;
+    uint count;
+};
+
+constant uint kPhotonEmptyCell = 0xFFFFFFFFu;
+
+// Teschner 2003 spatial hash. Mirrors Photon::Map::cellHash on the
+// host so cells built CPU-side land in the same GPU slot.
+inline uint photonCellHash(int cx, int cy, int cz) {
+    return uint(cx) * 73856093u
+         ^ uint(cy) * 19349663u
+         ^ uint(cz) * 83492791u;
+}
+
 struct Scene {
     constant Uniforms                &u;
     device const GpuSphere           *spheres;
@@ -294,7 +354,73 @@ struct Scene {
     device const GpuBvhNode          *bvhNodes;
     device const GpuLight            *lights;
     device const GpuLightTriangle    *lightTriangles;
+    // Caustic photon-map buffers. Always non-null because the host
+    // binds dummy 1-element placeholders when the map is off; the
+    // kernel guards reads behind u.useCausticPhotonMap.
+    device const PCRPhoton           *photons;
+    device const PCRPhotonCell       *photonCells;
 };
+
+// Caustic density estimate at a diffuse hit point x with outward
+// normal N and Lambertian albedo. Returns the radiance to add directly
+// to the eye-path accumulator at this hit; the caller multiplies by
+// throughput.
+//
+// Mathematical form (PBRT v4 ch. 16, Lambertian f_r = albedo / pi):
+//   L_o = (albedo / pi) * (1 / (pi r^2)) * sum_p Phi_p
+// over photons p within radius r of x whose direction-of-travel wi
+// strikes the front side (wi.N < 0). Photons heading into the back
+// side of this surface are dropped to match the CPU implementation.
+float3 photonDensityEstimate(thread const Scene &S,
+                             device const PCRPhoton *photons,
+                             device const PCRPhotonCell *cells,
+                             float3 x, float3 N, float3 albedo)
+{
+    if (S.u.useCausticPhotonMap == 0) return float3(0.0f);
+
+    const float r = S.u.photonRadius;
+    if (r <= 0.0f) return float3(0.0f);
+    const float r2 = r * r;
+    const float invR = 1.0f / r;
+    const uint  mask = uint(S.u.photonCellTableMask);
+
+    int cx = int(floor(x.x * invR));
+    int cy = int(floor(x.y * invR));
+    int cz = int(floor(x.z * invR));
+
+    float3 sumPower = float3(0.0f);
+
+    // 3x3x3 neighborhood. cell size == radius so this covers every
+    // possible photon within range of x.
+    for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        // Linear probe up to 8 steps. Past that we abandon the
+        // lookup; load factor <=0.5 makes >2 steps already rare.
+        for (int probe = 0; probe < 8; probe++) {
+            PCRPhotonCell cell = cells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0; i < cell.count; i++) {
+                    PCRPhoton ph = photons[cell.offset + i];
+                    float3 d = float3(ph.position) - x;
+                    float dist2 = dot(d, d);
+                    if (dist2 > r2) continue;
+                    if (dot(float3(ph.wi), N) >= 0.0f) continue;
+                    sumPower += float3(ph.power);
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }}}
+
+    const float invArea = 1.0f / (PI * r2);
+    const float invPi   = 1.0f / PI;
+    return albedo * invPi * sumPower * invArea;
+}
 
 // ---- Spectrum lookup --------------------------------------------------
 //
@@ -910,6 +1036,14 @@ float3 tracePath(thread const Scene &S, float2 pix, float pr1, float pr2,
         }
         radiance += throughput * directLo;
 
+        // Caustic photon-map contribution. Same per-bounce-throughput
+        // convention as directLo. Density estimate gates on the
+        // useCausticPhotonMap uniform flag, so when the photon map is
+        // off this is a single uint compare + branch.
+        radiance += throughput * photonDensityEstimate(
+                        S, S.photons, S.photonCells,
+                        hit, N, mat.albedo.rgb);
+
         if (S.u.useRussian != 0 && bounce >= 1) {
             float p = clamp(max(max(mat.albedo.r, mat.albedo.g), mat.albedo.b), 0.05f, 0.95f);
             if (rand(seed) > p) break;
@@ -1195,6 +1329,11 @@ float4 tracePathSpectral(thread const Scene &S, float2 pix, float pr1, float pr2
 
 // ---- Kernel entry --------------------------------------------------
 
+// Megakernel kernels (path_trace, path_trace_pass, path_trace_pass_adaptive)
+// bind the caustic photon buffers at slots 9 and 10. When photon
+// mapping is off, the host binds a 1-element dummy buffer so the
+// kernel's parameter declaration is satisfied; the kernel checks
+// Uniforms.useCausticPhotonMap before reading.
 kernel void path_trace(
     constant Uniforms                          &u            [[buffer(0)]],
     device const GpuSphere                     *spheres      [[buffer(1)]],
@@ -1204,12 +1343,15 @@ kernel void path_trace(
     device const GpuBvhNode                    *bvhNodes     [[buffer(5)]],
     device const GpuLight                      *lights       [[buffer(6)]],
     device const GpuLightTriangle              *lightTris    [[buffer(7)]],
+    device const PCRPhoton                     *photons      [[buffer(9)]],
+    device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
     texture2d<float, access::write>             output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
-    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris };
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
+                photons, photonCells };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1349,12 +1491,15 @@ kernel void path_trace_pass(
     device const GpuBvhNode                    *bvhNodes     [[buffer(5)]],
     device const GpuLight                      *lights       [[buffer(6)]],
     device const GpuLightTriangle              *lightTris    [[buffer(7)]],
+    device const PCRPhoton                     *photons      [[buffer(9)]],
+    device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
     texture2d<float, access::read_write>        output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
-    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris };
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
+                photons, photonCells };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1510,12 +1655,15 @@ kernel void path_trace_pass_adaptive(
     device const GpuLight                      *lights       [[buffer(6)]],
     device const GpuLightTriangle              *lightTris    [[buffer(7)]],
     device Welford                             *welford      [[buffer(8)]],
+    device const PCRPhoton                     *photons      [[buffer(9)]],
+    device const PCRPhotonCell                 *photonCells  [[buffer(10)]],
     texture2d<float, access::read_write>        output       [[texture(0)]],
     texture2d<float, access::write>             albedoOut    [[texture(1)]],
     texture2d<float, access::write>             normalOut    [[texture(2)]],
     uint2                                       gid          [[thread_position_in_grid]])
 {
-    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris };
+    Scene S = { u, spheres, planes, materials, triangles, bvhNodes, lights, lightTris,
+                photons, photonCells };
 
     int2 pix = int2(int(gid.x) + u.xOffset, int(gid.y) + u.yOffset);
     if (pix.x >= u.xEnd || pix.x >= u.width ||
@@ -1916,8 +2064,12 @@ kernel void wf_intersect(
     float3 ro = origin[gid];
     float3 rd = dir[gid];
 
+    // Wavefront's Scene construction leaves the photon fields null:
+    // the wavefront kernels never call tracePath / photonDensityEstimate
+    // (session 3 will wire the density estimate into wf_shade_diffuse;
+    // until then, the megakernel is the only consumer).
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris };
+                lights, lightTris, nullptr, nullptr };
 
     float3 hp, N;
     int mi;
@@ -2524,8 +2676,11 @@ kernel void wf_shade_diffuse(
     int mi = matIdx[gid];
     uint seed = rngState[gid];
 
+    // Photon fields nullptr in wavefront. Session 3 will wire the
+    // caustic density estimate into this kernel and start binding
+    // the real photon buffers.
     Scene S = { u, spheres, planes, materials, triangles, bvhNodes,
-                lights, lightTris };
+                lights, lightTris, nullptr, nullptr };
 
     // Cached per-wavelength albedo for spectral mode. Used for both
     // NEE BSDF terms and the indirect throughput update so we only
@@ -2984,12 +3139,18 @@ namespace
         // slot indices as baseRayCount + atomic_offset, since fork
         // sub-rays live above the base ray range in the SoA buffers.
         int   baseRayCount;
-        // Padding so sizeof matches the MSL Uniforms (160 bytes).
+        // Padding so sizeof matches the MSL Uniforms.
         int   _pad0;
         int   _pad1;
+        // Caustic photon-map controls; see comment in the MSL Uniforms
+        // struct above for semantics.
+        int   useCausticPhotonMap;
+        int   photonCellTableMask;
+        float photonRadius;
+        int   _pad2;
     };
-    static_assert(sizeof(Uniforms) == 160,
-                  "Uniforms must be 160 bytes (multiple of 16) so per-pass "
+    static_assert(sizeof(Uniforms) == 176,
+                  "Uniforms must be 176 bytes (multiple of 16) so per-pass "
                   "buffer offsets are 16-aligned for MSL vectorized loads");
 
     // Per-pixel state for the adaptive multi-pass kernel. Layout matches
@@ -3007,6 +3168,123 @@ namespace
     };
     static_assert(sizeof(PCRWelfordState) == 48,
                   "PCRWelfordState must be 48 bytes to match the MSL Welford struct");
+
+    // ---------- Caustic photon-map host PODs ------------------------------
+    // Byte-equivalent to the MSL PCRPhoton / PCRPhotonCell structs above.
+    // Host fills these vectors then ships them to the GPU via
+    // newBufferWithBytes; the kernel reinterprets through the MSL struct
+    // layout.
+
+    struct PCRPhoton
+    {
+        float position[3];
+        float wi[3];
+        float power[3];
+    };
+    static_assert(sizeof(PCRPhoton) == 36,
+                  "PCRPhoton must be 36 bytes (packed_float3 x 3) to match the MSL Photon struct");
+
+    struct PCRPhotonCell
+    {
+        uint32_t cellHash;  // 0xFFFFFFFF = empty
+        uint32_t offset;
+        uint32_t count;
+    };
+    static_assert(sizeof(PCRPhotonCell) == 12,
+                  "PCRPhotonCell must be 12 bytes to match the MSL PhotonCell struct");
+
+    // Same Teschner-2003 hash the MSL photonCellHash uses. Host and GPU
+    // MUST compute identical hashes for identical cell coords so the GPU
+    // table lookup finds the cells the host placed.
+    inline uint32_t pcrPhotonCellHash32(int cx, int cy, int cz)
+    {
+        return uint32_t(cx) * 73856093u
+             ^ uint32_t(cy) * 19349663u
+             ^ uint32_t(cz) * 83492791u;
+    }
+
+    // Flatten a CPU Photon::Map into GPU-ready arrays. Produces:
+    //   - photons sorted-by-cell (a contiguous span per cell so the
+    //     kernel can read `count` photons starting at `offset`)
+    //   - cells: open-addressed hash table with power-of-two size,
+    //     load factor <= 0.5, linear probing on collision.
+    // Returns false (and clears outputs) when the input map is empty;
+    // caller should treat that as "photon mapping is effectively off
+    // this render" and bind dummy buffers.
+    struct PCRPhotonGpuTable
+    {
+        std::vector<PCRPhoton>     photons;
+        std::vector<PCRPhotonCell> cells;
+        uint32_t                   tableMask = 0;  // tableSize - 1
+    };
+
+    inline bool buildPhotonGpuTable(const Photon::Map &map, PCRPhotonGpuTable &out)
+    {
+        out.photons.clear();
+        out.cells.clear();
+        out.tableMask = 0;
+
+        const auto &records = map.records();
+        if (records.empty()) return false;
+
+        const float invR = 1.0f / map.radius();
+
+        // First pass: re-bucket by 32-bit cell hash. The host
+        // Photon::Map keys its private grid by 64-bit hash; the GPU
+        // table uses 32-bit (matching the MSL kernel). The two may
+        // disagree on bucketing (two 64-bit hashes can fold to the
+        // same 32-bit hash), which is fine - it just merges buckets.
+        std::unordered_map<uint32_t, std::vector<uint32_t>> by32;
+        by32.reserve(records.size() / 4);
+        for (size_t i = 0; i < records.size(); i++)
+        {
+            const auto &r = records[i];
+            int cx = (int)std::floor(r.position[0] * invR);
+            int cy = (int)std::floor(r.position[1] * invR);
+            int cz = (int)std::floor(r.position[2] * invR);
+            uint32_t h = pcrPhotonCellHash32(cx, cy, cz);
+            by32[h].push_back((uint32_t)i);
+        }
+
+        // Round table size up to next power of two with load factor 0.5.
+        uint32_t targetSlots = (uint32_t)by32.size() * 2u;
+        uint32_t tableSize = 16u;
+        while (tableSize < targetSlots) tableSize <<= 1;
+        out.tableMask = tableSize - 1u;
+
+        out.cells.assign(tableSize, PCRPhotonCell{0xFFFFFFFFu, 0u, 0u});
+        out.photons.reserve(records.size());
+
+        // Insert each bucket: copy photons into the flat sorted-by-
+        // cell array; record (cellHash, offset, count) in the table
+        // via linear probing.
+        for (auto &kv : by32)
+        {
+            uint32_t h = kv.first;
+            uint32_t slot = h & out.tableMask;
+            // Open addressing. With load factor <=0.5 the expected
+            // probe is 1.x; bounded loop count guards against insert
+            // pathology that shouldn't happen but would otherwise
+            // blow the build sky-high.
+            for (uint32_t step = 0; step < tableSize; step++)
+            {
+                if (out.cells[slot].cellHash == 0xFFFFFFFFu) break;
+                slot = (slot + 1u) & out.tableMask;
+            }
+            uint32_t startOffset = (uint32_t)out.photons.size();
+            for (uint32_t idx : kv.second)
+            {
+                const auto &r = records[idx];
+                PCRPhoton p;
+                p.position[0] = r.position[0]; p.position[1] = r.position[1]; p.position[2] = r.position[2];
+                p.wi[0]       = r.wi[0];       p.wi[1]       = r.wi[1];       p.wi[2]       = r.wi[2];
+                p.power[0]    = r.power[0];    p.power[1]    = r.power[1];    p.power[2]    = r.power[2];
+                out.photons.push_back(p);
+            }
+            out.cells[slot] = PCRPhotonCell{ h, startOffset, (uint32_t)kv.second.size() };
+        }
+        return true;
+    }
 
     // ---------- Wavefront ray-state SoA buffers --------------------------
     //
@@ -3843,11 +4121,23 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     lastOutputPath.clear();
     @autoreleasepool {
 
-    if (useCausticPhotonMap)
+    // Caustic photon-map pre-pass. The actual photon shoot lives in
+    // the shared CPU module (Photon::shootCaustic) so the algorithm
+    // matches the CPU backend bit-for-bit. We flatten the host hash-map
+    // into a power-of-two open-addressed GPU table below and ship two
+    // MTLBuffers to the megakernel kernels. Wavefront support lands in
+    // session 3; until then wavefront renders warn + skip.
+    bool effectivePhotonMap = useCausticPhotonMap;
+    if (effectivePhotonMap && useSpectral)
     {
-        std::cerr << "warning: --photon-map is CPU-only in this release; "
-                     "ignored on the Metal backend (session 2 will add it).\n";
+        std::cerr << "warning: --photon-map disabled in --spectral mode "
+                     "(RGB-only density estimate; spectral support is "
+                     "a later session).\n";
+        effectivePhotonMap = false;
     }
+    // Wavefront integration lands in session 3. Decision pushed below
+    // the architecture-selection block so we use the post-fallback
+    // effectiveWavefront value, not the raw flag.
 
     if (scene.areaLights.empty())
     {
@@ -3975,8 +4265,97 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     uBase.useBsdfMis       = useBsdfMis ? 1 : 0;
     uBase._pad0            = 0;
     uBase._pad1            = 0;
+    uBase._pad2            = 0;
+    // Photon-map uniforms default to "off". Filled in below if the
+    // GPU hash table built successfully.
+    uBase.useCausticPhotonMap = 0;
+    uBase.photonCellTableMask = 0;
+    uBase.photonRadius        = photonRadius;
     uBase.xOffset          = 0;
     uBase.xEnd             = _width;
+
+    // Build the GPU caustic photon table. The Photon::shootCaustic
+    // call runs on the host (single-threaded; ~milliseconds at 1M
+    // photons on a Cornell BVH); buildPhotonGpuTable flattens the
+    // result into the sorted-by-cell + open-addressed-table layout
+    // the MSL kernel expects.
+    //
+    // photonsBuf / cellsBuf hold either the real table or a tiny
+    // dummy. Always allocated so the kernel binding at slots 9/10
+    // is satisfied regardless of mode (we hit a bug last week
+    // (commit 4a970dc) where an unset kernel binding silently
+    // corrupted output at scale; same lesson applies here).
+    if (effectivePhotonMap && effectiveWavefront)
+    {
+        std::cerr << "warning: --photon-map disabled in wavefront mode "
+                     "for now (session 3 will wire the density estimate "
+                     "into wf_shade_diffuse); running without caustic "
+                     "density estimate.\n";
+        effectivePhotonMap = false;
+    }
+    id<MTLBuffer> photonsBuf = nil;
+    id<MTLBuffer> cellsBuf   = nil;
+    if (effectivePhotonMap)
+    {
+        uint64_t photonSeed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        Photon::Map cpuMap = Photon::shootCaustic(scene, photonCount,
+                                                   photonRadius, _maxDepth,
+                                                   photonSeed);
+        PCRPhotonGpuTable gpuTable;
+        if (buildPhotonGpuTable(cpuMap, gpuTable))
+        {
+            photonsBuf = [_impl->device
+                newBufferWithBytes:gpuTable.photons.data()
+                            length:gpuTable.photons.size() * sizeof(PCRPhoton)
+                           options:MTLResourceStorageModeShared];
+            cellsBuf = [_impl->device
+                newBufferWithBytes:gpuTable.cells.data()
+                            length:gpuTable.cells.size() * sizeof(PCRPhotonCell)
+                           options:MTLResourceStorageModeShared];
+            if (photonsBuf && cellsBuf)
+            {
+                uBase.useCausticPhotonMap = 1;
+                uBase.photonCellTableMask = (int)gpuTable.tableMask;
+                std::cout << "MetalRenderer: photon table uploaded ("
+                          << gpuTable.photons.size() << " photons, "
+                          << gpuTable.cells.size() << " cells, mask=0x"
+                          << std::hex << gpuTable.tableMask << std::dec
+                          << ")" << std::endl;
+            }
+            else
+            {
+                std::cerr << "MetalRenderer: photon-map buffer alloc failed; "
+                             "running without caustic density estimate.\n";
+                photonsBuf = nil; cellsBuf = nil;
+                uBase.useCausticPhotonMap = 0;
+            }
+        }
+        else
+        {
+            std::cerr << "MetalRenderer: photon shoot deposited zero photons "
+                         "(scene has no specular surfaces?); running without "
+                         "caustic density estimate.\n";
+            uBase.useCausticPhotonMap = 0;
+        }
+    }
+    if (!photonsBuf)
+    {
+        // Dummy 1-element placeholder so kernel parameter bindings
+        // are always satisfied. Never read because useCausticPhotonMap
+        // is 0 in this branch.
+        PCRPhoton dummyP{};
+        photonsBuf = [_impl->device
+            newBufferWithBytes:&dummyP length:sizeof(PCRPhoton)
+                       options:MTLResourceStorageModeShared];
+    }
+    if (!cellsBuf)
+    {
+        PCRPhotonCell dummyC{0xFFFFFFFFu, 0u, 0u};
+        cellsBuf = [_impl->device
+            newBufferWithBytes:&dummyC length:sizeof(PCRPhotonCell)
+                       options:MTLResourceStorageModeShared];
+    }
 
     // Atomic counter bumped from each command buffer's completion
     // handler. The handlers fire on a Metal-internal thread; the
@@ -4543,6 +4922,12 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             [enc setBuffer:_impl->lightTriBuf offset:0 atIndex:7];
             if (useAdaptive)
                 [enc setBuffer:welfordBuf    offset:0 atIndex:8];
+            // Photon-map buffers at slots 9/10. Always bound (dummy
+            // when off) so the kernel parameter declarations are
+            // satisfied; the kernel guards reads behind
+            // uBase.useCausticPhotonMap.
+            [enc setBuffer:photonsBuf offset:0 atIndex:9];
+            [enc setBuffer:cellsBuf   offset:0 atIndex:10];
             [enc setTexture:_impl->outputTex atIndex:0];
             [enc setTexture:_impl->albedoTex atIndex:1];
             [enc setTexture:_impl->normalTex atIndex:2];
@@ -4707,6 +5092,11 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         filename += "-h" + std::to_string(_height);
     if (useACES)
         filename += "-aces";
+    // Filename tag only when the photon map actually ran (built non-empty,
+    // megakernel path, not silently skipped in spectral mode). Matches the
+    // PNG metadata gate below so the two stay self-consistent.
+    if (uBase.useCausticPhotonMap != 0)
+        filename += "-photon";
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -4752,6 +5142,14 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // flag yet). Recorded so renders are self-describing.
     if (effectiveWavefront && useMIS)
         addText("BsdfMIS", useBsdfMis ? "1" : "0");
+    // Photon-map keys only when the map actually ran. Same gate as
+    // the filename tag above so the two never diverge.
+    if (uBase.useCausticPhotonMap != 0)
+    {
+        addText("PhotonMap",    "1");
+        addText("PhotonCount",  std::to_string(photonCount));
+        addText("PhotonRadius", std::to_string(photonRadius));
+    }
     addText("ThreadgroupX",  std::to_string(tgX));
     addText("ThreadgroupY",  std::to_string(tgY));
     // Architecture records what ACTUALLY ran, not what was requested
