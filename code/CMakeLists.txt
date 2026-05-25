@@ -168,6 +168,8 @@ set(PCR_RENDERER_SOURCES
     RGBToSpectrum.cpp
     LutDiscovery.cpp
     SpdLoader.cpp
+    Photon/PhotonMap.cpp
+    Photon/PhotonShoot.cpp
 )
 
 # --- Data-file deployment -----------------------------------------------

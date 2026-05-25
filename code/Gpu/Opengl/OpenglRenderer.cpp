@@ -1992,6 +1992,12 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
 {
     lastOutputPath.clear();
 
+    if (useCausticPhotonMap)
+    {
+        std::cerr << "warning: --photon-map is CPU-only in this release; "
+                     "ignored on the OpenGL backend.\n";
+    }
+
     if (!_sharedContext)
     {
         std::cerr << "OpenglRenderer: no shared OpenGL context" << std::endl;

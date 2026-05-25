@@ -13,6 +13,13 @@
 #include "../Bvh/Bvh.h"
 #include "../Scenes/Scene.h"
 
+// Forward decl. Defined in code/Photon/PhotonMap.h. Used as a const
+// pointer member below so the caustic-photon-map path in castRay can
+// query a pre-built map without exposing the full PhotonMap header
+// through Renderer.h. The map itself lives as a local in render()
+// while the pointer holds for the duration of the render call.
+namespace Photon { class Map; }
+
 // Hero wavelength sampling (Wilkie et al. 2014). Each spectral ray
 // carries N wavelengths through the same path geometry, so the
 // expensive part (intersection + light sampling) is paid once per
@@ -104,6 +111,23 @@ public:
     // ignored on this backend.
     bool useBsdfMis = false;
 
+    // Caustic photon mapping (Jensen 1996). When on, a pre-pass at
+    // render start shoots `photonCount` photons from the area lights
+    // and stores them at the first diffuse surface they hit after at
+    // least one specular bounce. Eye-path tracing then adds a density-
+    // estimate term at every diffuse hit, dramatically reducing
+    // variance on caustic regions (the bright glass-sphere-projected
+    // patch on the floor in cornell-glass etc.) at the cost of a
+    // one-time photon-shoot pass and a per-hit hash-grid lookup.
+    //
+    // Spectral mode is ignored here for now: density-estimate uses
+    // RGB photon power. Spectral integration is planned for a later
+    // pass; in --spectral renders the eye-path skips the photon
+    // contribution with a one-time warning.
+    bool  useCausticPhotonMap = false;
+    int   photonCount  = 1000000;
+    float photonRadius = 0.05f;
+
     // Hero-wavelength sample count. Default 4 = stratified hero sampling
     // (Wilkie 2014). 1 = legacy single-wavelength behavior, exposed only
     // for benchmarking and visual A/B against the hero default. Other
@@ -133,6 +157,13 @@ private:
     const int _maxDepth;
     const int _samples;
     const int _shadowSamples;
+
+    // Caustic photon map. Built once at the top of render() when
+    // useCausticPhotonMap is on, lives as a local std::optional in
+    // that function, and pointed at via this member so castRay's
+    // recursion sees it without threading it through the argument
+    // list. nullptr means "no map active; skip density-estimate."
+    const Photon::Map *_activeCausticMap = nullptr;
 
     // Optional out-params capture albedo + shading normal at the FIRST
     // hit (depth==0). Used to populate aux buffers for OIDN; recursive

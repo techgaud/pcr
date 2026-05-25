@@ -97,6 +97,15 @@ public:
     // existing renders are byte-identical until the flag is flipped.
     bool useBsdfMis = false;
 
+    // Caustic photon mapping. CPU-only in this release; carried on
+    // the Metal renderer for source compatibility with the CLI / GUI
+    // plumbing. Values are ignored; render() prints a one-time
+    // warning if useCausticPhotonMap is set. GPU port lands in
+    // session 2.
+    bool  useCausticPhotonMap = false;
+    int   photonCount  = 1000000;
+    float photonRadius = 0.05f;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

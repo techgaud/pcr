@@ -3843,6 +3843,12 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     lastOutputPath.clear();
     @autoreleasepool {
 
+    if (useCausticPhotonMap)
+    {
+        std::cerr << "warning: --photon-map is CPU-only in this release; "
+                     "ignored on the Metal backend (session 2 will add it).\n";
+    }
+
     if (scene.areaLights.empty())
     {
         std::cerr << "physically-cringe-rendering: scene has no area lights"

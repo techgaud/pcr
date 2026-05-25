@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <optional>
 #include <vector>
 #include <numbers>
 #include <iostream>
@@ -21,6 +22,9 @@
 #include "Includes/OidnDenoise.h"
 #include "Includes/Optics.h"
 #include "Includes/ToneMap.h"
+#include "Photon/PhotonMap.h"
+#include "Photon/PhotonShoot.h"
+#include "Photon/DensityEstimate.h"
 
 // PCR_BINARY_NAME is set per-target in CMake. Fallback for safety.
 #ifndef PCR_BINARY_NAME
@@ -134,6 +138,30 @@ void Renderer::render(const Scenes::SceneData &scene,
     float totalLightArea = 0.f;
     for (const auto &L : scene.areaLights)
         totalLightArea += L.totalArea;
+
+    // Caustic photon-map pre-pass. Single-threaded; runs before the
+    // worker threads spawn so the map is immutable by the time
+    // castRay accesses it. The std::optional wraps the map so the
+    // _activeCausticMap pointer in the Renderer can be nullable
+    // (the no-photon-map render path bypasses the density estimate
+    // via a single null-check, no other branching needed).
+    //
+    // Spectral mode warning: density-estimate is RGB-only for now,
+    // so castRaySpectral skips the lookup. Logged once here.
+    std::optional<Photon::Map> causticMap;
+    if (useCausticPhotonMap)
+    {
+        if (useSpectral)
+        {
+            std::cerr << "warning: --photon-map ignored on spectral renders for now; "
+                         "caustic density estimate is RGB-only.\n";
+        }
+        uint64_t photonSeed = NumGen::getSeed();
+        if (photonSeed == 0) photonSeed = (uint64_t)std::time(nullptr);
+        causticMap.emplace(Photon::shootCaustic(scene, photonCount, photonRadius,
+                                                _maxDepth, photonSeed));
+    }
+    _activeCausticMap = causticMap ? &*causticMap : nullptr;
 
     std::vector<Vec3f> frameBuffer(_width * _height);
     // OIDN aux buffers: only allocated when --oidn is on. Albedo and
@@ -337,6 +365,13 @@ void Renderer::render(const Scenes::SceneData &scene,
     if (snapshotThread.joinable())
         snapshotThread.join();
 
+    // Clear the dangling-pointer-prevention: causticMap (the
+    // std::optional that owns the storage) goes out of scope at the
+    // end of this function. Null _activeCausticMap before that so a
+    // future render call doesn't see a stale pointer if something
+    // about the call ordering changes.
+    _activeCausticMap = nullptr;
+
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
     {
         std::cout << "Render cancelled before write." << std::endl;
@@ -409,6 +444,8 @@ void Renderer::render(const Scenes::SceneData &scene,
         filename += "-spectral";
     if (useACES)
         filename += "-aces";
+    if (useCausticPhotonMap && !useSpectral)
+        filename += "-photon";
     filename += "-t" + std::to_string(elapsedMs) + ".png";
 
     std::filesystem::path outputPath = std::filesystem::path(outputDir) / filename;
@@ -447,6 +484,12 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Spectral",   useSpectral ? "1" : "0");
     if (useSpectral)
         addText("CMF", useCieCmf ? "cie" : "wyman");
+    if (useCausticPhotonMap && !useSpectral)
+    {
+        addText("PhotonMap",    "1");
+        addText("PhotonCount",  std::to_string(photonCount));
+        addText("PhotonRadius", std::to_string(photonRadius));
+    }
 
     std::vector<unsigned char> pngBuffer;
     unsigned encErr = lodepng::encode(pngBuffer, rgb, _width, _height, state);
@@ -652,7 +695,17 @@ Vec3f Renderer::castRay(const Ray &ray,
         }
     }
 
-    return directLo / _shadowSamples + indirectLo;
+    // Caustic photon-map density estimate. Only contributes on
+    // diffuse surfaces; specular hits returned early above and
+    // never reach here. Skipped when no map is built. When the
+    // surface has zero albedo (e.g. a pure-black material) the
+    // estimate still runs but lands on zero, which is cheap; the
+    // hash-grid query is the only real cost.
+    Vec3f causticLo(0.f, 0.f, 0.f);
+    if (_activeCausticMap)
+        causticLo = Photon::densityEstimate(*_activeCausticMap, hit, N, material.albedo);
+
+    return directLo / _shadowSamples + indirectLo + causticLo;
 }
 
 SpectralSample Renderer::castRaySpectral(const Ray &ray,

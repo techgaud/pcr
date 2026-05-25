@@ -97,6 +97,14 @@ public:
     // set it unconditionally. Value is ignored.
     bool useBsdfMis = false;
 
+    // Caustic photon mapping. CPU-only in this release; carried on
+    // the OpenGL renderer for source compatibility with the CLI /
+    // GUI plumbing. Values are ignored; render() prints a one-time
+    // warning if useCausticPhotonMap is set. GPU port lands later.
+    bool  useCausticPhotonMap = false;
+    int   photonCount  = 1000000;
+    float photonRadius = 0.05f;
+
     void render(const Scenes::SceneData &scene,
                 std::chrono::steady_clock::time_point start,
                 const std::string &outputDir);

@@ -117,6 +117,16 @@ int main(int argc, char *argv[])
     // Wavefront only; megakernel ignores.
     bool useBsdfMis = false;
 
+    // Caustic photon mapping (Jensen 1996). When on, the renderer
+    // shoots `photonCount` photons from the area lights at render
+    // start and adds a density-estimate term on every diffuse hit.
+    // Dramatically reduces variance on caustic regions; --spectral
+    // ignores the flag for now (density-estimate is RGB-only). CPU
+    // backend only in this session; GPU ports land later.
+    bool  useCausticPhotonMap = false;
+    int   photonCount = 1000000;
+    float photonRadius = 0.05f;
+
     CLI::App app{std::string(PCR_BINARY_NAME) + " - " + PCR_CLI_DESC};
     app.add_option("--scene", scene, "Scene to render (default: cornell)")
         ->default_str("cornell");
@@ -228,6 +238,35 @@ int main(int argc, char *argv[])
                  "expect 1.3-1.6x sample efficiency on cornell-spec. "
                  "Metal-wavefront-only; ignored on megakernel and "
                  "OpenGL. Requires --mis.");
+    techniques->add_flag("--photon-map", useCausticPhotonMap,
+                 "Caustic photon mapping (Jensen 1996). Shoots a pre-pass "
+                 "of photons from area lights, stores them at the first "
+                 "diffuse surface they hit after one or more specular "
+                 "bounces, and adds a density-estimate term on every "
+                 "diffuse hit during eye-path tracing. Dramatically "
+                 "reduces variance on caustic regions (the bright patch "
+                 "under a glass sphere etc.) at the cost of a one-time "
+                 "photon-shoot pass and a per-hit hash-grid lookup. "
+                 "RGB-only for now; --spectral renders skip the density "
+                 "estimate with a one-time warning. CPU backend only in "
+                 "this release; GPU ports land in a follow-up.");
+    techniques->add_option("--photons", photonCount,
+                 "Number of photons to shoot when --photon-map is on. "
+                 "Default 1M. More photons = smoother caustics, more "
+                 "RAM, longer pre-pass. ~36 bytes per photon (hash-"
+                 "grid overhead on top).")
+        ->default_str("1000000")
+        ->check(CLI::PositiveNumber);
+    techniques->add_option("--photon-radius", photonRadius,
+                 "Search radius for the density estimate, in scene "
+                 "units. Default 0.05. Smaller radius = sharper caustics "
+                 "but noisier (fewer photons per lookup); larger radius "
+                 "= smoother but blurrier (caustic edges bleed). Cornell-"
+                 "scale scenes (~2 unit walls) hit the sweet spot around "
+                 "0.03 to 0.08.")
+        ->default_str("0.05")
+        ->check(CLI::PositiveNumber);
+
     options->add_option("--seed", seed,
                  "Fixed PRNG seed for bit-deterministic renders. When set "
                  "to non-zero, all per-thread Monte Carlo PRNG state "
@@ -484,6 +523,9 @@ int main(int argc, char *argv[])
     renderer.useSpectral  = useSpectral;
     renderer.heroSamples  = heroSamples;
     renderer.useCieCmf    = useCieCmf;
+    renderer.useCausticPhotonMap = useCausticPhotonMap;
+    renderer.photonCount         = photonCount;
+    renderer.photonRadius        = photonRadius;
 #if PCR_USE_GPU
     renderer.threadgroupX = threadgroupX;
     renderer.threadgroupY = threadgroupY;
