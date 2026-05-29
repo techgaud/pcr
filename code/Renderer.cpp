@@ -857,7 +857,7 @@ Vec3f Renderer::castRay(const Ray &ray,
 
             if (!inShadow)
             {
-                float cosLight = std::max(0.f, sampleN.dot(Li * -1));
+                float cosLight = std::max(0.f, sampleN.dot(wi * -1));
                 float G = (cosTheta * cosLight) / lightDist2;
                 // pdf = 1/totalLightArea, so divide-by-pdf = totalLightArea.
                 Vec3f directContrib = (material.albedo / std::numbers::pi) * sampleEmissive * G * totalLightArea;
@@ -1168,7 +1168,7 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
 
             if (!inShadow)
             {
-                float cosLight = std::max(0.f, sampleN.dot(Li * -1));
+                float cosLight = std::max(0.f, sampleN.dot(wi * -1));
                 float G = (cosTheta * cosLight) / lightDist2;
                 float misWeight = 1.f;
                 if (useMIS && cosLight > 1e-6f)
