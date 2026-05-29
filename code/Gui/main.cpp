@@ -355,6 +355,15 @@ struct Settings
     // so it survives across launches.
     bool debugMode = false;
 
+    // Per-render logging, driving the shared pcr::logging sink. Independent
+    // of debugMode's console/tee: logVerbose echoes the per-pass render
+    // chatter inline, logToFile writes a sidecar .log next to each image
+    // (logPath overrides the auto location beside the image). Quiet when
+    // both are off. Persisted across launches.
+    bool logVerbose = false;
+    bool logToFile = false;
+    std::string logPath;
+
     // Editable from the Edit Presets popup; persisted in <binary>.json.
     // Default to per-binary code constants when settings file is missing
     // or doesn't carry presets yet.
@@ -644,6 +653,9 @@ static void loadSettings(Settings &s)
                                          s.useCausticPhotonSppm);
         s.lutChoice     = j.value("lutChoice",     s.lutChoice);
         s.debugMode    = j.value("debugMode",    s.debugMode);
+        s.logVerbose   = j.value("logVerbose",   s.logVerbose);
+        s.logToFile    = j.value("logToFile",    s.logToFile);
+        s.logPath      = j.value("logPath",      s.logPath);
         if (j.contains("presets") && j["presets"].is_array() && !j["presets"].empty())
         {
             std::vector<Preset> loaded;
@@ -723,6 +735,9 @@ static json buildSettingsJson(const Settings &s)
     j["useCausticPhotonSppm"] = s.useCausticPhotonSppm;
     j["lutChoice"]     = s.lutChoice;
     j["debugMode"]    = s.debugMode;
+    j["logVerbose"]   = s.logVerbose;
+    j["logToFile"]    = s.logToFile;
+    j["logPath"]      = s.logPath;
     json arr = json::array();
     for (const auto &p : s.presets)
     {
@@ -988,13 +1003,13 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 #endif
         renderer.progressRows = &job->rowsCompleted;
         renderer.cancelRequested = &job->cancelRequested;
-        // The GUI's debug toggle drives the shared render logger: on echoes
-        // the per-pass chatter inline (into the debug console) and captures
-        // it to a sidecar .log next to each image; off is quiet (default).
-        // Sidecar path is auto (beside the image), so clear any override.
-        pcr::logging::verboseInline()   = settings.debugMode;
-        pcr::logging::fileSink()        = settings.debugMode;
-        pcr::logging::logPathOverride() = std::string();
+        // Drive the shared render logger from the explicit logging controls
+        // (Output section). debugMode additionally forces verbose so the
+        // debug console actually shows the chatter, as it did before.
+        pcr::logging::verboseInline()   = settings.logVerbose || settings.debugMode;
+        pcr::logging::fileSink()        = settings.logToFile;
+        pcr::logging::logPathOverride() = settings.logToFile ? settings.logPath
+                                                             : std::string();
         renderer.useDenoise   = settings.useDenoise;
         renderer.useMIS       = settings.useMIS;
         renderer.useRussian   = settings.useRussian;
@@ -2318,6 +2333,26 @@ int main(int, char **)
         }
         ImGui::SameLine();
         ImGui::TextUnformatted("Output dir (blank = ./Image)");
+
+        // Render logging. Quiet by default; these mirror the CLI's
+        // --verbose / --debug / --log-path. The debug console (Debug
+        // button) additionally forces verbose so its window shows chatter.
+        ImGui::Checkbox("Verbose log (echo render chatter inline)",
+                        &settings.logVerbose);
+        ImGui::Checkbox("Write log file (sidecar .log next to image)",
+                        &settings.logToFile);
+        ImGui::BeginDisabled(!settings.logToFile);
+        {
+            char logBuf[1024];
+            std::strncpy(logBuf, settings.logPath.c_str(), sizeof(logBuf));
+            logBuf[sizeof(logBuf) - 1] = 0;
+            ImGui::SetNextItemWidth(ImGui::CalcItemWidth() * 0.75f);
+            if (ImGui::InputText("##logpath", logBuf, sizeof(logBuf)))
+                settings.logPath = logBuf;
+            ImGui::SameLine();
+            ImGui::TextUnformatted("Log path (blank = beside image)");
+        }
+        ImGui::EndDisabled();
 
         if (ImGui::BeginCombo("Timezone", kTimezones[settings.timezoneIndex]))
         {
