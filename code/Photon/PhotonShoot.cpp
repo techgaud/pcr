@@ -6,6 +6,7 @@
 #include <iostream>
 #include <numbers>
 
+#include "../Includes/Log.h"
 #include "../Includes/Ray.h"
 #include "../Includes/Optics.h"
 #include "../Includes/Material.h"
@@ -158,7 +159,7 @@ namespace Photon
 
         PCG rng(seed);
 
-        std::cout << "Photon::shootCaustic: " << photonCount
+        PCR_LOG << "Photon::shootCaustic: " << photonCount
                   << " photons, radius=" << radius
                   << ", maxBounces=" << maxBounces << std::endl;
 
@@ -326,7 +327,7 @@ namespace Photon
 
         map.build();
 
-        std::cout << "Photon::shootCaustic: deposited=" << deposited
+        PCR_LOG << "Photon::shootCaustic: deposited=" << deposited
                   << " noncaustic=" << droppedNonCaustic
                   << " hitlight=" << droppedHitLight
                   << " rr=" << droppedRR

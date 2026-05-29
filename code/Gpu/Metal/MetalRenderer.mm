@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "Gpu/Metal/MetalRenderer.h"
+#include "Includes/Log.h"
 #include "Includes/lodepng.h"
 #include "Includes/PngText.h"
 #include "Includes/Denoise.h"
@@ -4527,7 +4528,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         }
         else
         {
-            std::cout << "MetalRenderer: SPPM state allocated ("
+            PCR_LOG << "MetalRenderer: SPPM state allocated ("
                       << pixelCount << " pixels, "
                       << (pixelCount * sizeof(PCRSppmPixel)) / (1024*1024)
                       << " MB state + delta)" << std::endl;
@@ -4581,7 +4582,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             {
                 uBase.useCausticPhotonMap = 1;
                 uBase.photonCellTableMask = (int)gpuTable.tableMask;
-                std::cout << "MetalRenderer: photon table uploaded ("
+                PCR_LOG << "MetalRenderer: photon table uploaded ("
                           << gpuTable.records.size() << " photons, "
                           << gpuTable.cells.size() << " cells, mask=0x"
                           << std::hex << gpuTable.tableMask << std::dec
@@ -5322,7 +5323,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     }
 
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
-        std::cout << "Metal render cancelled." << std::endl;
+        PCR_RESULT << "Metal render cancelled." << std::endl;
 
     // Readback. RGBA32Float textures: getBytes is a memcpy on Apple
     // Silicon's unified memory. Strip into Vec3f for downstream
@@ -5402,7 +5403,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             hdr[i][1] = progAccum[i][1] * invN;
             hdr[i][2] = progAccum[i][2] * invN;
         }
-        std::cout << "MetalRenderer: progressive averaging across "
+        PCR_LOG << "MetalRenderer: progressive averaging across "
                   << numProgPasses << " passes complete." << std::endl;
     }
 
@@ -5427,7 +5428,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
             hdr[i][1] += px.tauG * scale;
             hdr[i][2] += px.tauB * scale;
         }
-        std::cout << "MetalRenderer: SPPM final composite complete." << std::endl;
+        PCR_LOG << "MetalRenderer: SPPM final composite complete." << std::endl;
     }
     // Hand the captured aux to the OIDN block below under the names
     // it expects. albedoBuf / normalBuf were originally local to the
@@ -5437,7 +5438,7 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
 
     auto end = std::chrono::steady_clock::now();
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << "Metal render took " << elapsedMs << " ms" << std::endl;
+    PCR_RESULT << "Metal render took " << elapsedMs << " ms" << std::endl;
 
     if (useOIDN)
     {
@@ -5593,8 +5594,9 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    std::cout << "Wrote " << outputPath << std::endl;
+    PCR_RESULT << "Wrote " << outputPath << std::endl;
     lastOutputPath = outputPath.string();
+    pcr::logging::flush(lastOutputPath);
 
     } // @autoreleasepool
 }

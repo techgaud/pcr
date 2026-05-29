@@ -13,6 +13,7 @@
 #include "Includes/CLI11.hpp"
 #include "Includes/DllSearch.h"
 #include "Includes/GpuDefaults.h"
+#include "Includes/Log.h"
 #include "Includes/LutDiscovery.h"
 #include "Includes/NumGen.h"
 #include "Includes/RGBToSpectrum.h"
@@ -100,6 +101,9 @@ int main(int argc, char *argv[])
     int heroSamples = 4;
     bool useLUT = false;
     std::string lutFile;
+    bool logVerbose = false;
+    bool logDebug = false;
+    std::string logPath;
     uint64_t seed = 0;
     int threadgroupX = pcr::kDefaultThreadgroupX;
     int threadgroupY = pcr::kDefaultThreadgroupY;
@@ -163,6 +167,20 @@ int main(int argc, char *argv[])
                    "are mapped to DST-aware POSIX strings; anything else passes through "
                    "(e.g. America/New_York). Default: system local time.");
     app.add_option("-o,--output", outputDir, "Output directory (default: $PWD/Image)");
+
+    app.add_flag("--verbose", logVerbose,
+                 "Echo per-pass render chatter (photon shoots, table "
+                 "uploads, progressive/SPPM progress) inline to stdout. "
+                 "Off by default (quiet). The result lines (Wrote / render "
+                 "took) always print regardless of mode.");
+    app.add_flag("--debug", logDebug,
+                 "Write all render chatter plus the result lines to a "
+                 "sidecar log file next to the output image (the .png "
+                 "becomes .log). Composes with --verbose. Use --log-path "
+                 "to choose a different file.");
+    app.add_option("--log-path", logPath,
+                 "Write the debug log to this path instead of the auto "
+                 "sidecar next to the image. Implies --debug.");
     app.add_option("--scenes-dir", extraSceneDirs,
                    "Additional directory to search for *.json scene files. May be "
                    "passed multiple times. Searched before the default $PWD/Scenes "
@@ -387,6 +405,13 @@ int main(int argc, char *argv[])
 #endif
 
     CLI11_PARSE(app, argc, argv);
+
+    // Logging mode. Two independent sinks, both off by default (quiet):
+    // --verbose echoes chatter inline, --debug (or --log-path) captures
+    // everything to a sidecar log. Giving a log path implies the file sink.
+    pcr::logging::verboseInline() = logVerbose;
+    pcr::logging::fileSink()      = logDebug || !logPath.empty();
+    pcr::logging::logPathOverride() = logPath;
 
     if (height < 0)
         height = width; // square by default

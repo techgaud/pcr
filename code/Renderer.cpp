@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "Bvh/Bvh.h"
+#include "Includes/Log.h"
 #include "Includes/Renderer.h"
 #include "Includes/Vec3f.h"
 #include "Includes/lodepng.h"
@@ -491,7 +492,7 @@ void Renderer::render(const Scenes::SceneData &scene,
             frameBuffer[i][1] = progAccum[i][1] * invN;
             frameBuffer[i][2] = progAccum[i][2] * invN;
         }
-        std::cout << "Renderer: progressive averaging across "
+        PCR_LOG << "Renderer: progressive averaging across "
                   << numProgPasses << " passes complete." << std::endl;
     }
 
@@ -519,7 +520,7 @@ void Renderer::render(const Scenes::SceneData &scene,
             frameBuffer[i][1] += px.tauG * scale;
             frameBuffer[i][2] += px.tauB * scale;
         }
-        std::cout << "Renderer: SPPM final composite complete." << std::endl;
+        PCR_LOG << "Renderer: SPPM final composite complete." << std::endl;
     }
 
     // Clear the dangling-pointer-prevention: causticMap (the
@@ -535,7 +536,7 @@ void Renderer::render(const Scenes::SceneData &scene,
 
     if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
     {
-        std::cout << "Render cancelled before write." << std::endl;
+        PCR_RESULT << "Render cancelled before write." << std::endl;
         lastOutputPath.clear();
         return;
     }
@@ -582,7 +583,7 @@ void Renderer::render(const Scenes::SceneData &scene,
 
     auto end = std::chrono::steady_clock::now();
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << "Render took " << elapsedMs << " ms" << std::endl;
+    PCR_RESULT << "Render took " << elapsedMs << " ms" << std::endl;
 
     std::string timestamp = formatTimestamp(false); // flip to true for UTC
 
@@ -678,8 +679,9 @@ void Renderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    std::cout << "Wrote " << outputPath << std::endl;
+    PCR_RESULT << "Wrote " << outputPath << std::endl;
     lastOutputPath = outputPath.string();
+    pcr::logging::flush(lastOutputPath);
 }
 
 Vec3f Renderer::castRay(const Ray &ray,

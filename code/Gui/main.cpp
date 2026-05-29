@@ -72,6 +72,7 @@
 
 #include "Includes/DllSearch.h"
 #include "Includes/GpuDefaults.h"
+#include "Includes/Log.h"
 #include "Includes/LutDiscovery.h"
 #include "Includes/RGBToSpectrum.h"
 #include "Includes/Renderer.h"
@@ -987,6 +988,13 @@ static void runRender(RenderJob *job, LivePreview *live, Settings settings,
 #endif
         renderer.progressRows = &job->rowsCompleted;
         renderer.cancelRequested = &job->cancelRequested;
+        // The GUI's debug toggle drives the shared render logger: on echoes
+        // the per-pass chatter inline (into the debug console) and captures
+        // it to a sidecar .log next to each image; off is quiet (default).
+        // Sidecar path is auto (beside the image), so clear any override.
+        pcr::logging::verboseInline()   = settings.debugMode;
+        pcr::logging::fileSink()        = settings.debugMode;
+        pcr::logging::logPathOverride() = std::string();
         renderer.useDenoise   = settings.useDenoise;
         renderer.useMIS       = settings.useMIS;
         renderer.useRussian   = settings.useRussian;

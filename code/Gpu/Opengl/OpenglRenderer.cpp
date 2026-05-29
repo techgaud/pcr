@@ -36,6 +36,7 @@
 #include <GLFW/glfw3.h>
 
 #include "Gpu/Opengl/OpenglRenderer.h"
+#include "Includes/Log.h"
 #include "Includes/lodepng.h"
 #include "Includes/PngText.h"
 #include "Includes/Denoise.h"
@@ -2226,7 +2227,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
             glBufferData(GL_SHADER_STORAGE_BUFFER,
                          (GLsizeiptr)(gpuTable.cells.size() * sizeof(Photon::GpuCell)),
                          gpuTable.cells.data(), GL_DYNAMIC_DRAW);
-            std::cout << "OpenglRenderer: photon table uploaded ("
+            PCR_LOG << "OpenglRenderer: photon table uploaded ("
                       << gpuTable.records.size() << " photons, "
                       << gpuTable.cells.size() << " cells, mask=0x"
                       << std::hex << gpuTable.tableMask << std::dec
@@ -2488,7 +2489,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         {
             if (cancelRequested && cancelRequested->load(std::memory_order_relaxed))
             {
-                std::cout << "GPU render cancelled." << std::endl;
+                PCR_RESULT << "GPU render cancelled." << std::endl;
                 glfwMakeContextCurrent(nullptr);
                 return;
             }
@@ -2619,7 +2620,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
             hdr[i][1] = progAccum[i][1] * invN;
             hdr[i][2] = progAccum[i][2] * invN;
         }
-        std::cout << "OpenglRenderer: progressive averaging across "
+        PCR_LOG << "OpenglRenderer: progressive averaging across "
                   << numProgPasses << " passes complete." << std::endl;
     }
     // Hand the captured aux to the OIDN block below under the names
@@ -2631,7 +2632,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
 
     auto end = std::chrono::steady_clock::now();
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-    std::cout << "GPU render took " << elapsedMs << " ms" << std::endl;
+    PCR_RESULT << "GPU render took " << elapsedMs << " ms" << std::endl;
 
     // OIDN on the GPU path now mirrors the CPU path: HDR linear input + aux
     // (albedo + shading normal at first hit) -> OIDN HDR-mode denoise -> CPU
@@ -2769,8 +2770,9 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         return;
     }
 
-    std::cout << "Wrote " << outputPath << std::endl;
+    PCR_RESULT << "Wrote " << outputPath << std::endl;
     lastOutputPath = outputPath.string();
+    pcr::logging::flush(lastOutputPath);
 }
 
 void OpenglRenderer::destroyGL()
