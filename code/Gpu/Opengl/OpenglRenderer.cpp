@@ -45,6 +45,7 @@
 #include "Photon/PhotonMap.h"
 #include "Photon/PhotonShoot.h"
 #include "Photon/GpuFlatten.h"
+#include "Photon/Sppm.h"
 
 #include <cmath>
 
@@ -92,6 +93,7 @@ using GLintptr = ptrdiff_t;
 #define GL_WRITE_ONLY 0x88B9
 #define GL_READ_ONLY 0x88B8
 #define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT 0x00000020
+#define GL_SHADER_STORAGE_BARRIER_BIT 0x00002000
 #define GL_ALL_BARRIER_BITS 0xFFFFFFFF
 
 #if defined(_WIN32)
@@ -132,6 +134,7 @@ using GLintptr = ptrdiff_t;
     X(void,   TexImage2D,           GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *) \
     X(void,   TexParameteri,        GLenum, GLenum, GLint)                        \
     X(void,   GetTexImage,          GLenum, GLint, GLenum, GLenum, void *)        \
+    X(void,   GetBufferSubData,     GLenum, GLintptr, GLsizeiptr, void *)         \
     X(void,   BindImageTexture,     GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum) \
     X(void,   DispatchCompute,      GLuint, GLuint, GLuint)                       \
     X(void,   MemoryBarrier,        GLbitfield)                                   \
@@ -174,6 +177,7 @@ PCR_GL_FUNCS(PCR_DECLARE_GL_FN)
 #define glTexImage2D          pcr_glTexImage2D
 #define glTexParameteri       pcr_glTexParameteri
 #define glGetTexImage         pcr_glGetTexImage
+#define glGetBufferSubData    pcr_glGetBufferSubData
 #define glBindImageTexture    pcr_glBindImageTexture
 #define glDispatchCompute     pcr_glDispatchCompute
 #define glMemoryBarrier       pcr_glMemoryBarrier
@@ -256,6 +260,7 @@ uniform int   uUseCieCmf;     // 0 = Wyman 2013, 1 = CIE 1931 tabulated 2-deg ob
 uniform int   uUseCausticPhotonMap;
 uniform int   uPhotonCellTableMask;
 uniform float uPhotonRadius;
+uniform int   uPhotonSppm;    // 0/1; SPPM visible-point mode (deposit into per-pixel delta instead of adding radiance)
 
 const float PI = 3.14159265358979323846;
 
@@ -396,6 +401,15 @@ struct PhotonCell {
 layout(std430, binding = 8) buffer Photons     { Photon     photons[];     };
 layout(std430, binding = 9) buffer PhotonCells { PhotonCell photonCells[]; };
 
+// SPPM per-pixel state (Hachisuka & Jensen 2009). Mirrors Photon::SppmPixel
+// (20 B, 5 floats) and SppmDelta (16 B, 4 floats). std430 lays both out
+// naturally (all floats, 4-byte aligned), so no vec3-padding trick like
+// the Photon struct needed. Bound only in SPPM mode (uPhotonSppm != 0).
+struct SppmPixel  { float R; float tauR; float tauG; float tauB; float N; };
+struct SppmDelta  { float dtauR; float dtauG; float dtauB; float M; };
+layout(std430, binding = 10) buffer SppmState  { SppmPixel sppm[];      };
+layout(std430, binding = 11) buffer SppmDeltaB { SppmDelta sppmDelta[]; };
+
 const uint kPhotonEmptyCell = 0xFFFFFFFFu;
 
 // Teschner 2003 spatial hash. Mirrors Photon::Map::cellHash and the
@@ -461,6 +475,58 @@ vec3 photonDensityEstimate(vec3 x, vec3 N, vec3 albedo) {
     float invArea = 1.0 / (PI * r2);
     float invPi   = 1.0 / PI;
     return albedo * invPi * sumPower * invArea;
+}
+
+// SPPM visible-point density estimate. Queries photons within the
+// per-pixel adaptive radius (sppm[pixelIdx].R), accumulates (albedo/pi *
+// power) into the per-pixel delta and counts M photons. Adds zero
+// radiance here; the per-pass update + host composite turn the delta
+// into caustic radiance via the Hachisuka shrinkage. One shader
+// invocation owns one pixel's delta slot, so the += needs no atomics
+// (mirrors the Metal megakernel's one-thread-per-pixel write). The
+// MSL twin is sppmContributeAtVisiblePoint in MetalRenderer.mm.
+void sppmContributeAtVisiblePoint(uint pixelIdx, vec3 hit, vec3 N, vec3 albedo) {
+    if (uUseCausticPhotonMap == 0 || uPhotonSppm == 0) return;
+    float r = sppm[pixelIdx].R;
+    if (r <= 0.0) return;
+    float r2 = r * r;
+    float invR = 1.0 / r;
+    uint  mask = uint(uPhotonCellTableMask);
+    int cx = int(floor(hit.x * invR));
+    int cy = int(floor(hit.y * invR));
+    int cz = int(floor(hit.z * invR));
+    vec3  sumPower = vec3(0.0);
+    float M = 0.0;
+    for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        for (int probe = 0; probe < 8; probe++) {
+            PhotonCell cell = photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0u; i < cell.count; i++) {
+                    Photon ph = photons[cell.offset + i];
+                    vec3 pos = vec3(ph.position[0], ph.position[1], ph.position[2]);
+                    vec3 wi  = vec3(ph.wi[0],       ph.wi[1],       ph.wi[2]);
+                    vec3 pw  = vec3(ph.power[0],    ph.power[1],    ph.power[2]);
+                    vec3 d = pos - hit;
+                    if (dot(d, d) > r2) continue;
+                    if (dot(wi, N) >= 0.0) continue;
+                    sumPower += pw;
+                    M += 1.0;
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }}}
+    float invPi = 1.0 / PI;
+    sppmDelta[pixelIdx].dtauR += albedo.r * invPi * sumPower.r;
+    sppmDelta[pixelIdx].dtauG += albedo.g * invPi * sumPower.g;
+    sppmDelta[pixelIdx].dtauB += albedo.b * invPi * sumPower.b;
+    sppmDelta[pixelIdx].M     += M;
 }
 
 // Spectral helpers, used only when uUseSpectral != 0. Mirror the
@@ -972,7 +1038,10 @@ void sampleAreaLight(inout uint seed,
 // compile time. Pick a clean function boundary so the source still reads
 // linearly.
 R"GLSL(
-vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
+vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed, uint pixelIdx) {
+    // SPPM: the first diffuse hit per primary ray is the visible point;
+    // later diffuse hits skip photon contribution. Mirrors the megakernel.
+    bool firstDiffuseSppm = (uPhotonSppm != 0);
     float aspect = float(uWidth) / float(uHeight);
     float scale = tan(PI / 180.0 * 0.5 * uFov);
     float x = ((2.0 * (pix.x + 0.5) / float(uWidth)) - 1.0) * scale * aspect;
@@ -1082,7 +1151,17 @@ vec3 tracePath(vec2 pix, float pr1, float pr2, inout uint seed) {
         // albedo / PI in. Gated inside photonDensityEstimate on
         // uUseCausticPhotonMap so an off-mode render pays just a uint
         // compare and a branch.
-        radiance += throughput * photonDensityEstimate(hit, N, mat.albedo.rgb);
+        if (uPhotonSppm != 0) {
+            // SPPM: deposit at the visible point (first diffuse hit) into
+            // the per-pixel delta; the per-pass update + host composite
+            // turn it into caustic radiance. Adds no radiance here.
+            if (firstDiffuseSppm) {
+                sppmContributeAtVisiblePoint(pixelIdx, hit, N, mat.albedo.rgb);
+                firstDiffuseSppm = false;
+            }
+        } else {
+            radiance += throughput * photonDensityEstimate(hit, N, mat.albedo.rgb);
+        }
 
         // Russian roulette: at bounce >= 1, terminate with prob (1 - p) where
         // p reflects surface reflectance. Survivors get scaled to compensate.
@@ -1563,7 +1642,7 @@ void main() {
                     accum += xyz * 0.25;
                 }
             } else {
-                accum += tracePath(jpix, r1, r2, seed);
+                accum += tracePath(jpix, r1, r2, seed, uint(pix.y) * uint(uWidth) + uint(pix.x));
             }
         }
         accum /= float(uSamples);
@@ -1589,6 +1668,50 @@ void main() {
     // HDR linear radiance. Tone mapping happens on CPU after readback
     // so OIDN gets the full pre-tone-map signal as input.
     imageStore(uOutput, pix, vec4(mean, 1.0));
+}
+)GLSL";
+
+// ---------- SPPM end-of-pass update compute shader ------------------------
+// Second compute program. One thread per pixel; applies the Hachisuka 2009
+// per-pixel shrinkage to the SPPM state from the accumulated delta, then
+// zeros the delta for the next pass. Mirrors Photon::sppmUpdatePixel
+// (Sppm.h) and the MSL sppm_pass_update kernel exactly (alpha = 2/3).
+static const char *kSppmUpdateShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform int uWidth;
+uniform int uHeight;
+
+struct SppmPixel  { float R; float tauR; float tauG; float tauB; float N; };
+struct SppmDelta  { float dtauR; float dtauG; float dtauB; float M; };
+layout(std430, binding = 10) buffer SppmState  { SppmPixel sppm[];      };
+layout(std430, binding = 11) buffer SppmDeltaB { SppmDelta sppmDelta[]; };
+
+const float kSppmAlpha = 2.0 / 3.0;
+
+void main() {
+    if (int(gl_GlobalInvocationID.x) >= uWidth ||
+        int(gl_GlobalInvocationID.y) >= uHeight) return;
+    uint pixelIdx = gl_GlobalInvocationID.y * uint(uWidth) + gl_GlobalInvocationID.x;
+
+    float M = sppmDelta[pixelIdx].M;
+    if (M > 0.0) {
+        float N     = sppm[pixelIdx].N;
+        float N_new = N + kSppmAlpha * M;
+        float shrink = N_new / (N + M);
+        sppm[pixelIdx].R    = sppm[pixelIdx].R * sqrt(shrink);
+        sppm[pixelIdx].tauR = (sppm[pixelIdx].tauR + sppmDelta[pixelIdx].dtauR) * shrink;
+        sppm[pixelIdx].tauG = (sppm[pixelIdx].tauG + sppmDelta[pixelIdx].dtauG) * shrink;
+        sppm[pixelIdx].tauB = (sppm[pixelIdx].tauB + sppmDelta[pixelIdx].dtauB) * shrink;
+        sppm[pixelIdx].N    = N_new;
+    }
+    // Zero the delta for the next pass regardless of whether the update
+    // fired (a future pass may hit this pixel even if this one didn't).
+    sppmDelta[pixelIdx].dtauR = 0.0;
+    sppmDelta[pixelIdx].dtauG = 0.0;
+    sppmDelta[pixelIdx].dtauB = 0.0;
+    sppmDelta[pixelIdx].M     = 0.0;
 }
 )GLSL";
 
@@ -1821,6 +1944,8 @@ bool OpenglRenderer::initGL()
 
     _program = compileComputeShader(kComputeShaderSrc);
     if (!_program) return false;
+    _sppmUpdateProgram = compileComputeShader(kSppmUpdateShaderSrc);
+    if (!_sppmUpdateProgram) return false;
 
     // Three RGBA16F textures. uOutput holds HDR linear radiance (pre-tone-
     // map, so OIDN HDR mode gets the right input). uAlbedo/uNormal are
@@ -1854,6 +1979,8 @@ bool OpenglRenderer::initGL()
     // unconditional.
     glGenBuffers(1, &_photonSSBO);
     glGenBuffers(1, &_photonCellSSBO);
+    glGenBuffers(1, &_sppmSSBO);
+    glGenBuffers(1, &_sppmDeltaSSBO);
 
     _initialized = true;
     return true;
@@ -2142,18 +2269,12 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     bool effectiveProgressive = effectivePhotonMap && useCausticPhotonProgressive;
     int  numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
 
-    // True SPPM (Hachisuka & Jensen 2009) ships on the CPU + Metal-
-    // megakernel paths as of session 7. OpenGL SPPM requires the
-    // same per-pixel state buffers + an end-of-pass update kernel as
-    // Metal but in GLSL; that's a follow-up session. For now we warn
-    // and fall back to plain progressive.
-    if (useCausticPhotonSppm && effectiveProgressive)
-    {
-        std::cerr << "warning: --photon-sppm not yet implemented on the "
-                     "OpenGL backend; running plain progressive instead. "
-                     "Use the CPU CLI (no --no-wavefront needed) or the "
-                     "Metal CLI with --no-wavefront for full SPPM.\n";
-    }
+    // True SPPM (Hachisuka & Jensen 2009): per-pixel adaptive-radius state
+    // (sppm/sppmDelta SSBOs) + an end-of-pass update compute pass + a final
+    // composite. Layered on top of progressive, same as the CPU + Metal
+    // paths. Rides effectiveProgressive (the multi-pass radius shrinkage is
+    // the whole mechanism).
+    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
 
     if (!_sharedContext)
     {
@@ -2195,6 +2316,30 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // boundary (the post-loop divide replaces it with the averaged
     // progAccum).
     std::vector<Vec3f> hdr;
+
+    // SPPM per-pixel state: R seeded to the initial photon radius, tau/N
+    // zeroed. Persists across all progressive passes; the per-pass update
+    // shrinks R and folds in the delta. Delta starts zeroed.
+    if (effectiveSppm)
+    {
+        size_t n = (size_t)_width * _height;
+        std::vector<Photon::SppmPixel> initState(n);
+        for (auto &px : initState)
+        {
+            px.R = photonRadius;
+            px.tauR = px.tauG = px.tauB = 0.f;
+            px.N = 0.f;
+        }
+        std::vector<Photon::SppmDelta> initDelta(n, Photon::SppmDelta{0.f, 0.f, 0.f, 0.f});
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _sppmSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     (GLsizeiptr)(n * sizeof(Photon::SppmPixel)),
+                     initState.data(), GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _sppmDeltaSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     (GLsizeiptr)(n * sizeof(Photon::SppmDelta)),
+                     initDelta.data(), GL_DYNAMIC_DRAW);
+    }
 
     for (int progPass = 0; progPass < numProgPasses; progPass++)
     {
@@ -2274,6 +2419,11 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, _lightTriSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, _photonSSBO);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, _photonCellSSBO);
+    if (effectiveSppm)
+    {
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, _sppmSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, _sppmDeltaSSBO);
+    }
 
     // Set uniforms
     auto setI = [&](const char *name, int v) {
@@ -2336,6 +2486,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     setI("uUseCausticPhotonMap",  photonMapActive ? 1 : 0);
     setI("uPhotonCellTableMask",  photonTableMask);
     setF("uPhotonRadius",         photonRadius);
+    setI("uPhotonSppm",           effectiveSppm ? 1 : 0);
 
     // Dispatch in 2D tiles so we stay well under any GPU TDR (Timeout
     // Detection and Recovery) window. Windows defaults to a 2-second TDR;
@@ -2569,6 +2720,24 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         }
     }
 
+    // SPPM end-of-pass update: shrink each pixel's radius and fold in this
+    // pass's delta, then zero the delta. Storage barrier first so the
+    // path-trace SSBO writes are visible to the update program.
+    if (effectiveSppm)
+    {
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glUseProgram(_sppmUpdateProgram);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, _sppmSSBO);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, _sppmDeltaSSBO);
+        glUniform1i(glGetUniformLocation(_sppmUpdateProgram, "uWidth"),  _width);
+        glUniform1i(glGetUniformLocation(_sppmUpdateProgram, "uHeight"), _height);
+        GLuint ugx = (GLuint)((_width + 15) / 16);
+        GLuint ugy = (GLuint)((_height + 15) / 16);
+        glDispatchCompute(ugx, ugy, 1);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glFinish();
+    }
+
     // Readback. GPU now stores HDR linear radiance + (optionally) aux as
     // RGBA16F, so we read GL_FLOAT into 4-component float buffers and then
     // strip the alpha into Vec3f arrays for downstream processing.
@@ -2623,6 +2792,34 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         PCR_LOG << "OpenglRenderer: progressive averaging across "
                   << numProgPasses << " passes complete." << std::endl;
     }
+
+    // SPPM final composite: read back the per-pixel state and add the
+    // Hachisuka caustic estimate L = tau / (pi R^2 N_emitted) to hdr.
+    // N_emitted = photonCount * numProgPasses (each pass shot photonCount).
+    // Identical math to the CPU (Renderer.cpp) + Metal composites.
+    if (effectiveSppm && numProgPasses > 0)
+    {
+        const double kPi = 3.14159265358979323846;
+        size_t n = (size_t)_width * _height;
+        std::vector<Photon::SppmPixel> state(n);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _sppmSSBO);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                           (GLsizeiptr)(n * sizeof(Photon::SppmPixel)),
+                           state.data());
+        const float invEmitted = 1.0f /
+            (float)(kPi * (double)photonCount * (double)numProgPasses);
+        for (size_t i = 0; i < n; i++)
+        {
+            const Photon::SppmPixel &px = state[i];
+            if (px.N <= 0.f || px.R <= 0.f) continue;
+            float scale = (1.0f / (px.R * px.R)) * invEmitted;
+            hdr[i][0] += px.tauR * scale;
+            hdr[i][1] += px.tauG * scale;
+            hdr[i][2] += px.tauB * scale;
+        }
+        PCR_LOG << "OpenglRenderer: SPPM final composite complete." << std::endl;
+    }
+
     // Hand the captured aux to the OIDN block below under the names
     // it expects.
     std::vector<Vec3f> &albedoBuf = progAlbedoBuf;
@@ -2704,7 +2901,11 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // stay self-consistent. Progressive mode appends "-prog" so A/B
     // sorting groups classical vs progressive cleanly.
     if (effectivePhotonMap)
-        filename += effectiveProgressive ? "-photon-prog" : "-photon";
+    {
+        if (effectiveSppm)             filename += "-photon-sppm";
+        else if (effectiveProgressive) filename += "-photon-prog";
+        else                           filename += "-photon";
+    }
     filename += "-t" + std::to_string(elapsedMs) + "-gpu.png";
 
     fs::path outputPath = fs::path(outputDir) / filename;
@@ -2753,6 +2954,8 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
             addText("PhotonProgressive", "1");
             addText("PhotonPasses",      std::to_string(numProgPasses));
         }
+        if (effectiveSppm)
+            addText("PhotonSppm", "1");
     }
 
     std::vector<unsigned char> pngBuffer;
@@ -2778,6 +2981,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
 void OpenglRenderer::destroyGL()
 {
     if (_program) { glDeleteProgram(_program); _program = 0; }
+    if (_sppmUpdateProgram) { glDeleteProgram(_sppmUpdateProgram); _sppmUpdateProgram = 0; }
     if (_outputTex) { glDeleteTextures(1, &_outputTex); _outputTex = 0; }
     if (_albedoTex) { glDeleteTextures(1, &_albedoTex); _albedoTex = 0; }
     if (_normalTex) { glDeleteTextures(1, &_normalTex); _normalTex = 0; }
@@ -2786,5 +2990,7 @@ void OpenglRenderer::destroyGL()
     if (_materialSSBO) { glDeleteBuffers(1, &_materialSSBO); _materialSSBO = 0; }
     if (_photonSSBO)     { glDeleteBuffers(1, &_photonSSBO);     _photonSSBO = 0; }
     if (_photonCellSSBO) { glDeleteBuffers(1, &_photonCellSSBO); _photonCellSSBO = 0; }
+    if (_sppmSSBO)       { glDeleteBuffers(1, &_sppmSSBO);       _sppmSSBO = 0; }
+    if (_sppmDeltaSSBO)  { glDeleteBuffers(1, &_sppmDeltaSSBO);  _sppmDeltaSSBO = 0; }
     _initialized = false;
 }

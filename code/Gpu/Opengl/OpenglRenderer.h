@@ -146,6 +146,12 @@ private:
     // SSBO declarations always resolve.
     unsigned _photonSSBO     = 0;
     unsigned _photonCellSSBO = 0;
+    // SPPM per-pixel state (R/tau/N) + per-pass delta SSBOs, plus the
+    // second compute program that applies the Hachisuka end-of-pass
+    // update. Allocated per render() when SPPM is active.
+    unsigned _sppmSSBO          = 0;
+    unsigned _sppmDeltaSSBO     = 0;
+    unsigned _sppmUpdateProgram = 0;
     bool _initialized = false;
 
     bool initGL();
