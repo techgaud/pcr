@@ -163,22 +163,22 @@ void Renderer::render(const Scenes::SceneData &scene,
     // the next step (needs per-pixel state threaded through
     // castRaySpectral), so for now it runs as spectral progressive.
     bool spectralPhoton = useSpectral && useCausticPhotonMap;
-    // Spectral progressive re-renders the fork-heavy spectral eye image
-    // once per pass, so wall-clock scales with the pass count (a single
-    // spectral pass is already expensive on glass scenes). Hard-cap + warn
-    // so a large --photon-passes can't launch a multi-hour render by
-    // accident. Spectral SPPM is the efficient path: it renders the eye
-    // once and accumulates the caustic over passes without re-rendering.
-    constexpr int kSpectralProgressivePassCap = 16;
+    // Spectral photon mapping (progressive AND SPPM) re-renders the
+    // fork-heavy spectral eye image once per pass, so wall-clock scales
+    // with the pass count (a single spectral pass is already expensive on
+    // glass scenes). Hard-cap + warn so a large --photon-passes can't
+    // launch a multi-hour render by accident. (The GPU backends are the
+    // practical path for spectral caustics; this CPU path is the
+    // reference.)
+    constexpr int kSpectralPhotonPassCap = 16;
     if (spectralPhoton && effectiveProgressive
-        && numProgPasses > kSpectralProgressivePassCap)
+        && numProgPasses > kSpectralPhotonPassCap)
     {
         std::cerr << "warning: --photon-passes " << numProgPasses
-                  << " is very expensive in --spectral progressive mode "
-                     "(the spectral eye image re-renders each pass); capping to "
-                  << kSpectralProgressivePassCap
-                  << ". Use --photon-sppm for efficient spectral caustics.\n";
-        numProgPasses = kSpectralProgressivePassCap;
+                  << " is very expensive in spectral photon mapping (the "
+                     "spectral eye image re-renders each pass); capping to "
+                  << kSpectralPhotonPassCap << ".\n";
+        numProgPasses = kSpectralPhotonPassCap;
     }
 
     // SPPM layers on top of progressive. When on, the eye path's
@@ -187,7 +187,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     // the per-pixel update + final composite below handle the
     // Hachisuka math. SPPM requires progressive (it's nonsensical
     // with a single pass); spectral disables both already.
-    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm && !useSpectral;
+    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
     std::vector<Photon::SppmPixel> sppmStateVec;
     std::vector<Photon::SppmDelta> sppmDeltaVec;
     if (effectiveSppm)
@@ -393,7 +393,8 @@ void Renderer::render(const Scenes::SceneData &scene,
                             SpectralSample rad = castRaySpectral(ray, scene.materials,
                                                                  scene.spheres, scene.triangles, scene.triangleBvh,
                                                                  scene.areaLights, totalLightArea, 0, lambdas,
-                                                                 albOut, nrmOut);
+                                                                 albOut, nrmOut,
+                                                                 (int)(i * _width + j), true);
                             // Convert each (lambda, radiance) to a
                             // CIE XYZ contribution, average across
                             // the N actually-sampled channels (1/N is
@@ -1015,7 +1016,9 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
                                          float totalLightArea, int depth,
                                          const SpectralSample &lambdas,
                                          Vec3f *outFirstAlbedo,
-                                         Vec3f *outFirstNormal)
+                                         Vec3f *outFirstNormal,
+                                         int pixelIdx,
+                                         bool firstDiffuse)
 {
     int matIdx = -1;
     Vec3f hit, N;
@@ -1052,7 +1055,8 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
         Vec3f reflOrigin = hit + N * 1e-3f;
         SpectralSample recurse = castRaySpectral(Ray(reflectedDir, reflOrigin), materials,
                                                  spheres, triangles, bvh, lights, totalLightArea,
-                                                 depth + 1, lambdas);
+                                                 depth + 1, lambdas, nullptr, nullptr,
+                                                 pixelIdx, firstDiffuse);
         SpectralSample out;
         for (int k = 0; k < kHeroLambdaCount; k++)
             out[k] = recurse[k] * material.albedoAt(lambdas[k]);
@@ -1079,7 +1083,8 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
                                               material.ior, NumGen::Epsilon());
             SpectralSample r = castRaySpectral(Ray(b.dir, b.origin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
-                                               depth + 1, lambdas);
+                                               depth + 1, lambdas, nullptr, nullptr,
+                                               pixelIdx, firstDiffuse);
             SpectralSample out;
             for (int k = 0; k < kHeroLambdaCount; k++)
                 out[k] = r[k] * material.albedoAt(lambdas[k]);
@@ -1098,9 +1103,12 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
             // the same value when all lambdas agree).
             SpectralSample singleLambdas;
             singleLambdas.fill(lambdas[k]);
+            // Dispersive fork: the 4 sub-paths must NOT each deposit an
+            // SPPM visible point (one per pixel), so firstDiffuse=false.
             SpectralSample r = castRaySpectral(Ray(b.dir, b.origin), materials,
                                                spheres, triangles, bvh, lights, totalLightArea,
-                                               depth + 1, singleLambdas);
+                                               depth + 1, singleLambdas, nullptr, nullptr,
+                                               pixelIdx, false);
             out[k] = r[0] * material.albedoAt(lambdas[k]);
         }
         return out;
@@ -1143,14 +1151,16 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
             float p = std::min(0.95f, std::max(0.05f, albedoLambdas[0]));
             if (NumGen::Epsilon() > p) continue;
             SpectralSample r = castRaySpectral(randomRay, materials, spheres, triangles, bvh, lights,
-                                               totalLightArea, depth + 1, lambdas);
+                                               totalLightArea, depth + 1, lambdas, nullptr, nullptr,
+                                               pixelIdx, false);
             for (int k = 0; k < kHeroLambdaCount; k++)
                 indirectLo[k] += r[k] * albedoLambdas[k] / p;
         }
         else
         {
             SpectralSample r = castRaySpectral(randomRay, materials, spheres, triangles, bvh, lights,
-                                               totalLightArea, depth + 1, lambdas);
+                                               totalLightArea, depth + 1, lambdas, nullptr, nullptr,
+                                               pixelIdx, false);
             for (int k = 0; k < kHeroLambdaCount; k++)
                 indirectLo[k] += r[k] * albedoLambdas[k];
         }
@@ -1240,10 +1250,43 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
     // shared), so specPower[k] aligns with lambdas[k] by index. SPPM's
     // per-pixel-state path is not wired into the spectral tracer yet, so
     // this is a direct radiance add (classical + progressive).
+    // Spectral caustic. Classical/progressive: add per-wavelength radiance
+    // directly. SPPM (first diffuse hit, valid pixel, delta buffer live):
+    // accumulate the per-wavelength caustic flux into the (RGB) per-pixel
+    // delta via CIE + count M, contributing zero radiance here -- the
+    // per-pass update + final composite produce the caustic radiance.
     SpectralSample causticLo{};
     if (_activeCausticMap && _activeCausticMap->isSpectral())
-        Photon::densityEstimateSpectral(*_activeCausticMap, hit, N,
-                                        albedoLambdas.data(), causticLo.data());
+    {
+        if (_sppmDelta && firstDiffuse && pixelIdx >= 0)
+        {
+            float sumPower[4] = {0.f, 0.f, 0.f, 0.f};
+            float M = 0.f;
+            _activeCausticMap->query(hit, [&](const Photon::Record &p, float) {
+                if (p.wi.dot(N) >= 0.f) return;
+                for (int k = 0; k < kHeroLambdaCount; k++) sumPower[k] += p.specPower[k];
+                M += 1.f;
+            });
+            const float invPi = 1.f / (float)std::numbers::pi;
+            Vec3f xyz(0.f, 0.f, 0.f);
+            for (int k = 0; k < kHeroLambdaCount; k++)
+            {
+                float flux = albedoLambdas[k] * invPi * sumPower[k];
+                xyz = xyz + CIE::singleLambdaXYZ(lambdas[k], flux, useCieCmf);
+            }
+            xyz = xyz / (float)kHeroLambdaCount;   // hero sampling weight
+            Vec3f rgb = CIE::xyzToLinearSRGB(xyz);
+            _sppmDelta[pixelIdx].dtauR += rgb[0];
+            _sppmDelta[pixelIdx].dtauG += rgb[1];
+            _sppmDelta[pixelIdx].dtauB += rgb[2];
+            _sppmDelta[pixelIdx].M     += M;
+        }
+        else
+        {
+            Photon::densityEstimateSpectral(*_activeCausticMap, hit, N,
+                                            albedoLambdas.data(), causticLo.data());
+        }
+    }
 
     SpectralSample out;
     for (int k = 0; k < kHeroLambdaCount; k++)

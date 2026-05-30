@@ -251,7 +251,9 @@ private:
                                    float totalLightArea, int depth,
                                    const SpectralSample &lambdas,
                                    Vec3f *outFirstAlbedo = nullptr,
-                                   Vec3f *outFirstNormal = nullptr);
+                                   Vec3f *outFirstNormal = nullptr,
+                                   int pixelIdx = -1,
+                                   bool firstDiffuse = false);
 
     // Material lookup goes through the scene's materials registry;
     // sceneIntersect outs the picked primitive's material index and
