@@ -122,6 +122,7 @@ using GLintptr = ptrdiff_t;
     X(void,   Uniform1i,            GLint, GLint)                                 \
     X(void,   Uniform1f,            GLint, GLfloat)                               \
     X(void,   Uniform3f,            GLint, GLfloat, GLfloat, GLfloat)             \
+    X(void,   Uniform4f,            GLint, GLfloat, GLfloat, GLfloat, GLfloat)    \
     X(void,   Uniform2i,            GLint, GLint, GLint)                          \
     X(void,   GenBuffers,           GLsizei, GLuint *)                            \
     X(void,   DeleteBuffers,        GLsizei, const GLuint *)                      \
@@ -165,6 +166,7 @@ PCR_GL_FUNCS(PCR_DECLARE_GL_FN)
 #define glUniform1i           pcr_glUniform1i
 #define glUniform1f           pcr_glUniform1f
 #define glUniform3f           pcr_glUniform3f
+#define glUniform4f           pcr_glUniform4f
 #define glUniform2i           pcr_glUniform2i
 #define glGenBuffers          pcr_glGenBuffers
 #define glDeleteBuffers       pcr_glDeleteBuffers
@@ -261,6 +263,8 @@ uniform int   uUseCausticPhotonMap;
 uniform int   uPhotonCellTableMask;
 uniform float uPhotonRadius;
 uniform int   uPhotonSppm;    // 0/1; SPPM visible-point mode (deposit into per-pixel delta instead of adding radiance)
+uniform int   uPhotonSpectral; // 0/1; spectral caustic photon mapping active
+uniform vec4  uPhotonLambdas;  // the 4 hero wavelengths the spectral photon map used (= eye path's per-pass lambdas)
 
 const float PI = 3.14159265358979323846;
 
@@ -400,6 +404,12 @@ struct PhotonCell {
 };
 layout(std430, binding = 8) buffer Photons     { Photon     photons[];     };
 layout(std430, binding = 9) buffer PhotonCells { PhotonCell photonCells[]; };
+
+// Spectral photon power, parallel to photons[] (same index). float4 per
+// photon; mirrors Photon::GpuSpectralPower. Bound only in spectral photon
+// mode (uPhotonSpectral != 0); the RGB Photon record stays untouched.
+struct SpectralPower { float p[4]; };
+layout(std430, binding = 12) buffer SpectralPowers { SpectralPower spectralPower[]; };
 
 // SPPM per-pixel state (Hachisuka & Jensen 2009). Mirrors Photon::SppmPixel
 // (20 B, 5 floats) and SppmDelta (16 B, 4 floats). std430 lays both out
@@ -695,6 +705,104 @@ vec3 xyzToLinearSRGB(vec3 xyz) {
         -0.9692660 * xyz.x + 1.8760108 * xyz.y + 0.0415560 * xyz.z,
          0.0556434 * xyz.x - 0.2040259 * xyz.y + 1.0572252 * xyz.z
     );
+}
+
+// Spectral caustic density estimate (classical / progressive). Per hero
+// wavelength: sum spectral photon power within the fixed radius, weight by
+// albedo at that wavelength. Mirrors Photon::densityEstimateSpectral.
+// spectralPower is parallel to photons[] (same index).
+vec4 spectralDensityEstimate(vec3 x, vec3 N, vec4 albedoLam) {
+    if (uUseCausticPhotonMap == 0 || uPhotonSpectral == 0) return vec4(0.0);
+    float r = uPhotonRadius;
+    if (r <= 0.0) return vec4(0.0);
+    float r2 = r * r;
+    float invR = 1.0 / r;
+    uint mask = uint(uPhotonCellTableMask);
+    int cx = int(floor(x.x * invR));
+    int cy = int(floor(x.y * invR));
+    int cz = int(floor(x.z * invR));
+    vec4 sumPower = vec4(0.0);
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        for (int probe = 0; probe < 8; probe++) {
+            PhotonCell cell = photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0u; i < cell.count; i++) {
+                    Photon ph = photons[cell.offset + i];
+                    vec3 pos = vec3(ph.position[0], ph.position[1], ph.position[2]);
+                    vec3 wi  = vec3(ph.wi[0], ph.wi[1], ph.wi[2]);
+                    vec3 d = pos - x;
+                    if (dot(d, d) > r2) continue;
+                    if (dot(wi, N) >= 0.0) continue;
+                    SpectralPower sp = spectralPower[cell.offset + i];
+                    sumPower += vec4(sp.p[0], sp.p[1], sp.p[2], sp.p[3]);
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+    float invArea = 1.0 / (PI * r2);
+    float invPi = 1.0 / PI;
+    return albedoLam * invPi * sumPower * invArea;
+}
+
+// Spectral SPPM visible-point contribution. Uses the per-pixel adaptive
+// radius, converts the per-wavelength caustic flux to RGB (CIE) and folds
+// into the per-pixel SPPM delta + count M. Contributes zero radiance; the
+// per-pass update + composite produce it. Mirrors the CPU spectral SPPM
+// block in castRaySpectral.
+void spectralSppmContribute(uint pixelIdx, vec3 x, vec3 N, vec4 albedoLam, vec4 lambdas) {
+    if (uUseCausticPhotonMap == 0 || uPhotonSpectral == 0) return;
+    float r = sppm[pixelIdx].R;
+    if (r <= 0.0) return;
+    float r2 = r * r;
+    float invR = 1.0 / r;
+    uint mask = uint(uPhotonCellTableMask);
+    int cx = int(floor(x.x * invR));
+    int cy = int(floor(x.y * invR));
+    int cz = int(floor(x.z * invR));
+    vec4 sumPower = vec4(0.0);
+    float M = 0.0;
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        for (int probe = 0; probe < 8; probe++) {
+            PhotonCell cell = photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0u; i < cell.count; i++) {
+                    Photon ph = photons[cell.offset + i];
+                    vec3 pos = vec3(ph.position[0], ph.position[1], ph.position[2]);
+                    vec3 wi  = vec3(ph.wi[0], ph.wi[1], ph.wi[2]);
+                    vec3 d = pos - x;
+                    if (dot(d, d) > r2) continue;
+                    if (dot(wi, N) >= 0.0) continue;
+                    SpectralPower sp = spectralPower[cell.offset + i];
+                    sumPower += vec4(sp.p[0], sp.p[1], sp.p[2], sp.p[3]);
+                    M += 1.0;
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+    float invPi = 1.0 / PI;
+    vec4 flux = albedoLam * invPi * sumPower;   // per-wavelength flux; composite does /(pi r^2 N)
+    vec3 xyz = singleLambdaXYZ(lambdas.x, flux.x) + singleLambdaXYZ(lambdas.y, flux.y)
+             + singleLambdaXYZ(lambdas.z, flux.z) + singleLambdaXYZ(lambdas.w, flux.w);
+    xyz *= 0.25;   // hero sampling weight
+    vec3 rgb = xyzToLinearSRGB(xyz);
+    sppmDelta[pixelIdx].dtauR += rgb.x;
+    sppmDelta[pixelIdx].dtauG += rgb.y;
+    sppmDelta[pixelIdx].dtauB += rgb.z;
+    sppmDelta[pixelIdx].M     += M;
 }
 
 // PCG random number generator. Each pixel gets its own seeded state.
@@ -1335,7 +1443,7 @@ R"GLSL(
 // path sampling). MIS weight is wavelength-independent (depends only
 // on path geometry) so it scales the per-channel direct contribution
 // uniformly.
-vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint seed) {
+vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint seed, uint pixelIdx) {
     float aspect = float(uWidth) / float(uHeight);
     float scale = tan(PI / 180.0 * 0.5 * uFov);
     float x = ((2.0 * (pix.x + 0.5) / float(uWidth)) - 1.0) * scale * aspect;
@@ -1346,6 +1454,7 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
     vec4 throughput = vec4(1.0);
     vec4 radiance = vec4(0.0);
     bool firstBounce = true;
+    bool firstDiffuseSppm = (uPhotonSppm != 0);   // spectral SPPM visible-point tracking
 
     for (int bounce = 0; bounce < uDepth; bounce++) {
         vec3 hit, N;
@@ -1499,6 +1608,20 @@ vec4 tracePathSpectral(vec2 pix, float pr1, float pr2, vec4 lambdas, inout uint 
         }
         radiance += throughput * directLo;
 
+        // Spectral caustic. Classical/progressive: add per-wavelength
+        // radiance. SPPM (first diffuse hit): deposit into the per-pixel
+        // delta, contribute zero here. Mirrors the CPU castRaySpectral hook.
+        if (uPhotonSpectral != 0) {
+            if (uPhotonSppm != 0) {
+                if (firstDiffuseSppm) {
+                    spectralSppmContribute(pixelIdx, hit, N, albedoLam, lambdas);
+                    firstDiffuseSppm = false;
+                }
+            } else {
+                radiance += throughput * spectralDensityEstimate(hit, N, albedoLam);
+            }
+        }
+
         // Russian roulette uses the hero (.x) channel reflectance so
         // all 4 channels share the termination decision; non-hero
         // channels carry their scaled throughput along.
@@ -1627,14 +1750,21 @@ void main() {
                     // accumulator runs in XYZ for the duration of
                     // the AA loop; we convert mean to linear sRGB
                     // once after the loop.
-                    float kSpan = kLambdaMax - kLambdaMin;
-                    float kStride = kSpan / 4.0;
                     vec4 lambdas;
-                    lambdas.x = kLambdaMin + rand(seed) * kSpan;
-                    lambdas.y = lambdas.x + kStride; if (lambdas.y > kLambdaMax) lambdas.y -= kSpan;
-                    lambdas.z = lambdas.x + kStride * 2.0; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
-                    lambdas.w = lambdas.x + kStride * 3.0; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
-                    vec4 rad = tracePathSpectral(jpix, r1, r2, lambdas, seed);
+                    if (uPhotonSpectral != 0) {
+                        // Per-pass shared wavelengths so the eye lines up
+                        // with the spectral photon map by index.
+                        lambdas = uPhotonLambdas;
+                    } else {
+                        float kSpan = kLambdaMax - kLambdaMin;
+                        float kStride = kSpan / 4.0;
+                        lambdas.x = kLambdaMin + rand(seed) * kSpan;
+                        lambdas.y = lambdas.x + kStride; if (lambdas.y > kLambdaMax) lambdas.y -= kSpan;
+                        lambdas.z = lambdas.x + kStride * 2.0; if (lambdas.z > kLambdaMax) lambdas.z -= kSpan;
+                        lambdas.w = lambdas.x + kStride * 3.0; if (lambdas.w > kLambdaMax) lambdas.w -= kSpan;
+                    }
+                    vec4 rad = tracePathSpectral(jpix, r1, r2, lambdas, seed,
+                                                 uint(pix.y) * uint(uWidth) + uint(pix.x));
                     vec3 xyz = singleLambdaXYZ(lambdas.x, rad.x)
                              + singleLambdaXYZ(lambdas.y, rad.y)
                              + singleLambdaXYZ(lambdas.z, rad.z)
@@ -1981,6 +2111,7 @@ bool OpenglRenderer::initGL()
     glGenBuffers(1, &_photonCellSSBO);
     glGenBuffers(1, &_sppmSSBO);
     glGenBuffers(1, &_sppmDeltaSSBO);
+    glGenBuffers(1, &_spectralPowerSSBO);
 
     _initialized = true;
     return true;
@@ -2255,13 +2386,10 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // Photon::shootCaustic and the Photon::buildGpuTable helpers; the
     // Metal backend uses the same path).
     bool effectivePhotonMap = useCausticPhotonMap;
-    if (effectivePhotonMap && useSpectral)
-    {
-        std::cerr << "warning: --photon-map disabled in --spectral mode "
-                     "(RGB-only density estimate; spectral support is "
-                     "a later session).\n";
-        effectivePhotonMap = false;
-    }
+    // Spectral caustic photon mapping (formulation B): photons carry hero-4
+    // power (parallel SpectralPower buffer) and share the eye path's per-pass
+    // wavelengths. Mirrors the CPU path; no longer disabled in --spectral.
+    bool spectralPhoton = effectivePhotonMap && useSpectral;
     // Progressive photon mapping: wrap the photon-shoot + dispatch +
     // readback block in an outer loop; accumulate HDR per pass on the
     // host; OIDN / tone-map / PNG runs once on the averaged result.
@@ -2353,12 +2481,31 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // failed - so the SSBO bindings below resolve unconditionally.
     int   photonTableMask = 0;
     bool  photonMapActive = false;
+    bool  spectralPowerUploaded = false;
+    float passLambdas[4] = {0.f, 0.f, 0.f, 0.f};
     if (effectivePhotonMap)
     {
         uint64_t photonSeed = baseProgSeed + (uint64_t)progPass;
-        Photon::Map cpuMap = Photon::shootCaustic(scene, photonCount,
-                                                   photonRadius, _maxDepth,
-                                                   photonSeed);
+        if (spectralPhoton)
+        {
+            // Per-pass hero wavelengths, rotated to cover 400-700nm; the eye
+            // path uses the same set (uPhotonLambdas) so photon specPower[k]
+            // aligns with the eye's lambda[k] by index.
+            const float lmin = 400.f, lmax = 700.f, span = lmax - lmin;
+            const float stride = span / 4.f;
+            float pbase = lmin + ((progPass + 0.5f) / (float)numProgPasses) * stride;
+            for (int k = 0; k < 4; k++)
+            {
+                float l = pbase + k * stride;
+                if (l > lmax) l -= span;
+                passLambdas[k] = l;
+            }
+        }
+        Photon::Map cpuMap = spectralPhoton
+            ? Photon::shootCausticSpectral(scene, photonCount, photonRadius,
+                                           _maxDepth, photonSeed, passLambdas)
+            : Photon::shootCaustic(scene, photonCount, photonRadius,
+                                   _maxDepth, photonSeed);
         Photon::GpuTable gpuTable;
         if (Photon::buildGpuTable(cpuMap, gpuTable))
         {
@@ -2372,6 +2519,14 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
             glBufferData(GL_SHADER_STORAGE_BUFFER,
                          (GLsizeiptr)(gpuTable.cells.size() * sizeof(Photon::GpuCell)),
                          gpuTable.cells.data(), GL_DYNAMIC_DRAW);
+            if (gpuTable.spectral)
+            {
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, _spectralPowerSSBO);
+                glBufferData(GL_SHADER_STORAGE_BUFFER,
+                             (GLsizeiptr)(gpuTable.spectralPower.size() * sizeof(Photon::GpuSpectralPower)),
+                             gpuTable.spectralPower.data(), GL_DYNAMIC_DRAW);
+                spectralPowerUploaded = true;
+            }
             PCR_LOG << "OpenglRenderer: photon table uploaded ("
                       << gpuTable.records.size() << " photons, "
                       << gpuTable.cells.size() << " cells, mask=0x"
@@ -2399,6 +2554,14 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, _photonCellSSBO);
         glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(dummyCell), &dummyCell, GL_DYNAMIC_DRAW);
     }
+    if (!spectralPowerUploaded)
+    {
+        // 1-element dummy so SpectralPowers (binding 12) resolves in RGB /
+        // inactive modes (the shader gates reads on uPhotonSpectral).
+        Photon::GpuSpectralPower dummySp{};
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, _spectralPowerSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(dummySp), &dummySp, GL_DYNAMIC_DRAW);
+    }
 
     glUseProgram(_program);
 
@@ -2424,6 +2587,7 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, _sppmSSBO);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 11, _sppmDeltaSSBO);
     }
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 12, _spectralPowerSSBO);
 
     // Set uniforms
     auto setI = [&](const char *name, int v) {
@@ -2487,6 +2651,9 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     setI("uPhotonCellTableMask",  photonTableMask);
     setF("uPhotonRadius",         photonRadius);
     setI("uPhotonSppm",           effectiveSppm ? 1 : 0);
+    setI("uPhotonSpectral",       spectralPhoton ? 1 : 0);
+    glUniform4f(glGetUniformLocation(_program, "uPhotonLambdas"),
+                passLambdas[0], passLambdas[1], passLambdas[2], passLambdas[3]);
 
     // Dispatch in 2D tiles so we stay well under any GPU TDR (Timeout
     // Detection and Recovery) window. Windows defaults to a 2-second TDR;
@@ -2896,6 +3063,8 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
     // so they live in the PNG metadata only.
     if (useACES)
         filename += "-aces";
+    if (useSpectral)
+        filename += "-spectral";
     // Filename tag only when the photon map actually ran (built non-
     // empty, RGB mode). Matches the PNG metadata gate below so the two
     // stay self-consistent. Progressive mode appends "-prog" so A/B
@@ -2992,5 +3161,6 @@ void OpenglRenderer::destroyGL()
     if (_photonCellSSBO) { glDeleteBuffers(1, &_photonCellSSBO); _photonCellSSBO = 0; }
     if (_sppmSSBO)       { glDeleteBuffers(1, &_sppmSSBO);       _sppmSSBO = 0; }
     if (_sppmDeltaSSBO)  { glDeleteBuffers(1, &_sppmDeltaSSBO);  _sppmDeltaSSBO = 0; }
+    if (_spectralPowerSSBO) { glDeleteBuffers(1, &_spectralPowerSSBO); _spectralPowerSSBO = 0; }
     _initialized = false;
 }

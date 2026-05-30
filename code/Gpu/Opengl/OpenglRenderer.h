@@ -152,6 +152,8 @@ private:
     unsigned _sppmSSBO          = 0;
     unsigned _sppmDeltaSSBO     = 0;
     unsigned _sppmUpdateProgram = 0;
+    // Spectral photon power, parallel to the photon records (spectral mode).
+    unsigned _spectralPowerSSBO = 0;
     bool _initialized = false;
 
     bool initGL();

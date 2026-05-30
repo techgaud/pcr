@@ -54,6 +54,19 @@ namespace Photon
                   "Photon::GpuCell must be 12 bytes to match MSL PCRPhotonCell "
                   "and GLSL std430 PhotonCell layouts");
 
+    // Parallel spectral-power buffer (spectral mode only). One entry per
+    // GpuRecord, same order as the flattened records array, so the kernel
+    // indexes it with the same offset it uses for `records`. 16 bytes
+    // (float4) matches MSL float4 + GLSL std430 vec4. Keeping this separate
+    // from GpuRecord leaves the 36-byte RGB record (and the RGB GPU photon
+    // path) completely untouched; the buffer is bound only in spectral mode.
+    struct GpuSpectralPower
+    {
+        float p[4];
+    };
+    static_assert(sizeof(GpuSpectralPower) == 16,
+                  "Photon::GpuSpectralPower must be 16 bytes (float4)");
+
     inline constexpr uint32_t kEmptyCell = 0xFFFFFFFFu;
 
     // Teschner 2003 spatial hash. The MSL photonCellHash and the GLSL
@@ -73,6 +86,11 @@ namespace Photon
         std::vector<GpuRecord> records;
         std::vector<GpuCell>   cells;
         uint32_t               tableMask = 0;  // tableSize - 1
+        // Spectral mode: parallel to records (same order); the 4 hero
+        // wavelengths these powers correspond to. Empty / unset in RGB mode.
+        std::vector<GpuSpectralPower> spectralPower;
+        bool                   spectral = false;
+        float                  lambdas[4] = {0.f, 0.f, 0.f, 0.f};
     };
 
     // Flatten a CPU Map into the GPU layout. Returns false (and clears
@@ -84,7 +102,10 @@ namespace Photon
     {
         out.records.clear();
         out.cells.clear();
+        out.spectralPower.clear();
         out.tableMask = 0;
+        out.spectral = map.isSpectral();
+        for (int k = 0; k < 4; k++) out.lambdas[k] = map.lambdas()[k];
 
         const auto &records = map.records();
         if (records.empty()) return false;
@@ -144,6 +165,13 @@ namespace Photon
                 rec.wi[0]       = r.wi[0];       rec.wi[1]       = r.wi[1];       rec.wi[2]       = r.wi[2];
                 rec.power[0]    = r.power[0];    rec.power[1]    = r.power[1];    rec.power[2]    = r.power[2];
                 out.records.push_back(rec);
+                if (out.spectral)
+                {
+                    GpuSpectralPower sp;
+                    sp.p[0] = r.specPower[0]; sp.p[1] = r.specPower[1];
+                    sp.p[2] = r.specPower[2]; sp.p[3] = r.specPower[3];
+                    out.spectralPower.push_back(sp);
+                }
             }
             out.cells[slot] = GpuCell{ h, startOffset, (uint32_t)kv.second.size() };
         }
