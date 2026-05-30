@@ -36,4 +36,16 @@ namespace Photon
                      float radius,
                      int maxBounces,
                      uint64_t seed);
+
+    // Spectral variant: photons carry power at the 4 hero wavelengths in
+    // `lambdas` (the same per-pass wavelengths the eye path uses), and
+    // disperse at dispersive glass. The returned Map is tagged spectral
+    // (Map::isSpectral) with those lambdas; query it via
+    // densityEstimateSpectral. Used when --spectral + --photon-map.
+    Map shootCausticSpectral(const Scenes::SceneData &scene,
+                             int photonCount,
+                             float radius,
+                             int maxBounces,
+                             uint64_t seed,
+                             const float lambdas[4]);
 }

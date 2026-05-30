@@ -156,14 +156,30 @@ void Renderer::render(const Scenes::SceneData &scene,
     // shoots fresh photons with a different seed). The single-shot
     // call here only fires in non-progressive mode.
     bool effectiveProgressive = useCausticPhotonMap && useCausticPhotonProgressive;
-    if (effectiveProgressive && useSpectral)
-    {
-        // Spectral skips density-estimate, so progressive is a no-op.
-        // Fall back to a single non-progressive pass to avoid wasted
-        // re-shoots that don't contribute.
-        effectiveProgressive = false;
-    }
     int numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
+    // Spectral caustic photon mapping (formulation B): photons carry
+    // per-hero-wavelength power and share the eye path's per-pass
+    // wavelengths. Classical + progressive land here; spectral SPPM is
+    // the next step (needs per-pixel state threaded through
+    // castRaySpectral), so for now it runs as spectral progressive.
+    bool spectralPhoton = useSpectral && useCausticPhotonMap;
+    // Spectral progressive re-renders the fork-heavy spectral eye image
+    // once per pass, so wall-clock scales with the pass count (a single
+    // spectral pass is already expensive on glass scenes). Hard-cap + warn
+    // so a large --photon-passes can't launch a multi-hour render by
+    // accident. Spectral SPPM is the efficient path: it renders the eye
+    // once and accumulates the caustic over passes without re-rendering.
+    constexpr int kSpectralProgressivePassCap = 16;
+    if (spectralPhoton && effectiveProgressive
+        && numProgPasses > kSpectralProgressivePassCap)
+    {
+        std::cerr << "warning: --photon-passes " << numProgPasses
+                  << " is very expensive in --spectral progressive mode "
+                     "(the spectral eye image re-renders each pass); capping to "
+                  << kSpectralProgressivePassCap
+                  << ". Use --photon-sppm for efficient spectral caustics.\n";
+        numProgPasses = kSpectralProgressivePassCap;
+    }
 
     // SPPM layers on top of progressive. When on, the eye path's
     // first-diffuse-hit density estimate mutates per-pixel state
@@ -171,7 +187,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     // the per-pixel update + final composite below handle the
     // Hachisuka math. SPPM requires progressive (it's nonsensical
     // with a single pass); spectral disables both already.
-    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
+    bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm && !useSpectral;
     std::vector<Photon::SppmPixel> sppmStateVec;
     std::vector<Photon::SppmDelta> sppmDeltaVec;
     if (effectiveSppm)
@@ -197,13 +213,10 @@ void Renderer::render(const Scenes::SceneData &scene,
         _sppmDelta = nullptr;
     }
     std::optional<Photon::Map> causticMap;
-    if (useCausticPhotonMap && !effectiveProgressive)
+    if (useCausticPhotonMap && !effectiveProgressive && !spectralPhoton)
     {
-        if (useSpectral)
-        {
-            std::cerr << "warning: --photon-map ignored on spectral renders for now; "
-                         "caustic density estimate is RGB-only.\n";
-        }
+        // RGB classical (single-shot). Spectral classical is shot inside
+        // the per-pass loop below so it gets this pass's hero wavelengths.
         uint64_t photonSeed = NumGen::getSeed();
         if (photonSeed == 0) photonSeed = (uint64_t)std::time(nullptr);
         causticMap.emplace(Photon::shootCaustic(scene, photonCount, photonRadius,
@@ -257,7 +270,29 @@ void Renderer::render(const Scenes::SceneData &scene,
         // decorrelated photon trails; combined with the per-pixel
         // averaging this gives the 1/sqrt(N) variance reduction
         // that's the whole point of progressive.
-        if (effectiveProgressive)
+        SpectralSample passLambdas{};
+        if (spectralPhoton)
+        {
+            // Per-pass hero wavelengths, rotated across passes to cover
+            // 400-700 nm. This pass's photon shoot and its eye rays use
+            // this exact set, so photon specPower[k] lines up with the
+            // eye path's lambdas[k] by index (the formulation-B contract).
+            constexpr float kSpan = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
+            float kStride = kSpan / (float)kHeroLambdaCount;
+            float pbase = Spectrum::kLambdaMin
+                        + ((progPass + 0.5f) / (float)numProgPasses) * kStride;
+            for (int k = 0; k < kHeroLambdaCount; k++)
+            {
+                float l = pbase + k * kStride;
+                if (l > Spectrum::kLambdaMax) l -= kSpan;
+                passLambdas[k] = l;
+            }
+            causticMap.emplace(Photon::shootCausticSpectral(
+                scene, photonCount, photonRadius, _maxDepth,
+                baseProgSeed + (uint64_t)progPass, passLambdas.data()));
+            _activeCausticMap = &*causticMap;
+        }
+        else if (effectiveProgressive)
         {
             causticMap.emplace(Photon::shootCaustic(scene, photonCount, photonRadius,
                                                     _maxDepth,
@@ -335,15 +370,26 @@ void Renderer::render(const Scenes::SceneData &scene,
                             constexpr float kSpan = Spectrum::kLambdaMax - Spectrum::kLambdaMin;
                             float kStride = kSpan / (float)N;
                             SpectralSample lambdas;
-                            lambdas[0] = Spectrum::kLambdaMin + NumGen::Epsilon() * kSpan;
-                            for (int k = 1; k < N; k++)
+                            if (spectralPhoton)
                             {
-                                float l = lambdas[0] + kStride * k;
-                                if (l > Spectrum::kLambdaMax) l -= kSpan;
-                                lambdas[k] = l;
+                                // Use this pass's shared hero wavelengths so the
+                                // eye path lines up with the photon map by index.
+                                // All 4 channels active (override heroSamples).
+                                N = kHeroLambdaCount;
+                                lambdas = passLambdas;
                             }
-                            for (int k = N; k < kHeroLambdaCount; k++)
-                                lambdas[k] = lambdas[0];
+                            else
+                            {
+                                lambdas[0] = Spectrum::kLambdaMin + NumGen::Epsilon() * kSpan;
+                                for (int k = 1; k < N; k++)
+                                {
+                                    float l = lambdas[0] + kStride * k;
+                                    if (l > Spectrum::kLambdaMax) l -= kSpan;
+                                    lambdas[k] = l;
+                                }
+                                for (int k = N; k < kHeroLambdaCount; k++)
+                                    lambdas[k] = lambdas[0];
+                            }
                             SpectralSample rad = castRaySpectral(ray, scene.materials,
                                                                  scene.spheres, scene.triangles, scene.triangleBvh,
                                                                  scene.areaLights, totalLightArea, 0, lambdas,
@@ -606,7 +652,7 @@ void Renderer::render(const Scenes::SceneData &scene,
         filename += "-spectral";
     if (useACES)
         filename += "-aces";
-    if (useCausticPhotonMap && !useSpectral)
+    if (useCausticPhotonMap)
     {
         if (effectiveSppm)            filename += "-photon-sppm";
         else if (effectiveProgressive) filename += "-photon-prog";
@@ -650,7 +696,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     addText("Spectral",   useSpectral ? "1" : "0");
     if (useSpectral)
         addText("CMF", useCieCmf ? "cie" : "wyman");
-    if (useCausticPhotonMap && !useSpectral)
+    if (useCausticPhotonMap)
     {
         addText("PhotonMap",    "1");
         addText("PhotonCount",  std::to_string(photonCount));
@@ -1189,9 +1235,19 @@ SpectralSample Renderer::castRaySpectral(const Ray &ray,
         }
     }
 
+    // Spectral caustic (classical / progressive photon mapping). The
+    // map's hero wavelengths match this eye path's lambdas (per-pass
+    // shared), so specPower[k] aligns with lambdas[k] by index. SPPM's
+    // per-pixel-state path is not wired into the spectral tracer yet, so
+    // this is a direct radiance add (classical + progressive).
+    SpectralSample causticLo{};
+    if (_activeCausticMap && _activeCausticMap->isSpectral())
+        Photon::densityEstimateSpectral(*_activeCausticMap, hit, N,
+                                        albedoLambdas.data(), causticLo.data());
+
     SpectralSample out;
     for (int k = 0; k < kHeroLambdaCount; k++)
-        out[k] = directLo[k] / (float)_shadowSamples + indirectLo[k];
+        out[k] = directLo[k] / (float)_shadowSamples + indirectLo[k] + causticLo[k];
     return out;
 }
 

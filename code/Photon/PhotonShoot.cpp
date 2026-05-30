@@ -336,4 +336,186 @@ namespace Photon
 
         return map;
     }
+
+    // Spectral caustic shoot. Same structure as shootCaustic but carries
+    // per-hero-wavelength power (the map's 4 lambdas) instead of RGB, and
+    // handles dispersion: at a dispersive glass surface (cauchyB > 0) a
+    // still-polychromatic photon collapses to one hero wavelength (uniform
+    // pick, power x4 to stay unbiased) so the refraction uses that
+    // wavelength's IOR -- different wavelengths bend differently, which is
+    // the rainbow. The deposited photon carries power in its collapsed
+    // channel (or all four for a non-dispersive mirror-only caustic).
+    Map shootCausticSpectral(const Scenes::SceneData &scene,
+                             int photonCount,
+                             float radius,
+                             int maxBounces,
+                             uint64_t seed,
+                             const float lambdas[4])
+    {
+        Map map(radius);
+        map.setSpectralLambdas(lambdas);
+
+        if (photonCount <= 0 || scene.areaLights.empty())
+            return map;
+
+        std::vector<Plane> planes;
+        for (const auto &L : scene.areaLights)
+            if (L.kind == Scenes::AreaLightKind::Plane) planes.push_back(L.plane);
+        for (const auto &w : scene.walls) planes.push_back(w);
+
+        float totalLightArea = 0.f;
+        for (const auto &L : scene.areaLights) totalLightArea += L.totalArea;
+        if (totalLightArea <= 0.f) return map;
+
+        const float fluxScale = (float)std::numbers::pi * totalLightArea
+                                / (float)photonCount;
+
+        PCG rng(seed);
+
+        int deposited = 0, droppedNonCaustic = 0, droppedHitLight = 0,
+            droppedRR = 0, droppedMissed = 0;
+
+        for (int i = 0; i < photonCount; i++)
+        {
+            float pickTarget = rng.next() * totalLightArea;
+            const Scenes::AreaLight *picked = &scene.areaLights.front();
+            float cumul = 0.f;
+            for (const auto &L : scene.areaLights)
+            {
+                cumul += L.totalArea;
+                if (pickTarget <= cumul) { picked = &L; break; }
+            }
+
+            Vec3f startPos, startN;
+            int lightMatIdx;
+            if (picked->kind == Scenes::AreaLightKind::Plane)
+            {
+                const Plane &p = picked->plane;
+                float ru = rng.next(), rv = rng.next();
+                startPos = p.origin + p.getU() * ru + p.getV() * rv;
+                startN = p.N;
+                lightMatIdx = p.matIdx;
+            }
+            else
+            {
+                float rtri = rng.next() * picked->totalArea;
+                auto it = std::lower_bound(picked->cumulativeArea.begin(),
+                                           picked->cumulativeArea.end(), rtri);
+                int triIdx = std::min((int)(it - picked->cumulativeArea.begin()),
+                                      (int)picked->triangles.size() - 1);
+                const Triangle &tri = picked->triangles[triIdx];
+                float r1 = rng.next(), r2 = rng.next();
+                if (r1 + r2 > 1.f) { r1 = 1.f - r1; r2 = 1.f - r2; }
+                startPos = tri.v0 + (tri.v1 - tri.v0) * r1 + (tri.v2 - tri.v0) * r2;
+                startN = tri.flatN;
+                lightMatIdx = tri.matIdx;
+            }
+
+            Vec3f startDir = cosineHemisphere(startN, rng.next(), rng.next());
+            Ray   photonRay(startDir, startPos + startN * 1e-3f);
+
+            const Material &lightMat = scene.materials[lightMatIdx];
+            float specPower[4];
+            for (int k = 0; k < 4; k++)
+                specPower[k] = lightMat.emissiveAt(lambdas[k]) * fluxScale;
+
+            int  monoIdx = -1;     // -1 = still polychromatic (hero-4)
+            bool hasSpecular = false;
+            bool pathAlive = true;
+
+            auto maxPower = [&]() {
+                float m = 0.f;
+                for (int k = 0; k < 4; k++) m = std::max(m, specPower[k]);
+                return m;
+            };
+
+            for (int bounce = 0; bounce < maxBounces && pathAlive; bounce++)
+            {
+                Vec3f hit, N;
+                int matIdx = -1;
+                if (!sceneIntersectPhoton(photonRay, scene.spheres, planes,
+                                          scene.triangles, scene.triangleBvh,
+                                          hit, N, matIdx))
+                { droppedMissed++; break; }
+
+                const Material &material = scene.materials[matIdx];
+                bool entering = photonRay.dir.dot(N) < 0.f;
+                if (!entering) N = N * -1.f;
+
+                if (material.isEmissive()) { droppedHitLight++; break; }
+
+                if (material.metallic)
+                {
+                    float cosI = -photonRay.dir.dot(N);
+                    Vec3f reflectedDir = photonRay.dir + N * (2.f * cosI);
+                    for (int k = 0; k < 4; k++)
+                        specPower[k] *= material.albedoAt(lambdas[k]);
+                    float pSurv = std::min(0.95f, std::max(0.f, maxPower()));
+                    if (bounce >= 1)
+                    {
+                        if (rng.next() > pSurv) { droppedRR++; pathAlive = false; break; }
+                        for (int k = 0; k < 4; k++) specPower[k] /= pSurv;
+                    }
+                    photonRay = Ray(reflectedDir, hit + N * 1e-3f);
+                    hasSpecular = true;
+                    continue;
+                }
+
+                if (material.transparent)
+                {
+                    float ior = material.ior;
+                    if (material.cauchyB > 0.f)
+                    {
+                        if (monoIdx < 0)
+                        {
+                            monoIdx = std::min(3, (int)(rng.next() * 4.f));
+                            for (int k = 0; k < 4; k++)
+                                if (k != monoIdx) specPower[k] = 0.f;
+                            specPower[monoIdx] *= 4.f; // 1 / uniform pick prob
+                        }
+                        ior = Optics::cauchyIor(material.ior, material.cauchyB,
+                                                lambdas[monoIdx]);
+                    }
+                    auto b = Optics::dielectricBounce(photonRay.dir, N, hit,
+                                                      entering, ior, rng.next());
+                    for (int k = 0; k < 4; k++)
+                        specPower[k] *= material.albedoAt(lambdas[k]);
+                    float pSurv = std::min(0.95f, std::max(0.f, maxPower()));
+                    if (bounce >= 1)
+                    {
+                        if (rng.next() > pSurv) { droppedRR++; pathAlive = false; break; }
+                        for (int k = 0; k < 4; k++) specPower[k] /= pSurv;
+                    }
+                    photonRay = Ray(b.dir, b.origin);
+                    hasSpecular = true;
+                    continue;
+                }
+
+                if (hasSpecular)
+                {
+                    Record rec;
+                    rec.position = hit;
+                    rec.wi       = photonRay.dir;
+                    rec.power    = Vec3f(0.f, 0.f, 0.f);
+                    for (int k = 0; k < 4; k++) rec.specPower[k] = specPower[k];
+                    map.insert(rec);
+                    deposited++;
+                }
+                else droppedNonCaustic++;
+                pathAlive = false;
+                break;
+            }
+        }
+
+        map.build();
+
+        PCR_LOG << "Photon::shootCausticSpectral: deposited=" << deposited
+                  << " noncaustic=" << droppedNonCaustic
+                  << " hitlight=" << droppedHitLight
+                  << " rr=" << droppedRR
+                  << " missed=" << droppedMissed
+                  << std::endl;
+
+        return map;
+    }
 }

@@ -77,4 +77,34 @@ namespace Photon
             albedo[1] * invPi * sumPower[1] * invArea,
             albedo[2] * invPi * sumPower[2] * invArea);
     }
+
+    // Spectral caustic density estimate. Same Jensen 1996 form as the
+    // RGB densityEstimate above, but per hero wavelength: the photon's
+    // specPower[k] is its power at the map's k-th hero wavelength, which
+    // (because the photon shoot and the eye path share the same per-pass
+    // wavelengths) lines up by index with the eye path's lambdas[k].
+    // `albedo4[k]` is the surface's spectral reflectance evaluated at
+    // lambdas[k] (the caller computes it via Material::albedoAt). Writes
+    // the 4 per-wavelength radiances to out[].
+    inline void densityEstimateSpectral(const Map &map,
+                                        const Vec3f &x,
+                                        const Vec3f &N,
+                                        const float albedo4[4],
+                                        float out[4])
+    {
+        out[0] = out[1] = out[2] = out[3] = 0.f;
+        if (map.size() == 0) return;
+
+        float sumPower[4] = {0.f, 0.f, 0.f, 0.f};
+        map.query(x, [&](const Record &p, float /*distSq*/) {
+            if (p.wi.dot(N) >= 0.f) return;
+            for (int k = 0; k < 4; k++) sumPower[k] += p.specPower[k];
+        });
+
+        const float r = map.radius();
+        const float invArea = 1.0f / ((float)std::numbers::pi * r * r);
+        const float invPi   = 1.0f / (float)std::numbers::pi;
+        for (int k = 0; k < 4; k++)
+            out[k] = albedo4[k] * invPi * sumPower[k] * invArea;
+    }
 }

@@ -43,9 +43,18 @@ namespace Photon
         Vec3f position;
         Vec3f wi;
         Vec3f power;
+        // Spectral-mode power: per-photon power at the map's 4 hero
+        // wavelengths (Map::lambdas()). Only populated when shooting in
+        // --spectral mode; RGB renders leave it zero and use `power`.
+        // A photon that dispersed at glass carries power in a single
+        // channel; a non-dispersed (mirror-only) caustic photon can
+        // carry all four. The GPU flatten ignores this field (the GPU
+        // GpuRecord stays 36-byte RGB until the spectral GPU port).
+        float specPower[4] = {0.f, 0.f, 0.f, 0.f};
     };
-    static_assert(sizeof(Record) == 36,
-                  "Photon::Record must be 36 bytes for GPU buffer compatibility");
+    static_assert(sizeof(Record) == 52,
+                  "Photon::Record is 52 bytes (RGB power + spectral hero-4); "
+                  "GpuFlatten copies only the RGB power into the 36-byte GpuRecord");
 
     // Spatial index over a photon array. Hash grid with cell size
     // equal to the kernel radius, so a radius-r query needs to check
@@ -89,6 +98,19 @@ namespace Photon
         float  radius() const { return _radius; }
         const std::vector<Record> &records() const { return _photons; }
 
+        // Spectral mode: the 4 hero wavelengths these photons' specPower
+        // channels correspond to. Set once before/after shooting a
+        // spectral pass; the spectral density estimate reads them so the
+        // eye path (which uses the same per-pass wavelengths) can combine
+        // photon power with surface reflectance per wavelength.
+        bool isSpectral() const { return _spectral; }
+        const float *lambdas() const { return _lambdas; }
+        void setSpectralLambdas(const float lam[4])
+        {
+            _spectral = true;
+            for (int k = 0; k < 4; k++) _lambdas[k] = lam[k];
+        }
+
     private:
         // 3D integer cell coordinates from a world position. The
         // floor + cast pattern handles negative coords correctly
@@ -104,6 +126,8 @@ namespace Photon
         float                                      _invCellSize;
         std::vector<Record>                        _photons;
         std::unordered_map<uint64_t, std::vector<uint32_t>> _grid;
+        bool                                       _spectral = false;
+        float                                      _lambdas[4] = {0.f, 0.f, 0.f, 0.f};
     };
 
     // Inline definition. Lives in the header so the visitor template
