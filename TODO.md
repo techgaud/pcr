@@ -2,70 +2,45 @@
 
 Deferred work, with enough context to pick up cold later.
 
-## Photon mapping: GPU SPPM ports + spectral integration
+## Photon mapping: GPU SPPM ports + spectral integration — COMPLETE
 
-**Status:** Classical photon mapping ships on all four backends (sessions 1-4, commits `3b0209b` / `942887c` / `9371c48` / `add7d0a`). Plain progressive (ensemble averaging across N fresh photon shoots) ships on all four backends (sessions 5-6, commits `814db3c` / `5191178`). True SPPM (Hachisuka & Jensen 2009, per-pixel adaptive radius shrinkage) ships on CPU + Metal megakernel (session 7, commit `b28e7dc`) **and Metal wavefront (session 8 — code written, pending Mac A/B verification; the Linux dev box can't compile `.mm`)**. OpenGL still warns + falls back to plain progressive when `--photon-sppm` is requested.
+**Status (2026-05-31): full backend + mode parity reached.** Classical
+(Jensen 1996), plain progressive (Hachisuka 2008-style ensemble), and true
+SPPM (Hachisuka & Jensen 2009, α=2/3 per-pixel radius shrink) all ship on
+**all four backends** — CPU, Metal megakernel, Metal wavefront, OpenGL.
+Spectral (dispersion) caustics ship on all four too. CLI + GUI both expose
+the flags via the shared renderer.
 
-> **Note (session 8):** `b28e7dc` shipped a latent compile error — `MetalRenderer.mm` used `effectiveWavefront` (line 4247) before its declaration (line 4284), so the `mac` branch did not build on Metal. Session 8's wavefront-SPPM work removes that block (it was the SPPM-vs-wavefront fallback, slated for deletion anyway) and relocates the decision below the declaration, fixing the build as a side effect.
+Verification: CPU + OpenGL validated. The Metal commits are written but
+**UNVERIFIED** (the Linux dev box can't compile `.mm`) — they gate on the
+macOS CI build + a Mac A/B. Hand off Metal work UNVERIFIED and watch the
+macOS CI check; first Mac render with `MTL_SHADER_VALIDATION=1
+MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 MTL_DEBUG_LAYER=1`.
 
-Algorithm code lives in `code/Photon/`:
-- `PhotonMap.h/.cpp` — Jensen hash-grid spatial index
-- `PhotonShoot.h/.cpp` — host-side caustic photon shoot, reuses BVH + `dielectricBounce`
-- `DensityEstimate.h` — CPU Jensen-1996 estimator (header-only)
-- `GpuFlatten.h` — shared host→GPU table flattener (Metal + OpenGL)
-- `Sppm.h` — `SppmPixel` (R, tauRGB, N) + `SppmDelta` (dtauRGB, M) PODs + `sppmUpdatePixel` host helper + `kSppmAlpha = 2/3`
+Key commits: OpenGL SPPM `89a33aa`; spectral CPU `ba79d0d`+`f2be894`;
+spectral OpenGL `e5b5c62`; spectral Metal megakernel `7d09cc5`; spectral
+Metal wavefront `0593230`. (Wavefront SPPM `75afdc7`, verified on Mac.)
 
-CLI flags: `--photon-map`, `--photons N` (default 1M), `--photon-radius R` (default 0.05), `--photon-progressive`, `--photon-passes N` (default 8), `--photon-sppm`. PNG metadata: `PhotonMap` / `PhotonCount` / `PhotonRadius` / `PhotonProgressive` / `PhotonPasses` / `PhotonSppm` tEXt chunks, gated on what actually ran. Filename suffix `-photon-sppm` > `-photon-prog` > `-photon` for A/B-sort cleanliness.
+**One deliberate non-parity:** spectral **SPPM** on Metal routes to the
+megakernel (a narrow force `--no-wavefront` gate scoped to spectral+SPPM).
+Per-pixel SPPM needs one visible point per pixel carrying all four hero
+wavelengths together (= the megakernel hero-4 single-path shape); the
+wavefront's monochromatic spectral fork splits a glass-piercing ray into
+sub-rays that share a pixelIdx (would race the atomic-free `sppmDelta`) and,
+in terminate mode, drop 3/4 of the spectrum. Classical/progressive spectral
+run natively on the wavefront (forks write their own ray-slot color +
+atomic fork-scatter, so no race). See `[[project-photon-mapping]]` memory.
 
-Two remaining tasks (wavefront SPPM done in session 8, see below).
+Algorithm code: `code/Photon/` (`PhotonMap`, `PhotonShoot`,
+`DensityEstimate.h`, `GpuFlatten.h`, `Sppm.h`). CLI flags: `--photon-map`,
+`--photons`, `--photon-radius`, `--photon-progressive`, `--photon-passes`,
+`--photon-sppm`. PNG `tEXt`: `PhotonMap`/`PhotonCount`/`PhotonRadius`/
+`PhotonProgressive`/`PhotonPasses`/`PhotonSppm` (+ `Spectral`), gated on what
+ran. Filename suffix `-photon-sppm` > `-photon-prog` > `-photon`.
 
-### ✅ Wavefront SPPM (session 8 — code complete, pending Mac A/B)
-
-Implemented per the outline below. **Needs a Mac build + A/B before it can be trusted** — the Linux dev box can't compile `.mm`, so this is unverified on hardware. Run with `MTL_SHADER_VALIDATION=1 MTL_SHADER_VALIDATION_ENABLE_ERROR_REPORTING=1 MTL_DEBUG_LAYER=1` on the first render to catch any binding mistakes.
-
-**What shipped:**
-- `rayState` bit 9 = `firstDiffuse` (MetalRenderer.mm packing comment + `kRayStateFirstDiffuseBit`, `stateFirstDiffuse()`); `statePack(depth, alive)` → `statePack(depth, alive, firstDiffuse)` — signature changed deliberately so the compiler forces every call site to be updated.
-- `wf_generate_primary_rays` sets `firstDiffuse=true` on the live primary, `false` on the adaptive done-pixel early-out.
-- `wf_shade_mirror` / `wf_shade_glass` (main + 3 fork sites) pass the bit through unchanged.
-- `wf_shade_diffuse`: reads the bit; when set AND `useCausticPhotonSppm`, calls `sppmContributeAtVisiblePoint` (reused unchanged) and skips the classical estimate; clears the bit on the outgoing state. Added `pixelIdx`@5 (already host-bound) + `sppm`@21 / `sppmDelta`@22 params, wired into `Scene S`.
-- **Slot correction:** the original outline said bind sppm/sppmDelta at 11/12 — but those are `normal`/`spheres` in `wf_shade_diffuse` (11/12 is the *megakernel's* Scene layout). Used **21/22** (next free after photons at 19/20), gated by a new `needsSppm` knob in `encodeShading` so only the diffuse kernel gets the binding.
-- Host: dropped the `effectiveSppm && effectiveWavefront` warn+fallback (which also fixes the `b28e7dc` use-before-declaration build error); forces 1-spp for wavefront SPPM (multi-spp races the atomic-free per-pixel delta accumulation — warns if the user had multi-sample on).
-- `sppm_pass_update` dispatch + final composite (tau/(π R² N_emitted)) are backend-agnostic and untouched.
-
-**Validation (do this on the Mac):** A/B `--no-wavefront --photon-sppm` (megakernel SPPM, known working) vs `--photon-sppm` (wavefront SPPM) on cornell-glass at production-ish samples, adaptive OFF for a clean comparison. Per-pixel output should match within Monte Carlo noise; PNG `Architecture` differs (megakernel vs wavefront), everything else identical.
-
-### 1. OpenGL SPPM
-
-**Why deferred:** Same shape as Metal SPPM but in GLSL + OpenGL SSBOs. Two new SSBOs (Sppm + SppmDelta), a `sppm_pass_update` compute shader, host-side allocation + binding + dispatch after each progressive pass, final composite identical to Metal's.
-
-**Implementation outline:**
-1. Add GLSL `SppmPixel` + `SppmDelta` structs to the OpenglRenderer.cpp kernel string (next to the existing `Photon` + `PhotonCell` structs). SppmPixel is 5 floats (R, tauR, tauG, tauB, N) so it lays out naturally in std430; SppmDelta is 4 floats also fine. No need for the `float[3]`-instead-of-vec3 trick that `Photon` needed.
-2. Add `uPhotonSppm` uniform (mirror of MSL `Uniforms.useCausticPhotonSppm`).
-3. Add `sppmContributeAtVisiblePoint` GLSL function (line-for-line translation of the MSL version near the top of MetalRenderer.mm's kernel string).
-4. Modify the GLSL `tracePath` (around OpenglRenderer.cpp line 858) to track a local `bool firstDiffuseSppm = (uPhotonSppm != 0);`. At the diffuse case, branch on SPPM vs classical the same way the megakernel `tracePath` does (see Renderer.cpp's diffuse case for the reference flow; MSL's is at MetalRenderer.mm tracePath).
-5. Add a second compute shader `sppm_pass_update` (its own GL program). One thread per pixel; applies Hachisuka math to the SppmPixel SSBO using the SppmDelta SSBO; zeros the delta.
-6. Host: allocate Sppm + SppmDelta SSBOs in `initGL()` (or per-render in `render()` like the photon SSBOs currently do), upload init state (R = photonRadius, everything else 0), bind at chosen SSBO indices (next free after the photon SSBOs at 8/9, so 10/11).
-7. Dispatch `sppm_pass_update` after the existing tile-dispatch loop completes each progressive pass.
-8. After all progressive passes, read back Sppm SSBO + apply the final composite per pixel (same code shape as Metal's at MetalRenderer.mm's "SPPM final composite" block).
-9. Drop the OpenGL "warn + fallback" stub.
-
-**Risk:** Medium. OpenGL needs two compute programs (the existing path-trace shader + a new sppm_pass_update shader), so the host-side single-`_program` assumption gets broken. Easy fix: keep them as two separate `GLuint` members.
-
-### 2. Spectral photon mapping
-
-**Why deferred:** Density estimate (CPU + Metal + OpenGL) currently uses RGB photon power. In `--spectral` mode each eye-path ray carries a hero-wavelength tuple; per-photon RGB power doesn't combine correctly with per-wavelength radiance. All photon-mapping toggles silently disable in spectral mode with a warning.
-
-**Implementation outline:**
-1. Per-photon wavelength: add `float lambda` to `Photon::Record` (becomes 40 bytes; update all consumers). Or alternatively: each photon carries 4 stratified wavelengths' powers (`float4 power` + the hero lambda tuple) — matches the eye-path's hero-N=4 convention but burns more memory per photon.
-2. Photon shoot: per-emitted-photon, sample a wavelength uniformly in [400, 700] nm. Photon power scales by the emitter's per-wavelength emissive (using `Material::emissiveAt(lambda)`).
-3. Density estimate: at a diffuse hit during the eye path, for each hero lambda the eye ray carries, sum photon contributions weighted by spectral reflectance evaluated at the photon's wavelength.
-4. PBRT v4 chapter 16.4 has a clean spectral SPPM treatment worth following before implementing.
-
-**Risk:** High. Spectral photon mapping has multiple defensible formulations and the literature is less unanimous than the RGB case. This is a research-flavored implementation, not a port. Worth bisecting first whether the user actually needs spectral caustics or if RGB caustics + spectral direct-lighting is good enough.
-
-### When to revisit
-
-In priority order: **(1) OpenGL SPPM** (consistency for Linux/Windows users), **(2) spectral photon mapping** (algorithmic depth, lower practical priority since the user's caustic-heavy scenes render fine in RGB mode). Wavefront SPPM (formerly priority 1, the production path) is done in session 8 pending Mac A/B verification.
+**Remaining is validation only** (Mac A/B for the two spectral Metal
+commits + the megakernel spectral commit). No code work outstanding on this
+feature.
 
 ## Indirect dispatch for wavefront shading kernels (Metal)
 

@@ -124,9 +124,9 @@ int main(int argc, char *argv[])
     // Caustic photon mapping (Jensen 1996). When on, the renderer
     // shoots `photonCount` photons from the area lights at render
     // start and adds a density-estimate term on every diffuse hit.
-    // Dramatically reduces variance on caustic regions; --spectral
-    // ignores the flag for now (density-estimate is RGB-only). CPU
-    // backend only in this session; GPU ports land later.
+    // Dramatically reduces variance on caustic regions. Works in RGB
+    // and --spectral (dispersion caustics) on all backends; classical,
+    // progressive, and SPPM.
     bool  useCausticPhotonMap = false;
     int   photonCount = 1000000;
     float photonRadius = 0.05f;

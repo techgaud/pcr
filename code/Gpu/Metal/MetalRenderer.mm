@@ -2876,8 +2876,9 @@ kernel void wf_shade_glass(
     uint depth = stateDepth(rayState[gid]) + 1u;
     // Glass is specular: the SPPM firstDiffuse bit passes through unchanged
     // to both the continuing primary and any spectral fork sub-rays (all
-    // still pre-diffuse). SPPM itself is RGB-only, so forks (spectral-only)
-    // never carry a live visible point, but we thread the bit anyway to
+    // still pre-diffuse). Spectral SPPM force-routes to the megakernel (see
+    // the effectiveWavefront gate in render()), so on the wavefront a fork
+    // never reaches a live SPPM visible point; we thread the bit anyway to
     // keep the packing well-formed.
     bool fd = stateFirstDiffuse(rayState[gid]);
     bool alive_after = true;
@@ -3182,9 +3183,10 @@ kernel void wf_shade_diffuse(
         color[gid] = float3(color[gid]) + t * directLoRGB;
     }
 
-    // Caustic photon-map contribution. Skipped in spectral mode (the
-    // estimate is RGB-power-based; spectral support is a later pass).
-    // Two mutually exclusive modes, matching the megakernel tracePath:
+    // Caustic photon-map contribution. The RGB branch below handles
+    // non-spectral renders; spectral renders take the else-if branch
+    // further down (per-wavelength density estimate / fork lane-k).
+    // Two mutually exclusive RGB modes, matching the megakernel tracePath:
     //   - SPPM on: the FIRST diffuse hit per primary (firstDiffuse bit
     //     set) is this pixel's visible point. Accumulate photon flux
     //     into the per-pixel sppmDelta; the host-side per-pass update +

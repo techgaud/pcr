@@ -120,10 +120,9 @@ public:
     // patch on the floor in cornell-glass etc.) at the cost of a
     // one-time photon-shoot pass and a per-hit hash-grid lookup.
     //
-    // Spectral mode is ignored here for now: density-estimate uses
-    // RGB photon power. Spectral integration is planned for a later
-    // pass; in --spectral renders the eye-path skips the photon
-    // contribution with a one-time warning.
+    // Spectral mode is supported (formulation B): photons carry hero-4
+    // power and the eye path runs a per-wavelength density estimate,
+    // producing dispersion caustics. Classical, progressive, and SPPM.
     bool  useCausticPhotonMap = false;
     int   photonCount  = 1000000;
     float photonRadius = 0.05f;
