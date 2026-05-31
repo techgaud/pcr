@@ -278,9 +278,10 @@ int main(int argc, char *argv[])
                  "reduces variance on caustic regions (the bright patch "
                  "under a glass sphere etc.) at the cost of a one-time "
                  "photon-shoot pass and a per-hit hash-grid lookup. "
-                 "RGB-only for now; --spectral renders skip the density "
-                 "estimate with a one-time warning. CPU backend only in "
-                 "this release; GPU ports land in a follow-up.");
+                 "Works in RGB and --spectral (dispersion caustics) on all "
+                 "backends (CPU, Metal, OpenGL); classical, --photon-"
+                 "progressive, and --photon-sppm. Spectral SPPM runs on the "
+                 "Metal megakernel (auto --no-wavefront).");
     techniques->add_option("--photons", photonCount,
                  "Number of photons to shoot when --photon-map is on. "
                  "Default 1M. More photons = smoother caustics, more "

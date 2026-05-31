@@ -867,6 +867,68 @@ void spectralSppmContribute(thread const Scene &S,
     dd.M     += M;
 }
 
+// Wavefront-only raw photon-power gather, used by the wavefront spectral
+// caustic hook. Returns the per-photon-lane summed power (NOT divided by
+// area, NO albedo) + the photon count M within radius r. Wavelength-
+// independent; the caller picks the lane matching its wavelength(s) and
+// applies albedo / 1/(pi r^2) / hero weighting. Mirrors the gather loop in
+// spectralDensityEstimate / spectralSppmContribute. Separate function (vs
+// reusing those) so the megakernel estimators stay byte-for-byte unchanged
+// while the wavefront handles its fork-specific lane indexing locally.
+struct SpectralGatherResult { float4 power; float M; };
+SpectralGatherResult spectralGatherPower(thread const Scene &S,
+                                         device const PCRSpectralPower *spectralPower,
+                                         float3 x, float3 N, float r) {
+    SpectralGatherResult g;
+    g.power = float4(0.0f);
+    g.M     = 0.0f;
+    if (r <= 0.0f) return g;
+    float r2 = r * r;
+    float invR = 1.0f / r;
+    uint mask = uint(S.u.photonCellTableMask);
+    int cx = int(floor(x.x * invR));
+    int cy = int(floor(x.y * invR));
+    int cz = int(floor(x.z * invR));
+    for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) {
+        uint h = photonCellHash(cx + dx, cy + dy, cz + dz);
+        uint slot = h & mask;
+        for (int probe = 0; probe < 8; probe++) {
+            PCRPhotonCell cell = S.photonCells[slot];
+            if (cell.cellHash == kPhotonEmptyCell) break;
+            if (cell.cellHash == h) {
+                for (uint i = 0; i < cell.count; i++) {
+                    PCRPhoton ph = S.photons[cell.offset + i];
+                    float3 d = float3(ph.position) - x;
+                    if (dot(d, d) > r2) continue;
+                    if (dot(float3(ph.wi), N) >= 0.0f) continue;
+                    device const PCRSpectralPower &sp = spectralPower[cell.offset + i];
+                    g.power += float4(sp.p[0], sp.p[1], sp.p[2], sp.p[3]);
+                    g.M     += 1.0f;
+                }
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+    return g;
+}
+
+// Recover the photon-power lane index for a wavelength carried by a
+// wavefront spectral fork sub-ray. The eye path's per-pass wavelengths are
+// u.specLambda0..3 (set verbatim in ray-gen for spectral photon mode); the
+// glass fork copies one of them verbatim into the sub-ray's lambdas.x, so
+// an exact float match recovers which photon lane holds that wavelength's
+// power. Identity (returns j) for a never-dispersed ray whose lambdas[j]
+// equals specLambda_j.
+inline int spectralLaneIndex(thread const Scene &S, float lambda) {
+    if (lambda == S.u.specLambda1) return 1;
+    if (lambda == S.u.specLambda2) return 2;
+    if (lambda == S.u.specLambda3) return 3;
+    return 0;
+}
+
 float3 xyzToLinearSRGB(float3 xyz) {
     return float3(
          3.2404542f * xyz.x - 1.5371385f * xyz.y - 0.4985314f * xyz.z,
@@ -2285,13 +2347,26 @@ kernel void wf_generate_primary_rays(
     // sample the same spectral distribution. Initial throughput is
     // float4(1) since no surface has been touched yet.
     if (u.useSpectral != 0) {
-        float kSpan   = kLambdaMax - kLambdaMin;
-        float kStride = kSpan / 4.0f;
         float4 lams;
-        lams.x = kLambdaMin + rand(seed) * kSpan;
-        lams.y = lams.x + kStride;          if (lams.y > kLambdaMax) lams.y -= kSpan;
-        lams.z = lams.x + kStride * 2.0f;   if (lams.z > kLambdaMax) lams.z -= kSpan;
-        lams.w = lams.x + kStride * 3.0f;   if (lams.w > kLambdaMax) lams.w -= kSpan;
+        if (u.useCausticPhotonSpectral != 0) {
+            // Spectral caustic photon mapping: the eye path must use the
+            // SAME per-pass hero wavelengths as the photon shoot so the
+            // photon spectralPower[k] aligns with lambdas[k] by index
+            // (formulation B). Copied verbatim from the uniform so the
+            // glass fork's per-lane copy stays bit-exact for the
+            // spectralLaneIndex recovery in wf_shade_diffuse. Matches the
+            // megakernel path_trace_pass override.
+            lams = float4(u.specLambda0, u.specLambda1, u.specLambda2, u.specLambda3);
+        } else {
+            // Wilkie 2014 stratified hero sampling: one random offset + 3
+            // strides through 400..700 nm with wraparound.
+            float kSpan   = kLambdaMax - kLambdaMin;
+            float kStride = kSpan / 4.0f;
+            lams.x = kLambdaMin + rand(seed) * kSpan;
+            lams.y = lams.x + kStride;          if (lams.y > kLambdaMax) lams.y -= kSpan;
+            lams.z = lams.x + kStride * 2.0f;   if (lams.z > kLambdaMax) lams.z -= kSpan;
+            lams.w = lams.x + kStride * 3.0f;   if (lams.w > kLambdaMax) lams.w -= kSpan;
+        }
         lambdas[gid]            = lams;
         spectralThroughput[gid] = float4(1.0f);
     }
@@ -2984,6 +3059,12 @@ kernel void wf_shade_diffuse(
     // encodeShading(needsSppm=true); gated by u.useCausticPhotonSppm.
     device PCRSppmPixel                        *sppm               [[buffer(21)]],
     device PCRSppmDelta                        *sppmDelta          [[buffer(22)]],
+    // Parallel spectral photon power, same index as the photons buffer.
+    // Bound only on this kernel via encodeShading(needsSpectralPhoton=true);
+    // reads guarded by u.useCausticPhotonSpectral. Slot 23 is free here
+    // (21/22 are sppm; 19/20 are photons). Always non-null (dummy 1-elem
+    // buffer when spectral photon is off).
+    device const PCRSpectralPower              *spectralPower      [[buffer(23)]],
     device const uint                          *queue              [[buffer(24)]],
     constant uint                              &queueLen           [[buffer(25)]],
     device const float4                        *lambdas            [[buffer(27)]],
@@ -3123,6 +3204,46 @@ kernel void wf_shade_diffuse(
             color[gid] = float3(color[gid])
                        + t * photonDensityEstimate(S, S.photons, S.photonCells,
                                                     h, N, albedo);
+        }
+    } else if (u.useCausticPhotonSpectral != 0 && u.useCausticPhotonSppm == 0) {
+        // Spectral caustic photon mapping (formulation B), classical +
+        // progressive density estimate. Mirrors the megakernel
+        // tracePathSpectral hook, adapted to the wavefront's spectral-fork
+        // representation. Two ray shapes reach here:
+        //   - "full hero" ray (lams.y != 0): all 4 hero lanes carry the
+        //     photon map's per-pass wavelengths in order (set in ray-gen);
+        //     lambdas[j] == specLambda_j, so photon lane j aligns with eye
+        //     lane j. This is a never-dispersed primary OR a post-dispersion
+        //     primary (which keeps full lambdas but has its secondary
+        //     throughput lanes zeroed - the spThru weighting makes the dead
+        //     lanes contribute nothing, so this matches the megakernel).
+        //   - monochromatic fork sub-ray (lams.y == 0): a single wavelength
+        //     in lams.x whose photon power lives in lane k =
+        //     spectralLaneIndex(lams.x). Recovered by exact float match.
+        // Both write the per-ray color slot (forks their own slot); the
+        // atomic fork-scatter combines them, so there is no per-pixel race.
+        //
+        // Spectral SPPM does NOT run here: it falls back to the megakernel
+        // (per-pixel SPPM is incompatible with the fork representation - see
+        // the effectiveWavefront gate in render()), so the host never sets
+        // both useCausticPhotonSpectral and useCausticPhotonSppm on a
+        // wavefront dispatch. The useCausticPhotonSppm == 0 guard above keeps
+        // this branch off the racy per-pixel deposit even if that invariant
+        // ever broke.
+        if (lams.y != 0.0f) {
+            // Classical / progressive, all 4 lanes aligned: identical to the
+            // megakernel (spThru weighting kills any zeroed secondary).
+            float4 est = spectralDensityEstimate(S, spectralPower, h, N, albedoLam);
+            color[gid] = float3(color[gid]) + heroLambdasXYZ(lams, spThru * est, u.useCieCmf);
+        } else {
+            // Classical / progressive, monochromatic fork: estimate at the
+            // single wavelength lams.x using its photon lane k.
+            int k = spectralLaneIndex(S, lams.x);
+            SpectralGatherResult g = spectralGatherPower(S, spectralPower, h, N, u.photonRadius);
+            float invArea = 1.0f / (PI * u.photonRadius * u.photonRadius);
+            float estK = albedoLam.x * (1.0f / PI) * g.power[k] * invArea;
+            float radK = spThru.x * estK;
+            color[gid] = float3(color[gid]) + singleLambdaXYZ(lams.x, radK, u.useCieCmf) * 0.25f;
         }
     }
 
@@ -4467,12 +4588,29 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
     // megakernel forks four sub-paths per glass hit while wavefront
     // keeps only the hero past dispersion.
     bool effectiveWavefront = useWavefront;
-    if (spectralPhoton && effectiveWavefront)
+    // Spectral caustic photon mapping runs on the wavefront path for the
+    // classical + progressive density-estimate modes: the spectral fork
+    // sub-rays do a per-wavelength density estimate at the diffuse hit
+    // (spectralPower bound at slot 23), and the eye path shares the photon
+    // map's per-pass hero wavelengths via u.specLambda0..3 so lanes align
+    // by index.
+    //
+    // Spectral SPPM is the exception and falls back to the megakernel:
+    // per-pixel SPPM needs ONE visible point per pixel carrying all four
+    // hero wavelengths together, which is exactly the megakernel hero-4
+    // single-path representation. The wavefront's monochromatic fork splits
+    // a glass-piercing camera ray into sub-rays that (a) share the parent's
+    // pixelIdx and would race the atomic-free per-pixel sppmDelta deposit,
+    // and (b) in terminate mode carry only the hero past dispersion, so a
+    // caustic seen through glass would lose 3/4 of its spectrum. The
+    // megakernel spectral SPPM (commit 7d09cc5) has neither problem.
+    if (spectralPhoton && effectiveSppm && effectiveWavefront)
     {
-        std::cerr << "MetalRenderer: spectral photon mapping runs on the "
-                     "megakernel; forcing --no-wavefront for this render "
-                     "(wavefront spectral photon mapping is not implemented "
-                     "yet).\n";
+        std::cerr << "MetalRenderer: spectral SPPM runs on the megakernel "
+                     "(per-pixel SPPM is incompatible with wavefront spectral "
+                     "forks); forcing --no-wavefront for this render. "
+                     "Classical/progressive spectral photon mapping runs on "
+                     "the wavefront.\n";
         effectiveWavefront = false;
     }
     if (useWavefront)
@@ -5223,7 +5361,8 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                                          bool needsFullScene,
                                          bool needsColor,
                                          bool needsPhotons,
-                                         bool needsSppm) {
+                                         bool needsSppm,
+                                         bool needsSpectralPhoton) {
                     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
                     [enc setComputePipelineState:pipeline];
                     [enc setBuffer:uniformsBuf       offset:p * uniformsStride atIndex:0];
@@ -5270,6 +5409,17 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                         [enc setBuffer:sppmBuf      offset:0 atIndex:21];
                         [enc setBuffer:sppmDeltaBuf offset:0 atIndex:22];
                     }
+                    if (needsSpectralPhoton)
+                    {
+                        // Slot 23 carries the parallel spectral photon-power
+                        // buffer to wf_shade_diffuse, the only shading kernel
+                        // that declares it. Gated like photons/sppm so the
+                        // other kernels don't trip unused-binding validation.
+                        // Always non-null (dummy 1-elem buffer when spectral
+                        // photon is off); the kernel reads behind
+                        // u.useCausticPhotonSpectral.
+                        [enc setBuffer:spectralPowerBuf offset:0 atIndex:23];
+                    }
                     [enc setBuffer:queueBuf            offset:0 atIndex:24];
                     [enc setBuffer:wfBufs.queueCounters offset:counterOffset atIndex:25];
                     [enc setBuffer:wfBufs.lambdas            offset:0 atIndex:27];
@@ -5302,20 +5452,20 @@ void MetalRenderer::render(const Scenes::SceneData &scene,
                 encodeShading(_impl->pipelineWfShadeDiffuse,  wfBufs.queueDiffuse,
                               0 * sizeof(uint32_t), /*fullScene=*/true,
                               /*needsColor=*/true,  /*needsPhotons=*/true,
-                              /*needsSppm=*/true);
+                              /*needsSppm=*/true,   /*needsSpectralPhoton=*/true);
                 encodeShading(_impl->pipelineWfShadeMirror,   wfBufs.queueMirror,
                               1 * sizeof(uint32_t), /*fullScene=*/false,
                               /*needsColor=*/false, /*needsPhotons=*/false,
-                              /*needsSppm=*/false);
+                              /*needsSppm=*/false,  /*needsSpectralPhoton=*/false);
                 encodeShading(_impl->pipelineWfShadeGlass,    wfBufs.queueGlass,
                               2 * sizeof(uint32_t), /*fullScene=*/false,
                               /*needsColor=*/true,
                               /*needsPhotons=*/false,
-                              /*needsSppm=*/false);
+                              /*needsSppm=*/false,  /*needsSpectralPhoton=*/false);
                 encodeShading(_impl->pipelineWfShadeEmissive, wfBufs.queueEmissive,
                               3 * sizeof(uint32_t), /*fullScene=*/false,
                               /*needsColor=*/true,  /*needsPhotons=*/false,
-                              /*needsSppm=*/false);
+                              /*needsSppm=*/false,  /*needsSpectralPhoton=*/false);
             }
 
             // ---- Fork-scatter (spectralFork mode only) ----

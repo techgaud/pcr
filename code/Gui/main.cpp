@@ -2212,13 +2212,11 @@ int main(int, char **)
                               "the binary to be built with PCR_USE_OIDN=ON.");
 
         // Caustic photon mapping (Jensen 1996). The checkbox is enabled
-        // unconditionally; the renderer falls back to a noop if the
-        // active backend / mode doesn't support it (spectral renders
-        // skip it RGB-only; wavefront / OpenGL warn one-time per
-        // render until sessions 3-4 ship). The disabled state would
-        // require knowing each backend's eventual support matrix at
-        // GUI compile time, which is more complexity than it's worth
-        // for a feature flag whose mis-toggle gracefully no-ops.
+        // unconditionally. Supported in RGB and spectral (dispersion
+        // caustics) on all backends (CPU, Metal, OpenGL); classical,
+        // progressive, and SPPM. Spectral SPPM auto-routes to the Metal
+        // megakernel (per-pixel SPPM is incompatible with wavefront
+        // spectral forks).
         ImGui::Checkbox("Caustic photon mapping (Jensen 1996)",
                         &settings.useCausticPhotonMap);
         if (ImGui::IsItemHovered())
@@ -2227,8 +2225,8 @@ int main(int, char **)
                               "after at least one specular bounce. Eye\n"
                               "path adds a density estimate at every\n"
                               "diffuse hit. Big win on caustic-heavy\n"
-                              "scenes (cornell-glass etc). RGB-only;\n"
-                              "spectral renders skip it.");
+                              "scenes (cornell-glass etc). Works in RGB\n"
+                              "and spectral (dispersion caustics).");
         if (settings.useCausticPhotonMap)
         {
             // Photon count: log-scale-friendly via the slider. 100k - 10M

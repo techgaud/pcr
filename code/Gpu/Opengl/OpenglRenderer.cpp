@@ -2380,11 +2380,10 @@ void OpenglRenderer::render(const Scenes::SceneData &scene,
 {
     lastOutputPath.clear();
 
-    // Caustic photon-map pre-pass. Spectral mode skips (density estimate
-    // is RGB-only for now; spectral support is a separate session).
-    // Otherwise we shoot photons on the host (reuses the shared
-    // Photon::shootCaustic and the Photon::buildGpuTable helpers; the
-    // Metal backend uses the same path).
+    // Caustic photon-map pre-pass. We shoot photons on the host (reuses
+    // the shared Photon::shootCaustic / shootCausticSpectral and the
+    // Photon::buildGpuTable helpers; the Metal backend uses the same
+    // path). Spectral mode is supported (dispersion caustics) - see below.
     bool effectivePhotonMap = useCausticPhotonMap;
     // Spectral caustic photon mapping (formulation B): photons carry hero-4
     // power (parallel SpectralPower buffer) and share the eye path's per-pass

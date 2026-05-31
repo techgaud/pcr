@@ -148,8 +148,9 @@ void Renderer::render(const Scenes::SceneData &scene,
     // (the no-photon-map render path bypasses the density estimate
     // via a single null-check, no other branching needed).
     //
-    // Spectral mode warning: density-estimate is RGB-only for now,
-    // so castRaySpectral skips the lookup. Logged once here.
+    // Spectral mode: castRaySpectral runs the per-hero-wavelength
+    // density estimate (formulation B); the photon shoot uses
+    // shootCausticSpectral. Classical, progressive, and SPPM all work.
     //
     // In progressive mode the actual Photon::shootCaustic call moves
     // inside the per-pass loop below (each progressive iteration
@@ -159,9 +160,9 @@ void Renderer::render(const Scenes::SceneData &scene,
     int numProgPasses = effectiveProgressive ? std::max(1, photonPasses) : 1;
     // Spectral caustic photon mapping (formulation B): photons carry
     // per-hero-wavelength power and share the eye path's per-pass
-    // wavelengths. Classical + progressive land here; spectral SPPM is
-    // the next step (needs per-pixel state threaded through
-    // castRaySpectral), so for now it runs as spectral progressive.
+    // wavelengths. Classical, progressive, and SPPM all supported on the
+    // CPU reference (SPPM threads per-pixel state through castRaySpectral
+    // and folds the per-wavelength flux into the RGB SppmPixel tau).
     bool spectralPhoton = useSpectral && useCausticPhotonMap;
     // Spectral photon mapping (progressive AND SPPM) re-renders the
     // fork-heavy spectral eye image once per pass, so wall-clock scales
@@ -186,7 +187,7 @@ void Renderer::render(const Scenes::SceneData &scene,
     // (delta_tau + M) instead of contributing radiance directly;
     // the per-pixel update + final composite below handle the
     // Hachisuka math. SPPM requires progressive (it's nonsensical
-    // with a single pass); spectral disables both already.
+    // with a single pass) and composes with spectral mode.
     bool effectiveSppm = effectiveProgressive && useCausticPhotonSppm;
     std::vector<Photon::SppmPixel> sppmStateVec;
     std::vector<Photon::SppmDelta> sppmDeltaVec;
