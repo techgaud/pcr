@@ -6,3 +6,11 @@ physically-cringe-rendering.json
 imgui.ini
 tests/render/output/
 
+# Internal knowledge (docs/, CLAUDE.md, CHARTER.md) is versioned centrally in
+# the internal repo techgaud/projects-docs, never in this public repo. The files
+# stay on disk so a chat launched here still reads its cascade, they are only
+# untracked here.
+docs/
+CLAUDE.md
+CHARTER.md
+
