@@ -6,11 +6,15 @@ physically-cringe-rendering.json
 imgui.ini
 tests/render/output/
 
-# Internal knowledge (CLAUDE.md, CHARTER.md) is versioned centrally in the
-# internal repo techgaud/projects-docs, never in this public repo. The files stay
-# on disk so a chat launched here still reads its cascade, they are only untracked
-# here. docs/ stays tracked and public: for a public tool, its docs/ are
-# user-facing documentation, not internal knowledge.
+# Internal knowledge (CLAUDE.md, CHARTER.md, and the SPECTRAL-PHOTON-HANDOFF /
+# project-knowledge dev-session docs) is versioned centrally in the internal repo
+# techgaud/projects-docs, never in this public repo. The files stay on disk so a
+# chat launched here still reads its cascade, they are only untracked here. The
+# handoff/knowledge docs are untracked now and their content is scrubbed from
+# history in the follow-up rewrite pass. docs/ stays tracked and public: for a
+# public tool, its docs/ are user-facing documentation, not internal knowledge.
 CLAUDE.md
 CHARTER.md
+SPECTRAL-PHOTON-HANDOFF.md
+project-knowledge.md
 
